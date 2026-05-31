@@ -1,0 +1,40 @@
+{
+  "api": {
+    "polymarket_gamma_base": "https://gamma-api.polymarket.com",
+    "weather_company_base": "https://api.weather.com",
+    "twc_api_key_env": "TWC_API_KEY",
+    "twc_duration": "2day",
+    "twc_units": "e",
+    "twc_language": "en-US",
+    "request_timeout_seconds": 30,
+    "per_request_delay_seconds": 0.25
+  },
+  "events": {
+    "target_dates": ["tomorrow"],
+    "city_filter": "",
+    "include_closed": false,
+    "max_offsets": 1200
+  },
+  "trading": {
+    "strategy_name": "twc_every_15m_most_likely",
+    "buy_notional_usdc": 5.0,
+    "fee_rate": 0.05,
+    "fee_enabled": true,
+    "one_trade_per_event_per_cycle": true
+  },
+  "scheduler": {
+    "poll_interval_minutes": 15,
+    "run_once": false,
+    "max_cycles": 0,
+    "settle_after_each_cycle": true,
+    "stop_when_all_target_events_settled": false
+  },
+  "outputs": {
+    "trades_csv": "polymarket_weather_trades.csv",
+    "snapshots_csv": "polymarket_weather_forecast_snapshots.csv",
+    "settled_trades_csv": "polymarket_weather_trades_settled.csv",
+    "performance_by_cycle_csv": "polymarket_weather_performance_by_cycle.csv",
+    "performance_by_event_csv": "polymarket_weather_performance_by_event.csv",
+    "state_json": "polymarket_weather_state.json"
+  }
+}

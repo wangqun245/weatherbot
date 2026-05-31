@@ -1,0 +1,15 @@
+__pycache__/
+*.py[cod]
+
+.env
+.venv/
+venv/
+
+polymarket_weather_forecast_snapshots.csv
+polymarket_weather_trades.csv
+polymarket_weather_trades_settled.csv
+polymarket_weather_performance_by_cycle.csv
+polymarket_weather_performance_by_event.csv
+polymarket_weather_state.json
+
+*.log

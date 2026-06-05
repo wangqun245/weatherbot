@@ -125,8 +125,11 @@ class PaperTrade:
     total_cost_usdc: float
     exit_at: str = ""
     exit_reason: str = ""
+    exit_action: str = ""
     exit_yes_price: Optional[float] = None
+    exit_no_price: Optional[float] = None
     exit_fee_usdc: float = 0.0
+    exit_hedge_cost_usdc: float = 0.0
     exit_proceeds_usdc: float = 0.0
     monitor_last_yes_price: Optional[float] = None
     monitor_last_checked_at: str = ""
@@ -252,7 +255,6 @@ def default_config() -> dict[str, Any]:
             "performance_by_event_csv": "polymarket_weather_performance_by_event.csv",
             "twc_raw_wide_csv": "polymarket_weather_twc_raw_wide.csv",
             "polymarket_price_snapshots_csv": "polymarket_weather_price_snapshots.csv",
-            "polymarket_websocket_raw_jsonl": "polymarket_weather_websocket_raw.jsonl",
             "state_json": "polymarket_weather_state.json",
             "log_file": "bot.log",
             "log_level": "INFO",
@@ -351,7 +353,7 @@ def default_config() -> dict[str, Any]:
                     "stop_loss_fraction_of_cost": 0.25,
                     "profit_drawdown_fraction": 0.3,
                     "profit_drawdown_min_profit_usdc": 1.0,
-                    "websocket_peak_price_fields": ["price", "best_bid", "bid", "last_trade_price"],
+                    "websocket_peak_price_fields": ["best_bid", "bid"],
                     "allowed_cities": sorted(US_WEATHER_CITIES),
                     "websocket_persistent": True,
                     "websocket_reconnect_seconds": 5,
@@ -363,9 +365,9 @@ def default_config() -> dict[str, Any]:
                     "highest_local_start": "12:15",
                     "lowest_local_end": "06:00",
                     "highest_local_end": "18:00",
-                    "forecast_scope": "event_day_full",
-                    "forecast_horizon_hours": 24,
-                    "include_observed_today": False,
+                    "forecast_scope": "next_hours_plus_observed",
+                    "forecast_horizon_hours": 6,
+                    "include_observed_today": True,
                 },
             },
         ],
@@ -788,15 +790,16 @@ def twc_hourly_forecast_by_icao(config: dict[str, Any], icao_code: str, units: O
     )
 
 
-def twc_historical_hourly_by_icao(config: dict[str, Any], icao_code: str, units: str) -> dict[str, Any]:
+def twc_historical_observations_by_icao(config: dict[str, Any], icao_code: str, units: str, event_date: str) -> dict[str, Any]:
+    query_date = event_date.replace("-", "")
+    location_id = f"{icao_code}:9:US"
     return twc_get(
         config,
-        "/v3/wx/conditions/historical/hourly/1day",
+        f"/v1/location/{location_id}/observations/historical.json",
         {
-            "icaoCode": icao_code,
             "units": units,
-            "language": config["api"]["twc_language"],
-            "format": "json",
+            "startDate": query_date,
+            "endDate": query_date,
         },
     )
 
@@ -859,20 +862,28 @@ def filtered_twc_points(
     return matched
 
 
-def observed_twc_points(payload: dict[str, Any], event_date: str, current_local: Optional[datetime]) -> list[tuple[datetime, float]]:
-    temps = payload.get("temperature") or []
-    times = payload.get("validTimeLocal") or []
+def observed_twc_observation_points(payload: dict[str, Any], event_date: str, current_local: Optional[datetime]) -> list[tuple[datetime, float]]:
+    observations = payload.get("observations") or []
+    if not isinstance(observations, list):
+        return []
+    local_tz = current_local.tzinfo if current_local and current_local.tzinfo else timezone.utc
     matched: list[tuple[datetime, float]] = []
-    for idx, raw_time in enumerate(times):
-        if idx >= len(temps) or temps[idx] is None:
+    for row in observations:
+        if not isinstance(row, dict):
             continue
-        local_dt = parse_twc_local_time(str(raw_time))
-        if not local_dt:
+        raw_time = row.get("valid_time_gmt")
+        raw_temp = row.get("temp")
+        if raw_time is None or raw_temp is None:
+            continue
+        try:
+            local_dt = datetime.fromtimestamp(int(raw_time), timezone.utc).astimezone(local_tz)
+            temp = float(raw_temp)
+        except (TypeError, ValueError, OSError):
             continue
         if local_dt.date().isoformat() != event_date:
             continue
         if current_local is None or local_dt <= current_local:
-            matched.append((local_dt, float(temps[idx])))
+            matched.append((local_dt, temp))
     return sorted(matched, key=lambda item: item[0])
 
 
@@ -1328,13 +1339,6 @@ def append_csv(path: str, rows: list[dict[str, Any]]) -> None:
             writer.writerows(rows)
 
 
-def append_jsonl_text(path: str, text: str) -> None:
-    with IO_LOCK:
-        with open(path, "a", encoding="utf-8") as f:
-            f.write(text.rstrip("\r\n"))
-            f.write("\n")
-
-
 def read_csv_dicts(path: str) -> list[dict[str, str]]:
     if not os.path.exists(path):
         return []
@@ -1366,7 +1370,9 @@ def read_trades(path: str) -> list[PaperTrade]:
                 "buy_fee_usdc",
                 "total_cost_usdc",
                 "exit_yes_price",
+                "exit_no_price",
                 "exit_fee_usdc",
+                "exit_hedge_cost_usdc",
                 "exit_proceeds_usdc",
                 "monitor_last_yes_price",
                 "monitor_price_trigger",
@@ -1384,6 +1390,7 @@ def read_trades(path: str) -> list[PaperTrade]:
         cleaned.setdefault("comparable_unit", cleaned.get("forecast_unit", ""))
         cleaned.setdefault("exit_at", "")
         cleaned.setdefault("exit_reason", "")
+        cleaned.setdefault("exit_action", "")
         cleaned.setdefault("monitor_last_checked_at", "")
         for field in {
             "notional_usdc",
@@ -1392,6 +1399,7 @@ def read_trades(path: str) -> list[PaperTrade]:
             "buy_fee_usdc",
             "total_cost_usdc",
             "exit_fee_usdc",
+            "exit_hedge_cost_usdc",
             "exit_proceeds_usdc",
             "monitor_price_trigger",
             "monitor_peak_pnl_usdc",
@@ -1520,8 +1528,8 @@ def evaluate_trade_forecast_market(config: dict[str, Any], trade: PaperTrade) ->
     observed_points: list[tuple[datetime, float]] = []
     if config["trading"].get("include_observed_today", True) and datetime.strptime(trade.event_date, "%Y-%m-%d").date() <= date.today():
         city_local_dt, _, _ = city_local_now(config, trade.city)
-        historical_payload = twc_historical_hourly_by_icao(config, station, units=twc_units)
-        observed_points = observed_twc_points(historical_payload, trade.event_date, city_local_dt)
+        historical_payload = twc_historical_observations_by_icao(config, station, units=twc_units, event_date=trade.event_date)
+        observed_points = observed_twc_observation_points(historical_payload, trade.event_date, city_local_dt)
 
     combined_points = merge_observed_and_forecast_points(observed_points, forecast_points)
     high, low, _, _, _, _ = summarize_points(combined_points)
@@ -1681,7 +1689,13 @@ def strategy4_exit_metrics(
             yes_best_ask = None
     if yes_best_bid is not None and yes_best_bid > 0:
         sell_yes = yes_best_bid
-    current_no = outcome_price(raw_current_market, "No") if isinstance(raw_current_market, dict) else None
+    mark_no = outcome_price(raw_current_market, "No") if isinstance(raw_current_market, dict) else None
+    implied_no_ask = None
+    if yes_best_bid is not None and 0 < yes_best_bid < 1:
+        implied_no_ask = max(0.0, 1.0 - yes_best_bid)
+    current_no = mark_no
+    if implied_no_ask is not None:
+        current_no = max(float(mark_no), implied_no_ask) if mark_no is not None else implied_no_ask
     fee_enabled = bool(config["trading"]["fee_enabled"])
     fee_rate = float(trade.taker_fee_rate)
     sell_fee = taker_fee_usdc(trade.shares, sell_yes, fee_rate, fee_enabled)
@@ -1690,10 +1704,11 @@ def strategy4_exit_metrics(
     hedge_pnl = -999999.0
     hedge_proceeds = 0.0
     hedge_fee = 0.0
+    hedge_cost = 0.0
     if current_no is not None and current_no > 0:
         hedge_fee = taker_fee_usdc(trade.shares, float(current_no), fee_rate, fee_enabled)
-        no_cost = trade.shares * float(current_no) + hedge_fee
-        hedge_proceeds = trade.shares - no_cost
+        hedge_cost = trade.shares * float(current_no) + hedge_fee
+        hedge_proceeds = trade.shares - hedge_cost
         hedge_pnl = hedge_proceeds - trade.total_cost_usdc
     use_hedge = current_no is not None and hedge_pnl > sell_pnl
     return {
@@ -1701,11 +1716,14 @@ def strategy4_exit_metrics(
         "mark_yes": mark_yes,
         "yes_best_bid": yes_best_bid,
         "yes_best_ask": yes_best_ask,
+        "mark_no": mark_no,
+        "implied_no_ask": implied_no_ask,
         "current_no": current_no,
         "sell_fee": sell_fee,
         "sell_proceeds": sell_proceeds,
         "sell_pnl": sell_pnl,
         "hedge_fee": hedge_fee,
+        "hedge_cost": hedge_cost,
         "hedge_proceeds": hedge_proceeds,
         "hedge_pnl": hedge_pnl,
         "use_hedge": use_hedge,
@@ -1724,12 +1742,15 @@ def apply_strategy4_exit(
     trade.status = "SOLD"
     trade.exit_at = now_text
     trade.exit_reason = exit_reason
+    trade.exit_action = "buy_no_hedge" if use_hedge else "sell_yes"
     trade.exit_yes_price = float(metrics["current_yes"])
+    trade.exit_no_price = float(metrics["current_no"]) if use_hedge and metrics["current_no"] is not None else None
     trade.exit_fee_usdc = round(float(metrics["hedge_fee"] if use_hedge else metrics["sell_fee"]), 8)
+    trade.exit_hedge_cost_usdc = round(float(metrics["hedge_cost"] if use_hedge else 0.0), 8)
     trade.exit_proceeds_usdc = round(float(metrics["hedge_proceeds"] if use_hedge else metrics["sell_proceeds"]), 8)
     trade.payout_usdc = trade.exit_proceeds_usdc
     trade.pnl_usdc = round(float(metrics["hedge_pnl"] if use_hedge else metrics["sell_pnl"]), 8)
-    return "buy_no_hedge" if use_hedge else "sell_yes"
+    return trade.exit_action
 
 
 def process_strategy4_reprice_on_trigger(
@@ -1799,8 +1820,8 @@ def process_strategy4_reprice_on_trigger(
                 LOGGER.warning("strategy4 monitor skip trade=%s reason=current_market_price_missing market=%s", trade.trade_id, trade.market_id)
                 continue
 
-            current_yes = float(current_choice.yes_price)
             metrics = strategy4_exit_metrics(strategy_config, trade, current_choice)
+            current_yes = float(metrics["current_yes"])
             baseline = float(trade.monitor_last_yes_price if trade.monitor_last_yes_price is not None else trade.yes_price or current_yes)
             trigger = float(trade.monitor_price_trigger or trigger_default)
             delta = round(current_yes - baseline, 8)
@@ -1865,16 +1886,17 @@ def process_strategy4_reprice_on_trigger(
                 drawdown = peak_pnl - best_pnl
                 drawdown_threshold = peak_pnl * profit_drawdown_fraction
                 if stop_loss_fraction > 0 and sell_pnl <= -stop_loss_amount:
+                    use_hedge = bool(metrics["use_hedge"])
                     action = apply_strategy4_exit(
                         trade,
                         now_text=now_text,
                         exit_reason=f"strategy4_stop_loss_forecast_same_loss_fraction_{stop_loss_fraction:g}",
                         metrics=metrics,
-                        use_hedge=False,
+                        use_hedge=use_hedge,
                     )
                     changed_count += 1
                     LOGGER.info(
-                        "strategy4 risk_exit trade=%s city=%s kind=%s market=%s reason=stop_loss action=%s current_yes=%s current_no=%s sell_pnl=%s stop_loss_amount=%s peak_pnl=%s exit_fee=%s proceeds=%s pnl=%s",
+                        "strategy4 risk_exit trade=%s city=%s kind=%s market=%s reason=stop_loss action=%s current_yes=%s current_no=%s sell_pnl=%s hedge_pnl=%s best_pnl=%s stop_loss_amount=%s peak_pnl=%s exit_fee=%s hedge_cost=%s proceeds=%s pnl=%s",
                         trade.trade_id,
                         trade.city,
                         trade.kind,
@@ -1883,9 +1905,12 @@ def process_strategy4_reprice_on_trigger(
                         current_yes,
                         metrics["current_no"] if metrics["current_no"] is not None else "",
                         round(sell_pnl, 8),
+                        round(float(metrics["hedge_pnl"]), 8) if metrics["current_no"] is not None else "",
+                        round(float(metrics["best_pnl"]), 8),
                         round(stop_loss_amount, 8),
                         round(peak_pnl, 8),
                         trade.exit_fee_usdc,
+                        trade.exit_hedge_cost_usdc,
                         trade.exit_proceeds_usdc,
                         trade.pnl_usdc,
                     )
@@ -1905,7 +1930,7 @@ def process_strategy4_reprice_on_trigger(
                     )
                     changed_count += 1
                     LOGGER.info(
-                        "strategy4 risk_exit trade=%s city=%s kind=%s market=%s reason=profit_drawdown action=%s current_yes=%s current_no=%s sell_pnl=%s hedge_pnl=%s best_pnl=%s peak_pnl=%s drawdown=%s threshold=%s exit_fee=%s proceeds=%s pnl=%s",
+                        "strategy4 risk_exit trade=%s city=%s kind=%s market=%s reason=profit_drawdown action=%s current_yes=%s current_no=%s sell_pnl=%s hedge_pnl=%s best_pnl=%s peak_pnl=%s drawdown=%s threshold=%s exit_fee=%s hedge_cost=%s proceeds=%s pnl=%s",
                         trade.trade_id,
                         trade.city,
                         trade.kind,
@@ -1920,6 +1945,7 @@ def process_strategy4_reprice_on_trigger(
                         round(drawdown, 8),
                         round(drawdown_threshold, 8),
                         trade.exit_fee_usdc,
+                        trade.exit_hedge_cost_usdc,
                         trade.exit_proceeds_usdc,
                         trade.pnl_usdc,
                     )
@@ -1952,7 +1978,7 @@ def process_strategy4_reprice_on_trigger(
             action = apply_strategy4_exit(trade, now_text=now_text, exit_reason=exit_reason, metrics=metrics, use_hedge=use_hedge)
             changed_count += 1
             LOGGER.info(
-                "strategy4 exit trade=%s city=%s kind=%s old_market=%s latest_market=%s current_yes=%s current_no=%s delta=%s action=%s sell_pnl=%s hedge_pnl=%s exit_fee=%s proceeds=%s pnl=%s",
+                "strategy4 exit trade=%s city=%s kind=%s old_market=%s latest_market=%s current_yes=%s current_no=%s delta=%s action=%s sell_pnl=%s hedge_pnl=%s exit_fee=%s hedge_cost=%s proceeds=%s pnl=%s",
                 trade.trade_id,
                 trade.city,
                 trade.kind,
@@ -1965,6 +1991,7 @@ def process_strategy4_reprice_on_trigger(
                 round(float(metrics["sell_pnl"]), 8),
                 round(float(metrics["hedge_pnl"]), 8) if metrics["current_no"] is not None else "",
                 trade.exit_fee_usdc,
+                trade.exit_hedge_cost_usdc,
                 trade.exit_proceeds_usdc,
                 trade.pnl_usdc,
             )
@@ -2222,12 +2249,6 @@ def monitor_strategy4_websocket(config: dict[str, Any], duration_seconds: int) -
     persistent = bool(strategy_config["trading"].get("websocket_persistent", True))
     deadline = None if persistent else time.monotonic() + max(1, duration_seconds)
     next_ping = time.monotonic() + max(1, ping_seconds)
-    websocket_raw_jsonl = str(
-        config["outputs"].get(
-            "polymarket_websocket_raw_jsonl",
-            config["outputs"].get("polymarket_websocket_raw_csv", "polymarket_weather_websocket_raw.jsonl"),
-        )
-    )
     LOGGER.info(
         "strategy4 websocket connect assets=%s events=%s persistent=%s duration=%ss",
         len(asset_ids),
@@ -2255,7 +2276,6 @@ def monitor_strategy4_websocket(config: dict[str, Any], duration_seconds: int) -
             if raw_message in {"", "PONG", "PING"}:
                 continue
             raw_text = raw_message.decode("utf-8", errors="replace") if isinstance(raw_message, bytes) else str(raw_message)
-            append_jsonl_text(websocket_raw_jsonl, raw_text)
             try:
                 message = json.loads(raw_text)
             except (TypeError, ValueError):
@@ -2548,8 +2568,8 @@ def collect_twc_raw_snapshots(config: dict[str, Any], cycle_id: str) -> int:
                 historical_payload: dict[str, Any] = {}
                 observed_points: list[tuple[datetime, float]] = []
                 if collector_config.get("include_observed_today", True) and target <= date.today():
-                    historical_payload = twc_historical_hourly_by_icao(config, station, units=twc_units)
-                    observed_points = observed_twc_points(historical_payload, event["_parsed_event_date"], city_local_dt)
+                    historical_payload = twc_historical_observations_by_icao(config, station, units=twc_units, event_date=event["_parsed_event_date"])
+                    observed_points = observed_twc_observation_points(historical_payload, event["_parsed_event_date"], city_local_dt)
                 combined_points = merge_observed_and_forecast_points(observed_points, forecast_points)
                 rows.append(
                     twc_raw_wide_row(
@@ -2715,11 +2735,16 @@ def best_twc_matching_market_for_event(
 ) -> tuple[Optional[TemperatureMarket], dict[str, Any], list[dict[str, Any]]]:
     twc_units = twc_units_for_temperature_unit(event_unit)
     payload = twc_hourly_forecast_by_icao(config, station, units=twc_units)
-    if config["trading"].get("forecast_scope") == "event_day_full":
-        forecast_points = daily_twc_points(payload, event["_parsed_event_date"])
-    else:
-        forecast_points = filtered_twc_points(payload, event["_parsed_event_date"], int(config["trading"]["forecast_horizon_hours"]))
-    high, low, first_local, last_local, _, _ = summarize_points(forecast_points)
+    horizon_hours = int(config["trading"].get("forecast_horizon_hours", 6))
+    forecast_points = filtered_twc_points(payload, event["_parsed_event_date"], horizon_hours)
+    target_date = datetime.strptime(event["_parsed_event_date"], "%Y-%m-%d").date()
+    observed_points: list[tuple[datetime, float]] = []
+    historical_payload: dict[str, Any] = {}
+    if config["trading"].get("include_observed_today", True) and (city_local_dt is None or target_date <= city_local_dt.date()):
+        historical_payload = twc_historical_observations_by_icao(config, station, units=twc_units, event_date=event["_parsed_event_date"])
+        observed_points = observed_twc_observation_points(historical_payload, event["_parsed_event_date"], city_local_dt)
+    combined_points = merge_observed_and_forecast_points(observed_points, forecast_points)
+    high, low, first_local, last_local, _, _ = summarize_points(combined_points)
     forecasts_by_unit = {event_unit: {"high": high, "low": low}}
     chosen = choose_most_likely_market(markets, forecasts_by_unit, event["_parsed_kind"])
     wide_rows = [
@@ -2734,11 +2759,11 @@ def best_twc_matching_market_for_event(
             twc_units=twc_units,
             city_local_dt=city_local_dt,
             city_timezone=city_timezone,
-            observed_points=[],
+            observed_points=observed_points,
             forecast_points=forecast_points,
-            combined_points=forecast_points,
+            combined_points=combined_points,
             forecast_payload=payload,
-            historical_payload={},
+            historical_payload=historical_payload,
             event_url=event_url,
             wunderground_source_url=wu_source,
         )
@@ -2746,6 +2771,8 @@ def best_twc_matching_market_for_event(
     return chosen, {
         "payload": payload,
         "forecast_points": forecast_points,
+        "observed_points": observed_points,
+        "combined_points": combined_points,
         "forecast_high": high,
         "forecast_low": low,
         "first_local": first_local,
@@ -3636,8 +3663,8 @@ def run_strategy_cycle(config: dict[str, Any], cycle_id: str) -> int:
                 observed_points: list[tuple[datetime, float]] = []
                 historical_payload: dict[str, Any] = {}
                 if config["trading"].get("include_observed_today", True) and target == date.today():
-                    historical_payload = twc_historical_hourly_by_icao(config, station, units=twc_units)
-                    observed_points = observed_twc_points(historical_payload, event["_parsed_event_date"], city_local_dt)
+                    historical_payload = twc_historical_observations_by_icao(config, station, units=twc_units, event_date=event["_parsed_event_date"])
+                    observed_points = observed_twc_observation_points(historical_payload, event["_parsed_event_date"], city_local_dt)
                 combined_points = merge_observed_and_forecast_points(observed_points, forecast_points)
                 twc_wide_rows.append(
                     twc_raw_wide_row(
@@ -3975,7 +4002,11 @@ def run(config: dict[str, Any]) -> None:
     while True:
         cycle_num += 1
         run_cycle(config, cycle_num, last_run_at)
-        process_strategy4_reprice(config)
+        process_strategy4_reprice_on_trigger(
+            config,
+            force=True,
+            trigger_context={"source": "scheduled_cycle_twc_reprice", "cycle_num": cycle_num},
+        )
         if config["scheduler"]["settle_after_each_cycle"]:
             settle_open_trades(config)
             summarize_settled(config)

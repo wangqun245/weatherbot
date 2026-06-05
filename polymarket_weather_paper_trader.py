@@ -153,13 +153,12 @@ def default_config() -> dict[str, Any]:
         "fee_rate": 0.05,
         "fee_enabled": True,
         "deterministic_min_yes_price": 0.01,
-        "deterministic_no_max_price": 0.99,
-        "deterministic_yes_max_price": 0.99,
+        "deterministic_no_max_price": 0.98,
+        "deterministic_yes_max_price": 0.98,
         "monitor_price_change_pct": 0.03,
+        "twc_post_entry_verify_seconds": 7200,
         "aviation_poll_after_observation_minutes": 15,
         "aviation_poll_interval_seconds": 60,
-        "twc_verify_interval_seconds": 3,
-        "twc_verify_window_seconds": 180,
         "allowed_cities": allowed,
         "websocket_enabled": True,
         "websocket_url": "wss://ws-subscriptions-clob.polymarket.com/ws/market",
@@ -529,6 +528,13 @@ def deterministic_extreme_market_reached(market: TemperatureMarket, kind: str, o
     return market_contains_temperature(market, float(observed_low), unit) if lo is not None else hi is None or float(observed_low) <= hi
 
 
+def trade_observation_verified(trade: PaperTrade, market: TemperatureMarket, observed_high: Optional[float], observed_low: Optional[float], unit: str) -> bool:
+    side = (trade.position_side or "YES").upper()
+    if side == "NO":
+        return deterministic_market_impossible(market, trade.kind, observed_high, observed_low, unit)
+    return deterministic_extreme_market_reached(market, trade.kind, observed_high, observed_low, unit)
+
+
 def twc_units_for_temperature_unit(unit: str) -> str:
     return "m" if unit.upper() == "C" else "e"
 
@@ -631,27 +637,6 @@ def aviation_observed_extremes(config: dict[str, Any], station: str, city: str, 
     high, low, _, _, _, _ = summarize_points(points)
     latest_dt = max((dt for dt, _ in points), default=None)
     return high, low, latest_dt, points
-
-
-def deterministic_twc_confirms_aviation(config: dict[str, Any], station: str, event_date: str, city_local_dt: Optional[datetime], unit: str, kind: str, aviation_high: Optional[float], aviation_low: Optional[float]) -> bool:
-    twc_high, twc_low, _, _ = deterministic_observed_extremes_from_twc(config, station, event_date, city_local_dt, unit)
-    if kind == "Highest":
-        return aviation_high is not None and twc_high is not None and float(twc_high) >= float(aviation_high)
-    return aviation_low is not None and twc_low is not None and float(twc_low) <= float(aviation_low)
-
-
-def wait_for_twc_confirmation(config: dict[str, Any], event: dict[str, Any], station: str, event_unit: str, aviation_high: Optional[float], aviation_low: Optional[float]) -> bool:
-    interval = max(1, int(config["trading"].get("twc_verify_interval_seconds", 3)))
-    deadline = time.monotonic() + max(interval, int(config["trading"].get("twc_verify_window_seconds", 180)))
-    city = event["_parsed_city"]
-    kind = event["_parsed_kind"]
-    event_date = event["_parsed_event_date"]
-    while time.monotonic() <= deadline:
-        city_local_dt, _, _ = city_local_now(config, city)
-        if deterministic_twc_confirms_aviation(config, station, event_date, city_local_dt, event_unit, kind, aviation_high, aviation_low):
-            return True
-        time.sleep(interval)
-    return False
 
 
 def taker_fee_usdc(shares: float, price: float, fee_rate: float, fee_enabled: bool) -> float:
@@ -851,6 +836,77 @@ def open_trade_exists(trades: list[PaperTrade], strategy_name: str, market_id: s
     return any(t.status == "OPEN" and t.strategy == strategy_name and t.market_id == market_id and (t.position_side or "YES").upper() == side.upper() for t in trades)
 
 
+def trade_age_seconds(trade: PaperTrade) -> float:
+    try:
+        created = datetime.fromisoformat(trade.created_at)
+    except ValueError:
+        return 0.0
+    if created.tzinfo is None:
+        created = created.replace(tzinfo=datetime.now().astimezone().tzinfo)
+    return max(0.0, (datetime.now(created.tzinfo) - created).total_seconds())
+
+
+def verify_open_positions_with_twc(config: dict[str, Any], trigger_context: Optional[dict[str, Any]] = None) -> list[PaperTrade]:
+    trades = read_trades(config["outputs"]["trades_csv"])
+    strategy_name = str(config["trading"]["strategy_name"])
+    verify_seconds = int(config["trading"].get("twc_post_entry_verify_seconds", 7200))
+    trigger_context = trigger_context or {}
+    trigger_market_id = str(trigger_context.get("market_id") or "")
+    changed = False
+
+    for trade in trades:
+        if trade.status != "OPEN" or trade.strategy != strategy_name:
+            continue
+        if "metar" not in (trade.forecast_source or "").lower():
+            continue
+        try:
+            event = fetch_event_by_url(config, trade.polymarket_url, trade.city, trade.kind, trade.event_date)
+            if not event:
+                continue
+            markets = markets_for_event(config, event)
+            market = next((m for m in markets if m.market_id == trade.market_id), None)
+            if not market:
+                continue
+            event_unit = event_market_unit(markets)
+            station = trade.forecast_station or station_from_wu_url(extract_wunderground_source(config, trade.polymarket_url))
+            if not station:
+                continue
+            city_local_dt, _, _ = city_local_now(config, trade.city)
+            twc_high, twc_low, _, _ = deterministic_observed_extremes_from_twc(config, station, trade.event_date, city_local_dt, event_unit)
+            if trade_observation_verified(trade, market, twc_high, twc_low, event_unit):
+                if trade.settlement_source != "twc_verified_hold":
+                    trade.settlement_source = "twc_verified_hold"
+                    trade.error = ""
+                    changed = True
+                continue
+
+            triggered_by_position_price = bool(trigger_market_id and trigger_market_id == trade.market_id)
+            expired = trade_age_seconds(trade) >= verify_seconds
+            if triggered_by_position_price or expired:
+                reason = "twc_inconsistent_after_position_price_move" if triggered_by_position_price else "twc_not_verified_within_2h"
+                close_trade(config, trade, market, reason)
+                changed = True
+                LOGGER.info(
+                    "twc verification sell trade=%s city=%s kind=%s market=%s reason=%s twc_high=%s twc_low=%s age_seconds=%.0f",
+                    trade.trade_id,
+                    trade.city,
+                    trade.kind,
+                    trade.market_id,
+                    reason,
+                    twc_high,
+                    twc_low,
+                    trade_age_seconds(trade),
+                )
+        except Exception:
+            LOGGER.exception("twc position verification failed trade=%s", trade.trade_id)
+
+    if changed:
+        write_csv(config["outputs"]["trades_csv"], trades)
+        write_csv(config["outputs"]["settled_trades_csv"], trades)
+        write_performance_reports(config, trades)
+    return trades
+
+
 def process_deterministic_harvest(config: dict[str, Any], trigger_context: dict[str, Any]) -> list[PaperTrade]:
     city = str(trigger_context.get("city") or "")
     kind = str(trigger_context.get("kind") or "")
@@ -868,9 +924,18 @@ def process_deterministic_harvest(config: dict[str, Any], trigger_context: dict[
     if not station:
         LOGGER.warning("deterministic skip missing station city=%s kind=%s url=%s", city, kind, event_url)
         return []
-    city_local_dt, _, _ = city_local_now(config, city)
-    observed_high, observed_low, _, _ = deterministic_observed_extremes_from_twc(config, station, event_date, city_local_dt, event_unit)
-    EXTREMES_BY_EVENT[(event_date, city, kind)] = {"observed_high": observed_high, "observed_low": observed_low, "checked_at": datetime.now().isoformat(timespec="seconds")}
+    observed_high = trigger_context.get("aviation_high")
+    observed_low = trigger_context.get("aviation_low")
+    if observed_high is None and observed_low is None:
+        observed_high, observed_low, _, _ = aviation_observed_extremes(config, station, city, event_date, event_unit)
+    observed_high = float(observed_high) if observed_high is not None else None
+    observed_low = float(observed_low) if observed_low is not None else None
+    EXTREMES_BY_EVENT[(event_date, city, kind)] = {
+        "source": "aviation_metar",
+        "observed_high": observed_high,
+        "observed_low": observed_low,
+        "checked_at": datetime.now().isoformat(timespec="seconds"),
+    }
 
     trades = read_trades(config["outputs"]["trades_csv"])
     strategy_name = str(config["trading"]["strategy_name"])
@@ -885,9 +950,9 @@ def process_deterministic_harvest(config: dict[str, Any], trigger_context: dict[
             continue
         market = markets_by_id.get(trade.market_id)
         if market and deterministic_no_possible_again(market, kind, observed_high, observed_low, event_unit):
-            close_trade(config, trade, market, "deterministic_twc_correction_no_possible_again")
+            close_trade(config, trade, market, "metar_correction_no_possible_again")
             changed = True
-            LOGGER.info("deterministic correction sell_no trade=%s city=%s kind=%s market=%s", trade.trade_id, city, kind, market.market_id)
+            LOGGER.info("metar correction sell_no trade=%s city=%s kind=%s market=%s", trade.trade_id, city, kind, market.market_id)
 
     ordered = deterministic_ordered_markets(markets, event_unit, kind)
     extreme_market = ordered[-1] if ordered else None
@@ -899,9 +964,9 @@ def process_deterministic_harvest(config: dict[str, Any], trigger_context: dict[
     if extreme_market and extreme_reached and not open_trade_exists(trades + new_trades, strategy_name, extreme_market.market_id, "YES"):
         price = float(extreme_market.yes_price or 0.0)
         if 0 < price <= yes_max:
-            new_trades.append(make_trade(config, cycle_id, extreme_market, wu_source, station, "YES", observed_high, observed_low, "extreme_yes_reached"))
+            new_trades.append(make_trade(config, cycle_id, extreme_market, wu_source, station, "YES", observed_high, observed_low, "metar_extreme_yes_reached"))
             changed = True
-            LOGGER.info("deterministic buy_yes city=%s kind=%s market=%s price=%s", city, kind, extreme_market.market_id, price)
+            LOGGER.info("metar buy_yes city=%s kind=%s market=%s price=%s observed_high=%s observed_low=%s", city, kind, extreme_market.market_id, price, observed_high, observed_low)
 
     if not extreme_reached:
         for market in ordered:
@@ -912,9 +977,9 @@ def process_deterministic_harvest(config: dict[str, Any], trigger_context: dict[
             no_price = market_no_price(market)
             if no_price is None or no_price <= 0 or no_price > no_max:
                 continue
-            new_trades.append(make_trade(config, cycle_id, market, wu_source, station, "NO", observed_high, observed_low, "impossible_no"))
+            new_trades.append(make_trade(config, cycle_id, market, wu_source, station, "NO", observed_high, observed_low, "metar_impossible_no"))
             changed = True
-            LOGGER.info("deterministic buy_no city=%s kind=%s market=%s no_price=%s observed_high=%s observed_low=%s", city, kind, market.market_id, no_price, observed_high, observed_low)
+            LOGGER.info("metar buy_no city=%s kind=%s market=%s no_price=%s observed_high=%s observed_low=%s", city, kind, market.market_id, no_price, observed_high, observed_low)
             break
 
     if new_trades:
@@ -985,6 +1050,8 @@ def frontier_markets(config: dict[str, Any], markets: list[TemperatureMarket], e
 def websocket_assets(config: dict[str, Any]) -> dict[str, dict[str, Any]]:
     trades = read_trades(config["outputs"]["trades_csv"])
     assets: dict[str, dict[str, Any]] = {}
+    strategy_name = str(config["trading"]["strategy_name"])
+    open_trades = [t for t in trades if t.status == "OPEN" and t.strategy == strategy_name]
     for target in [resolve_date(str(v)) for v in config["events"]["target_dates"]]:
         for event in discover_temperature_events(config, target):
             city = event["_parsed_city"]
@@ -992,13 +1059,48 @@ def websocket_assets(config: dict[str, Any]) -> dict[str, dict[str, Any]]:
             event_date = event["_parsed_event_date"]
             try:
                 markets = markets_for_event(config, event)
+                markets_by_id = {m.market_id: m for m in markets}
+                for trade in open_trades:
+                    if trade.city != city or trade.kind != kind or trade.event_date != event_date:
+                        continue
+                    held_market = markets_by_id.get(trade.market_id)
+                    if not held_market:
+                        continue
+                    raw = parse_jsonish(held_market.raw_market_json, {})
+                    wanted_side = (trade.position_side or "YES").lower()
+                    for asset_id, outcome in market_clob_tokens(raw):
+                        if outcome.lower() == wanted_side:
+                            current_price = held_market.yes_price if wanted_side == "yes" else market_no_price(held_market)
+                            assets[asset_id] = {
+                                "asset_id": asset_id,
+                                "role": "held_position",
+                                "trade_id": trade.trade_id,
+                                "position_side": trade.position_side,
+                                "market_id": held_market.market_id,
+                                "city": city,
+                                "kind": kind,
+                                "event_date": event_date,
+                                "polymarket_url": poly_url_from_event(event),
+                                "last_price": current_price,
+                            }
                 obs = EXTREMES_BY_EVENT.get((event_date, city, kind), {})
                 selected = frontier_markets(config, markets, event_market_unit(markets), kind, trades, obs.get("observed_high"), obs.get("observed_low"))
                 for market in selected:
                     raw = parse_jsonish(market.raw_market_json, {})
                     for asset_id, outcome in market_clob_tokens(raw):
                         if outcome.lower() == "yes":
-                            assets[asset_id] = {"asset_id": asset_id, "market_id": market.market_id, "city": city, "kind": kind, "event_date": event_date, "polymarket_url": poly_url_from_event(event), "last_price": market.yes_price}
+                            if asset_id in assets:
+                                continue
+                            assets[asset_id] = {
+                                "asset_id": asset_id,
+                                "role": "frontier",
+                                "market_id": market.market_id,
+                                "city": city,
+                                "kind": kind,
+                                "event_date": event_date,
+                                "polymarket_url": poly_url_from_event(event),
+                                "last_price": market.yes_price,
+                            }
             except Exception:
                 LOGGER.exception("websocket asset discovery failed city=%s kind=%s", city, kind)
     return assets
@@ -1062,7 +1164,10 @@ def monitor_websocket(config: dict[str, Any], duration_seconds: int = 0) -> bool
                     **asset,
                 }
                 LOGGER.info("websocket trigger %s", json.dumps(context, ensure_ascii=False, sort_keys=True))
-                process_deterministic_harvest(config, context)
+                if asset.get("role") == "held_position":
+                    verify_open_positions_with_twc(config, context)
+                else:
+                    process_deterministic_harvest(config, context)
                 assets = websocket_assets(config)
     finally:
         try:
@@ -1125,10 +1230,18 @@ def aviation_supervisor(config: dict[str, Any]) -> None:
                     if not changed:
                         continue
                     LOGGER.info("aviation extreme changed city=%s kind=%s high=%s low=%s latest=%s", city, kind, aviation_high, aviation_low, latest_dt.isoformat())
-                    if wait_for_twc_confirmation(config, event, station, event_unit, aviation_high, aviation_low):
-                        process_deterministic_harvest(config, {"source": "aviation_metar_twc_confirmed", "city": city, "kind": kind, "event_date": event_date, "polymarket_url": event_url})
-                    else:
-                        LOGGER.info("twc not confirmed city=%s kind=%s station=%s high=%s low=%s", city, kind, station, aviation_high, aviation_low)
+                    process_deterministic_harvest(
+                        config,
+                        {
+                            "source": "aviation_metar",
+                            "city": city,
+                            "kind": kind,
+                            "event_date": event_date,
+                            "polymarket_url": event_url,
+                            "aviation_high": aviation_high,
+                            "aviation_low": aviation_low,
+                        },
+                    )
                 except Exception:
                     LOGGER.exception("aviation event failed city=%s kind=%s", city, kind)
         except Exception:
@@ -1163,6 +1276,7 @@ def run(config: dict[str, Any]) -> None:
     while True:
         cycle_num += 1
         if config["scheduler"].get("settle_after_each_cycle", True):
+            verify_open_positions_with_twc(config, {"source": "scheduled_twc_position_verification"})
             settle_open_trades(config)
             summarize_settled(config)
         write_state(config, cycle_num)

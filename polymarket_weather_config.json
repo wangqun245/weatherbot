@@ -1,6 +1,7 @@
 {
   "api": {
     "polymarket_gamma_base": "https://gamma-api.polymarket.com",
+    "polymarket_data_base": "https://data-api.polymarket.com",
     "weather_company_base": "https://api.weather.com",
     "twc_api_key_env": "TWC_API_KEY",
     "twc_api_key": "e1f10a1e78da46f5b10a1e78da96f525",
@@ -84,6 +85,7 @@
   },
   "outputs": {
     "trades_csv": "polymarket_weather_trades.csv",
+    "positions_json": "polymarket_weather_positions.json",
     "settled_trades_csv": "polymarket_weather_trades_settled.csv",
     "performance_by_cycle_csv": "polymarket_weather_performance_by_cycle.csv",
     "performance_by_event_csv": "polymarket_weather_performance_by_event.csv",
@@ -91,6 +93,12 @@
     "log_file": "bot.log",
     "log_level": "INFO",
     "console_log_enabled": false
+  },
+  "account": {
+    "polymarket_user_address": "",
+    "polymarket_user_address_env": "POLYMARKET_USER_ADDRESS",
+    "sync_positions_on_start": true,
+    "sync_positions_on_stop": true
   },
   "strategies": [
     {

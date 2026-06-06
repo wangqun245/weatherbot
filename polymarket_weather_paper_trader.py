@@ -15,6 +15,7 @@ This is a simulator. It never submits real orders.
 from __future__ import annotations
 
 import argparse
+import atexit
 import csv
 import json
 import logging
@@ -126,6 +127,7 @@ class PaperTrade:
     payout_usdc: float = 0.0
     pnl_usdc: float = 0.0
     error: str = ""
+    asset_id: str = ""
 
 
 def deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
@@ -169,9 +171,10 @@ def default_config() -> dict[str, Any]:
         "websocket_asset_refresh_seconds": 300,
     }
     return {
-        "api": {
-            "polymarket_gamma_base": "https://gamma-api.polymarket.com",
-            "weather_company_base": "https://api.weather.com",
+    "api": {
+        "polymarket_gamma_base": "https://gamma-api.polymarket.com",
+        "polymarket_data_base": "https://data-api.polymarket.com",
+        "weather_company_base": "https://api.weather.com",
             "twc_api_key_env": "TWC_API_KEY",
             "twc_api_key": "",
             "twc_units": "e",
@@ -183,6 +186,7 @@ def default_config() -> dict[str, Any]:
         "scheduler": {"poll_interval_minutes": 15, "run_once": False, "max_cycles": 0, "settle_after_each_cycle": True},
         "outputs": {
             "trades_csv": "polymarket_weather_trades.csv",
+            "positions_json": "polymarket_weather_positions.json",
             "settled_trades_csv": "polymarket_weather_trades_settled.csv",
             "performance_by_cycle_csv": "polymarket_weather_performance_by_cycle.csv",
             "performance_by_event_csv": "polymarket_weather_performance_by_event.csv",
@@ -190,6 +194,12 @@ def default_config() -> dict[str, Any]:
             "log_file": "bot.log",
             "log_level": "INFO",
             "console_log_enabled": False,
+        },
+        "account": {
+            "polymarket_user_address": "",
+            "polymarket_user_address_env": "POLYMARKET_USER_ADDRESS",
+            "sync_positions_on_start": True,
+            "sync_positions_on_stop": True,
         },
         "strategies": [{"name": "deterministic_harvest", "enabled": True, "events": {"target_dates": ["today"]}, "trading": trading}],
     }
@@ -237,14 +247,52 @@ def setup_logging(config: dict[str, Any]) -> None:
     logging.basicConfig(level=level, format="%(asctime)s %(levelname)s %(message)s", handlers=handlers, force=True)
 
 
-def resolve_date(value: str) -> date:
-    today = datetime.now().date()
+def city_timezone(config: dict[str, Any], city: str) -> ZoneInfo:
+    tz_name = config["events"].get("city_timezones", {}).get(city, "UTC")
+    return ZoneInfo(tz_name)
+
+
+def local_date_for_timezone(tz_name: str, *, offset_days: int = 0) -> date:
+    return (datetime.now(ZoneInfo(tz_name)) + timedelta(days=offset_days)).date()
+
+
+def resolve_date(value: str, *, base_date: Optional[date] = None) -> date:
+    today = base_date or datetime.now().date()
     text = value.strip().lower()
     if text == "today":
         return today
     if text == "tomorrow":
         return today + timedelta(days=1)
     return date.fromisoformat(value)
+
+
+def resolve_event_target_dates(config: dict[str, Any]) -> list[date]:
+    cities = set(config["events"].get("allowed_cities") or config["trading"].get("allowed_cities") or [])
+    tz_by_city = config["events"].get("city_timezones", {})
+    timezone_names = {tz_by_city.get(city, "UTC") for city in cities} or {"UTC"}
+    targets: set[date] = set()
+    for value in config["events"]["target_dates"]:
+        text = str(value).strip().lower()
+        if text in {"today", "tomorrow"}:
+            offset = 1 if text == "tomorrow" else 0
+            for tz_name in timezone_names:
+                targets.add(local_date_for_timezone(tz_name, offset_days=offset))
+        else:
+            targets.add(date.fromisoformat(str(value)))
+    return sorted(targets)
+
+
+def resolve_event_target_dates_for_city(config: dict[str, Any], city: str) -> set[date]:
+    tz_name = config["events"].get("city_timezones", {}).get(city, "UTC")
+    targets: set[date] = set()
+    for value in config["events"]["target_dates"]:
+        text = str(value).strip().lower()
+        if text in {"today", "tomorrow"}:
+            offset = 1 if text == "tomorrow" else 0
+            targets.add(local_date_for_timezone(tz_name, offset_days=offset))
+        else:
+            targets.add(date.fromisoformat(str(value)))
+    return targets
 
 
 def infer_year(month_day_text: str, today: Optional[date] = None) -> date:
@@ -277,6 +325,19 @@ def twc_get(config: dict[str, Any], path: str, params: dict[str, Any]) -> Any:
     if not api_key:
         raise RuntimeError(f"Missing Weather Company API key. Set config api.twc_api_key or {env_name}.")
     return http_get_json(f"{config['api']['weather_company_base']}{path}", {"apiKey": api_key, **params}, int(config["api"]["request_timeout_seconds"]))
+
+
+def polymarket_data_get(config: dict[str, Any], path: str, params: Optional[dict[str, Any]] = None) -> Any:
+    return http_get_json(f"{config['api']['polymarket_data_base']}{path}", params, int(config["api"]["request_timeout_seconds"]))
+
+
+def configured_polymarket_user(config: dict[str, Any]) -> str:
+    account = config.get("account", {})
+    explicit = str(account.get("polymarket_user_address") or "").strip()
+    if explicit:
+        return explicit
+    env_name = str(account.get("polymarket_user_address_env") or "POLYMARKET_USER_ADDRESS").strip()
+    return os.environ.get(env_name, "").strip() if env_name else ""
 
 
 def parse_jsonish(value: Any, default: Any) -> Any:
@@ -328,8 +389,8 @@ def discover_temperature_events(config: dict[str, Any], target: date) -> list[di
                 if not parsed:
                     continue
                 kind, city, md = parsed
-                event_date = infer_year(md)
-                if event_date != target or (city_filter and city_filter not in city.lower()) or (allowed and city not in allowed):
+                event_date = infer_year(md, today=target)
+                if event_date != target or event_date not in resolve_event_target_dates_for_city(config, city) or (city_filter and city_filter not in city.lower()) or (allowed and city not in allowed):
                     continue
                 event["_parsed_kind"] = kind
                 event["_parsed_city"] = city
@@ -358,7 +419,7 @@ def fetch_event_by_url(config: dict[str, Any], event_url: str, city: str, kind: 
         parsed = parse_event_title(event.get("title") or event.get("question") or "")
         if parsed:
             event["_parsed_kind"], event["_parsed_city"], md = parsed
-            event["_parsed_event_date"] = infer_year(md).isoformat()
+            event["_parsed_event_date"] = infer_year(md, today=date.fromisoformat(event_date)).isoformat()
         if event.get("_parsed_city") == city and event.get("_parsed_kind") == kind and event.get("_parsed_event_date") == event_date:
             return event
     return None
@@ -498,6 +559,17 @@ def market_no_price(market: TemperatureMarket) -> Optional[float]:
     return None
 
 
+def asset_id_for_market_side(market: TemperatureMarket, side: str) -> str:
+    raw = parse_jsonish(market.raw_market_json, {})
+    if not isinstance(raw, dict):
+        return ""
+    wanted = side.strip().lower()
+    for asset_id, outcome in market_clob_tokens(raw):
+        if outcome.strip().lower() == wanted:
+            return asset_id
+    return ""
+
+
 def deterministic_ordered_markets(markets: list[TemperatureMarket], event_unit: str, kind: str) -> list[TemperatureMarket]:
     ordered = sorted_markets_for_unit(markets, event_unit)
     return ordered if kind == "Highest" else list(reversed(ordered))
@@ -586,7 +658,33 @@ def summarize_points(points: list[tuple[datetime, float]]) -> tuple[Optional[flo
 
 
 def deterministic_observed_extremes_from_twc(config: dict[str, Any], station: str, event_date: str, city_local_dt: Optional[datetime], unit: str) -> tuple[Optional[float], Optional[float], list[tuple[datetime, float]], dict[str, Any]]:
-    payload = twc_historical_observations_by_icao(config, station, twc_units_for_temperature_unit(unit), event_date)
+    if city_local_dt is not None:
+        try:
+            target_date = date.fromisoformat(event_date)
+        except ValueError:
+            target_date = None
+        if target_date is not None and city_local_dt.date() < target_date:
+            LOGGER.info(
+                "twc historical skip before local event day station=%s event_date=%s city_local=%s",
+                station,
+                event_date,
+                city_local_dt.isoformat(timespec="seconds"),
+            )
+            return None, None, [], {}
+    try:
+        payload = twc_historical_observations_by_icao(config, station, twc_units_for_temperature_unit(unit), event_date)
+    except requests.HTTPError as exc:
+        status = exc.response.status_code if exc.response is not None else None
+        if status == 400:
+            LOGGER.warning(
+                "twc historical unavailable station=%s event_date=%s unit=%s status=400 url=%s",
+                station,
+                event_date,
+                unit,
+                exc.response.url if exc.response is not None else "",
+            )
+            return None, None, [], {}
+        raise
     points = observed_twc_observation_points(payload, event_date, city_local_dt)
     high, low, _, _, _, _ = summarize_points(points)
     return high, low, points, payload
@@ -615,14 +713,32 @@ def parse_aviation_obs_time(value: Any) -> Optional[datetime]:
 
 def city_local_now(config: dict[str, Any], city: str) -> tuple[datetime, str, str]:
     tz_name = config["events"].get("city_timezones", {}).get(city, "UTC")
-    value = datetime.now(ZoneInfo(tz_name))
+    value = datetime.now(city_timezone(config, city))
     return value, tz_name, value.isoformat(timespec="seconds")
 
 
+def aviation_hours_for_local_event_day(city_tz: ZoneInfo, event_date: str) -> int:
+    target_date = date.fromisoformat(event_date)
+    local_start = datetime(target_date.year, target_date.month, target_date.day, tzinfo=city_tz)
+    hours_since_local_start = (datetime.now(timezone.utc) - local_start.astimezone(timezone.utc)).total_seconds() / 3600.0
+    return max(24, min(48, int(hours_since_local_start) + 3))
+
+
 def aviation_observed_extremes(config: dict[str, Any], station: str, city: str, event_date: str, unit: str) -> tuple[Optional[float], Optional[float], Optional[datetime], list[tuple[datetime, float]]]:
-    city_tz = ZoneInfo(config["events"].get("city_timezones", {}).get(city, "UTC"))
+    city_tz = city_timezone(config, city)
+    target_date = date.fromisoformat(event_date)
+    now_local = datetime.now(city_tz)
+    if now_local.date() < target_date:
+        LOGGER.info(
+            "aviation metar skip before local event day station=%s city=%s event_date=%s city_local=%s",
+            station,
+            city,
+            event_date,
+            now_local.isoformat(timespec="seconds"),
+        )
+        return None, None, None, []
     points: list[tuple[datetime, float]] = []
-    for row in aviation_metar_observations(station, 24):
+    for row in aviation_metar_observations(station, aviation_hours_for_local_event_day(city_tz, event_date)):
         obs_dt_utc = parse_aviation_obs_time(row.get("obsTime") or row.get("reportTime") or row.get("receiptTime"))
         raw_temp = row.get("temp")
         if obs_dt_utc is None or raw_temp is None:
@@ -693,6 +809,7 @@ def make_trade(config: dict[str, Any], cycle_id: str, market: TemperatureMarket,
         monitor_last_yes_price=market.yes_price,
         monitor_last_checked_at=now,
         monitor_price_trigger=float(config["trading"].get("monitor_price_change_pct", 0.03)),
+        asset_id=asset_id_for_market_side(market, side),
     )
 
 
@@ -836,6 +953,195 @@ def open_trade_exists(trades: list[PaperTrade], strategy_name: str, market_id: s
     return any(t.status == "OPEN" and t.strategy == strategy_name and t.market_id == market_id and (t.position_side or "YES").upper() == side.upper() for t in trades)
 
 
+def safe_float(value: Any, default: float = 0.0) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def polymarket_account_positions(config: dict[str, Any]) -> list[dict[str, Any]]:
+    user = configured_polymarket_user(config)
+    if not user:
+        LOGGER.info("polymarket position sync skipped: no account.polymarket_user_address configured")
+        return []
+    rows: list[dict[str, Any]] = []
+    limit = 500
+    for offset in range(0, 5000, limit):
+        params = {"user": user, "limit": limit, "offset": offset}
+        payload = polymarket_data_get(config, "/positions", params)
+        batch = payload.get("data") if isinstance(payload, dict) else payload
+        if not isinstance(batch, list) or not batch:
+            break
+        rows.extend([row for row in batch if isinstance(row, dict)])
+        if len(batch) < limit:
+            break
+    return rows
+
+
+def weather_market_lookup(config: dict[str, Any]) -> tuple[dict[str, TemperatureMarket], dict[str, TemperatureMarket], dict[str, TemperatureMarket]]:
+    by_asset: dict[str, TemperatureMarket] = {}
+    by_condition: dict[str, TemperatureMarket] = {}
+    by_market: dict[str, TemperatureMarket] = {}
+    for target in resolve_event_target_dates(config):
+        for event in discover_temperature_events(config, target):
+            for market in markets_for_event(config, event):
+                by_market[market.market_id] = market
+                if market.condition_id:
+                    by_condition[market.condition_id.lower()] = market
+                raw = parse_jsonish(market.raw_market_json, {})
+                if isinstance(raw, dict):
+                    for asset_id, _ in market_clob_tokens(raw):
+                        by_asset[asset_id] = market
+    return by_asset, by_condition, by_market
+
+
+def position_asset_id(row: dict[str, Any]) -> str:
+    for key in ("asset", "asset_id", "assetId", "token_id", "tokenId", "clobTokenId", "clobTokenID"):
+        value = row.get(key)
+        if value not in (None, ""):
+            return str(value)
+    return ""
+
+
+def position_side(row: dict[str, Any]) -> str:
+    outcome = str(row.get("outcome") or row.get("side") or row.get("title") or "").strip().lower()
+    if outcome in {"yes", "no"}:
+        return outcome.upper()
+    return "YES"
+
+
+def position_size(row: dict[str, Any]) -> float:
+    for key in ("size", "balance", "shares", "quantity"):
+        value = safe_float(row.get(key), 0.0)
+        if value:
+            return value
+    return 0.0
+
+
+def position_average_price(row: dict[str, Any]) -> float:
+    for key in ("avgPrice", "averagePrice", "avg_price", "price"):
+        value = safe_float(row.get(key), 0.0)
+        if value:
+            return value
+    size = position_size(row)
+    for key in ("initialValue", "currentValue", "value"):
+        value = safe_float(row.get(key), 0.0)
+        if value and size:
+            return value / size
+    return 0.0
+
+
+def raw_positions_snapshot_path(config: dict[str, Any]) -> str:
+    return str(config["outputs"].get("positions_json") or "polymarket_weather_positions.json")
+
+
+def sync_polymarket_positions_to_disk(config: dict[str, Any], *, reason: str) -> list[PaperTrade]:
+    if not config.get("account", {}).get("sync_positions_on_start", True) and reason == "start":
+        return read_trades(config["outputs"]["trades_csv"])
+    positions = polymarket_account_positions(config)
+    if not positions:
+        LOGGER.info("polymarket position sync %s: no remote positions, using local trades", reason)
+        return read_trades(config["outputs"]["trades_csv"])
+
+    with IO_LOCK, open(raw_positions_snapshot_path(config), "w", encoding="utf-8") as f:
+        json.dump({"synced_at": datetime.now().isoformat(timespec="seconds"), "reason": reason, "positions": positions}, f, indent=2, ensure_ascii=False)
+
+    by_asset, by_condition, by_market = weather_market_lookup(config)
+    trades = read_trades(config["outputs"]["trades_csv"])
+    existing = {(t.asset_id or "", t.market_id, (t.position_side or "YES").upper()) for t in trades if t.status == "OPEN"}
+    strategy_name = str(config["trading"]["strategy_name"])
+    added = 0
+    for row in positions:
+        size = position_size(row)
+        if size <= 0:
+            continue
+        asset_id = position_asset_id(row)
+        side = position_side(row)
+        market_id = str(row.get("market") or row.get("marketId") or row.get("market_id") or "")
+        condition_id = str(row.get("conditionId") or row.get("condition_id") or "")
+        market = by_asset.get(asset_id) or by_market.get(market_id) or by_condition.get(condition_id.lower())
+        if not market:
+            continue
+        dedupe_key = (asset_id, market.market_id, side)
+        if dedupe_key in existing or ("", market.market_id, side) in existing:
+            continue
+        price = position_average_price(row) or (market.yes_price if side == "YES" else market_no_price(market)) or 0.0
+        now = datetime.now().isoformat(timespec="seconds")
+        comparable_min, comparable_max, comparable_unit = comparable_rule_bounds(market, market.unit)
+        total_cost = round(size * price, 8)
+        trade = PaperTrade(
+            trade_id=f"{now}:polymarket_account_sync:{side}:{market.market_id}:{asset_id or time.time_ns()}",
+            created_at=now,
+            cycle_id=f"{now}:polymarket_account_sync",
+            strategy=strategy_name,
+            event_id=market.event_id,
+            market_id=market.market_id,
+            condition_id=market.condition_id or condition_id,
+            city=market.city,
+            kind=market.kind,
+            event_date=market.event_date,
+            event_title=market.event_title,
+            market_question=market.market_question,
+            polymarket_url=market.polymarket_url,
+            wunderground_source_url="",
+            forecast_source="polymarket_account_position_sync_metar_unknown",
+            forecast_observed_at=now,
+            forecast_station="",
+            forecast_temp=None,
+            forecast_high=None,
+            forecast_low=None,
+            forecast_first_valid_time_local="",
+            forecast_last_valid_time_local="",
+            forecast_unit=market.unit,
+            rule_min=market.rule_min,
+            rule_max=market.rule_max,
+            market_unit=market.unit,
+            comparable_rule_min=comparable_min,
+            comparable_rule_max=comparable_max,
+            comparable_unit=comparable_unit,
+            yes_price=price,
+            mispricing_price_threshold=1.0,
+            pricing_edge=0.0,
+            notional_usdc=total_cost,
+            shares=size,
+            taker_fee_rate=float(config["trading"]["fee_rate"]),
+            buy_fee_usdc=0.0,
+            total_cost_usdc=total_cost,
+            position_side=side,
+            monitor_last_yes_price=market.yes_price,
+            monitor_last_checked_at=now,
+            monitor_price_trigger=float(config["trading"].get("monitor_price_change_pct", 0.03)),
+            settlement_source="polymarket_account_sync",
+            asset_id=asset_id or asset_id_for_market_side(market, side),
+        )
+        trades.append(trade)
+        existing.add(dedupe_key)
+        added += 1
+
+    if added:
+        write_csv(config["outputs"]["trades_csv"], trades)
+        write_csv(config["outputs"]["settled_trades_csv"], trades)
+        write_performance_reports(config, trades)
+    LOGGER.info("polymarket position sync %s complete remote_positions=%s added_weather_positions=%s", reason, len(positions), added)
+    return trades
+
+
+def persist_positions_before_stop(config: dict[str, Any], *, reason: str = "stop") -> None:
+    try:
+        if config.get("account", {}).get("sync_positions_on_stop", True):
+            sync_polymarket_positions_to_disk(config, reason=reason)
+        else:
+            trades = read_trades(config["outputs"]["trades_csv"])
+            if trades:
+                write_csv(config["outputs"]["trades_csv"], trades)
+                write_csv(config["outputs"]["settled_trades_csv"], trades)
+                write_performance_reports(config, trades)
+        LOGGER.info("position persistence complete reason=%s", reason)
+    except Exception:
+        LOGGER.exception("position persistence failed reason=%s", reason)
+
+
 def trade_age_seconds(trade: PaperTrade) -> float:
     try:
         created = datetime.fromisoformat(trade.created_at)
@@ -873,6 +1179,16 @@ def verify_open_positions_with_twc(config: dict[str, Any], trigger_context: Opti
                 continue
             city_local_dt, _, _ = city_local_now(config, trade.city)
             twc_high, twc_low, _, _ = deterministic_observed_extremes_from_twc(config, station, trade.event_date, city_local_dt, event_unit)
+            if (trade.kind == "Highest" and twc_high is None) or (trade.kind == "Lowest" and twc_low is None):
+                LOGGER.info(
+                    "twc verification skip no local observations trade=%s city=%s kind=%s event_date=%s city_local=%s",
+                    trade.trade_id,
+                    trade.city,
+                    trade.kind,
+                    trade.event_date,
+                    city_local_dt.isoformat(timespec="seconds"),
+                )
+                continue
             if trade_observation_verified(trade, market, twc_high, twc_low, event_unit):
                 if trade.settlement_source != "twc_verified_hold":
                     trade.settlement_source = "twc_verified_hold"
@@ -930,6 +1246,15 @@ def process_deterministic_harvest(config: dict[str, Any], trigger_context: dict[
         observed_high, observed_low, _, _ = aviation_observed_extremes(config, station, city, event_date, event_unit)
     observed_high = float(observed_high) if observed_high is not None else None
     observed_low = float(observed_low) if observed_low is not None else None
+    if (kind == "Highest" and observed_high is None) or (kind == "Lowest" and observed_low is None):
+        LOGGER.info(
+            "deterministic skip no local aviation observations city=%s kind=%s event_date=%s station=%s",
+            city,
+            kind,
+            event_date,
+            station,
+        )
+        return []
     EXTREMES_BY_EVENT[(event_date, city, kind)] = {
         "source": "aviation_metar",
         "observed_high": observed_high,
@@ -1052,7 +1377,7 @@ def websocket_assets(config: dict[str, Any]) -> dict[str, dict[str, Any]]:
     assets: dict[str, dict[str, Any]] = {}
     strategy_name = str(config["trading"]["strategy_name"])
     open_trades = [t for t in trades if t.status == "OPEN" and t.strategy == strategy_name]
-    for target in [resolve_date(str(v)) for v in config["events"]["target_dates"]]:
+    for target in resolve_event_target_dates(config):
         for event in discover_temperature_events(config, target):
             city = event["_parsed_city"]
             kind = event["_parsed_kind"]
@@ -1065,6 +1390,21 @@ def websocket_assets(config: dict[str, Any]) -> dict[str, dict[str, Any]]:
                         continue
                     held_market = markets_by_id.get(trade.market_id)
                     if not held_market:
+                        continue
+                    if trade.asset_id:
+                        current_price = held_market.yes_price if (trade.position_side or "YES").upper() == "YES" else market_no_price(held_market)
+                        assets[trade.asset_id] = {
+                            "asset_id": trade.asset_id,
+                            "role": "held_position",
+                            "trade_id": trade.trade_id,
+                            "position_side": trade.position_side,
+                            "market_id": held_market.market_id,
+                            "city": city,
+                            "kind": kind,
+                            "event_date": event_date,
+                            "polymarket_url": poly_url_from_event(event),
+                            "last_price": current_price,
+                        }
                         continue
                     raw = parse_jsonish(held_market.raw_market_json, {})
                     wanted_side = (trade.position_side or "YES").lower()
@@ -1205,7 +1545,7 @@ def aviation_supervisor(config: dict[str, Any]) -> None:
         try:
             if time.monotonic() >= event_refresh_at:
                 event_cache = []
-                for target in [resolve_date(str(v)) for v in config["events"]["target_dates"]]:
+                for target in resolve_event_target_dates(config):
                     event_cache.extend(discover_temperature_events(config, target))
                 event_refresh_at = time.monotonic() + 300
             now_utc = datetime.now(timezone.utc)
@@ -1271,18 +1611,24 @@ def run(config: dict[str, Any]) -> None:
     cycle_num = 0
     max_cycles = int(config["scheduler"].get("max_cycles", 0))
     LOGGER.info("bot started config=%s", json.dumps(redacted_config(config), ensure_ascii=False, sort_keys=True))
+    sync_polymarket_positions_to_disk(config, reason="start")
     start_websocket_thread(config)
     start_aviation_thread(config)
-    while True:
-        cycle_num += 1
-        if config["scheduler"].get("settle_after_each_cycle", True):
-            verify_open_positions_with_twc(config, {"source": "scheduled_twc_position_verification"})
-            settle_open_trades(config)
-            summarize_settled(config)
-        write_state(config, cycle_num)
-        if max_cycles and cycle_num >= max_cycles:
-            break
-        time.sleep(max(10, int(config["scheduler"].get("poll_interval_minutes", 15)) * 60))
+    try:
+        while True:
+            cycle_num += 1
+            if config["scheduler"].get("settle_after_each_cycle", True):
+                verify_open_positions_with_twc(config, {"source": "scheduled_twc_position_verification"})
+                settle_open_trades(config)
+                summarize_settled(config)
+            write_state(config, cycle_num)
+            if max_cycles and cycle_num >= max_cycles:
+                break
+            time.sleep(max(10, int(config["scheduler"].get("poll_interval_minutes", 15)) * 60))
+    except KeyboardInterrupt:
+        LOGGER.info("bot stopping by KeyboardInterrupt")
+    finally:
+        persist_positions_before_stop(config, reason="stop")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -1296,11 +1642,14 @@ def main() -> None:
     args = build_parser().parse_args()
     config = load_config(args.config)
     setup_logging(config)
+    atexit.register(persist_positions_before_stop, config, reason="atexit")
     if args.command == "settle":
+        sync_polymarket_positions_to_disk(config, reason="start")
         settle_open_trades(config)
         summarize_settled(config)
         return
     if args.command == "once":
+        sync_polymarket_positions_to_disk(config, reason="start")
         settle_open_trades(config)
         summarize_settled(config)
         write_state(config, 1)

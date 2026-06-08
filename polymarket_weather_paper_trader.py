@@ -626,7 +626,7 @@ def clob_get(config: dict[str, Any], path: str, params: Optional[dict[str, Any]]
 
 
 def configured_polymarket_user(config: dict[str, Any]) -> str:
-    """Resolve the Polymarket account address from config or the configured environment variable.
+    """Resolve the Polymarket account address from config, user env, funder env, or safe env.
     
     Args:
         config (dict[str, Any]): Active bot configuration, including API endpoints, trading rules, outputs, and scheduler settings.
@@ -639,7 +639,15 @@ def configured_polymarket_user(config: dict[str, Any]) -> str:
     if explicit:
         return explicit
     env_name = str(account.get("polymarket_user_address_env") or "POLYMARKET_USER_ADDRESS").strip()
-    return os.environ.get(env_name, "").strip() if env_name else ""
+    user = os.environ.get(env_name, "").strip() if env_name else ""
+    if user:
+        return user
+    for fallback_key in ("funder_address_env", "safe_address_env"):
+        fallback_env = str(account.get(fallback_key) or "").strip()
+        fallback_value = os.environ.get(fallback_env, "").strip() if fallback_env else ""
+        if fallback_value:
+            return fallback_value
+    return ""
 
 
 def parse_jsonish(value: Any, default: Any) -> Any:

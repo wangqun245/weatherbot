@@ -16,9 +16,17 @@
     ],
     "city_filter": "",
     "allowed_cities": [
+      "Atlanta",
       "Austin",
+      "Chicago",
       "Dallas",
-      "Houston"
+      "Denver",
+      "Houston",
+      "Los Angeles",
+      "Miami",
+      "NYC",
+      "San Francisco",
+      "Seattle"
     ],
     "include_closed": false,
     "max_offsets": 1200,
@@ -51,9 +59,17 @@
     "aviation_poll_interval_seconds": 60,
     "aviation_refresh_probe_seconds": 180,
     "allowed_cities": [
+      "Atlanta",
       "Austin",
+      "Chicago",
       "Dallas",
-      "Houston"
+      "Denver",
+      "Houston",
+      "Los Angeles",
+      "Miami",
+      "NYC",
+      "San Francisco",
+      "Seattle"
     ],
     "websocket_enabled": true,
     "websocket_url": "wss://ws-subscriptions-clob.polymarket.com/ws/market",
@@ -81,6 +97,7 @@
     "performance_by_event_csv": "polymarket_weather_performance_by_event.csv",
     "state_json": "polymarket_weather_state.json",
     "aviation_metar_history_jsonl": "aviation_metar_history.jsonl",
+    "price_window_ticks_jsonl": "price_window_ticks.jsonl",
     "log_file": "bot.log",
     "log_level": "INFO",
     "console_log_enabled": false
@@ -107,7 +124,8 @@
     "move_to_one_fraction": 0.3,
     "no_change_pct": 0.3,
     "yes_change_pct": 0.3,
-    "report_window_seconds": 120,
+    "report_window_seconds": 210,
+    "price_window_record_seconds": 300,
     "no_max_price": 0.99,
     "yes_max_price": 0.99,
     "tgftp_verify_interval_seconds": 10,
@@ -138,9 +156,17 @@
         "aviation_poll_interval_seconds": 60,
         "aviation_refresh_probe_seconds": 180,
         "allowed_cities": [
+          "Atlanta",
           "Austin",
+          "Chicago",
           "Dallas",
-          "Houston"
+          "Denver",
+          "Houston",
+          "Los Angeles",
+          "Miami",
+          "NYC",
+          "San Francisco",
+          "Seattle"
         ],
         "websocket_enabled": true,
         "websocket_url": "wss://ws-subscriptions-clob.polymarket.com/ws/market",

@@ -58,6 +58,7 @@ TELEGRAM_NOTIFIER: Optional[Any] = None
 STATION_REPORT_TIMING: dict[tuple[str, str], dict[str, Any]] = {}
 TGFTP_VALIDATION_THREADS: set[str] = set()
 PRICE_MOMENTUM_WINDOWS: dict[str, dict[str, Any]] = {}
+PRICE_RECORDING_WINDOWS: dict[str, dict[str, Any]] = {}
 
 
 @dataclass
@@ -318,6 +319,7 @@ def default_config() -> dict[str, Any]:
             "performance_by_event_csv": "polymarket_weather_performance_by_event.csv",
             "state_json": "polymarket_weather_state.json",
             "aviation_metar_history_jsonl": "aviation_metar_history.jsonl",
+            "price_window_ticks_jsonl": "price_window_ticks.jsonl",
             "log_file": "bot.log",
             "log_level": "INFO",
             "console_log_enabled": False,
@@ -344,7 +346,8 @@ def default_config() -> dict[str, Any]:
             "move_to_one_fraction": 0.30,
             "no_change_pct": 0.30,
             "yes_change_pct": 0.30,
-            "report_window_seconds": 120,
+            "report_window_seconds": 210,
+            "price_window_record_seconds": 300,
             "no_max_price": 0.99,
             "yes_max_price": 0.99,
             "tgftp_verify_interval_seconds": 10,
@@ -1529,6 +1532,13 @@ def append_aviation_metar_history(config: dict[str, Any], station: str, rows: li
             f.write(json.dumps({"saved_at": datetime.now(timezone.utc).isoformat(), "station": station, "reason": reason, "row": row}, ensure_ascii=False, sort_keys=True) + "\n")
 
 
+def append_price_window_record(config: dict[str, Any], record: dict[str, Any]) -> None:
+    """Append one Polymarket websocket price record captured during an observation window."""
+    path = str(config.get("outputs", {}).get("price_window_ticks_jsonl") or "price_window_ticks.jsonl")
+    with IO_LOCK, open(path, "a", encoding="utf-8") as f:
+        f.write(json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n")
+
+
 def parse_aviation_obs_time(value: Any) -> Optional[datetime]:
     """Parse a METAR observation timestamp into UTC datetime.
     
@@ -1807,7 +1817,7 @@ def in_station_report_window(config: dict[str, Any], city: str, station: str, no
     except ValueError:
         return False, state
     now_value = (now_utc or datetime.now(timezone.utc)).astimezone(timezone.utc)
-    window_seconds = max(1, int(config.get("price_momentum", {}).get("report_window_seconds", 120)))
+    window_seconds = max(1, int(config.get("price_momentum", {}).get("report_window_seconds", 210)))
     return expected <= now_value < expected + timedelta(seconds=window_seconds), state
 
 
@@ -3658,6 +3668,10 @@ def websocket_assets(config: dict[str, Any]) -> dict[str, dict[str, Any]]:
                             "trade_id": trade.trade_id,
                             "position_side": trade.position_side,
                             "market_id": held_market.market_id,
+                            "market_question": held_market.market_question,
+                            "rule_min": held_market.rule_min,
+                            "rule_max": held_market.rule_max,
+                            "market_unit": held_market.unit,
                             "city": city,
                             "kind": kind,
                             "event_date": event_date,
@@ -3677,6 +3691,10 @@ def websocket_assets(config: dict[str, Any]) -> dict[str, dict[str, Any]]:
                                 "trade_id": trade.trade_id,
                                 "position_side": trade.position_side,
                                 "market_id": held_market.market_id,
+                                "market_question": held_market.market_question,
+                                "rule_min": held_market.rule_min,
+                                "rule_max": held_market.rule_max,
+                                "market_unit": held_market.unit,
                                 "city": city,
                                 "kind": kind,
                                 "event_date": event_date,
@@ -3695,6 +3713,10 @@ def websocket_assets(config: dict[str, Any]) -> dict[str, dict[str, Any]]:
                             "role": "temperature_market",
                             "position_side": side,
                             "market_id": market.market_id,
+                            "market_question": market.market_question,
+                            "rule_min": market.rule_min,
+                            "rule_max": market.rule_max,
+                            "market_unit": market.unit,
                             "city": city,
                             "kind": kind,
                             "event_date": event_date,
@@ -3796,6 +3818,88 @@ def process_harvest_if_new_websocket_metar(config: dict[str, Any], context: dict
         LOGGER.exception("websocket metar refresh failed context=%s", context)
 
 
+def price_record_payload(event_type: str, asset: dict[str, Any], asset_id: str, price: Optional[float], previous_price: Optional[float], price_field: str, timing: dict[str, Any]) -> dict[str, Any]:
+    """Build a JSON-serializable price capture record with millisecond timestamps."""
+    now_utc = datetime.now(timezone.utc)
+    return {
+        "event_type": event_type,
+        "captured_at_utc": now_utc.isoformat(timespec="milliseconds"),
+        "captured_at_epoch_ms": int(now_utc.timestamp() * 1000),
+        "expected_next_obs_utc": timing.get("expected_next_obs_utc", ""),
+        "latest_obs_utc": timing.get("latest_obs_utc", ""),
+        "scheduled_minutes_utc": timing.get("scheduled_minutes_utc", []),
+        "asset_id": asset_id,
+        "role": asset.get("role", ""),
+        "position_side": asset.get("position_side", ""),
+        "market_id": asset.get("market_id", ""),
+        "market_question": asset.get("market_question", ""),
+        "rule_min": asset.get("rule_min"),
+        "rule_max": asset.get("rule_max"),
+        "market_unit": asset.get("market_unit", ""),
+        "city": asset.get("city", ""),
+        "kind": asset.get("kind", ""),
+        "event_date": asset.get("event_date", ""),
+        "polymarket_url": asset.get("polymarket_url", ""),
+        "station": asset.get("station", ""),
+        "price": price,
+        "previous_price": previous_price,
+        "price_field": price_field,
+    }
+
+
+def record_price_window_tick(config: dict[str, Any], assets: dict[str, dict[str, Any]], asset: dict[str, Any], asset_id: str, price: float, previous_price: Optional[float], price_field: str) -> None:
+    """Record city-wide websocket prices while a station is inside its observation window."""
+    city = str(asset.get("city") or "")
+    station = str(asset.get("station") or "")
+    if not city or not station:
+        return
+    in_window, timing = in_station_report_window(config, city, station)
+    expected_next = str(timing.get("expected_next_obs_utc") or "")
+    window_key = f"{city}:{station}:{expected_next}"
+    now_mono = time.monotonic()
+    record_seconds = max(1, int(config.get("price_momentum", {}).get("price_window_record_seconds", 300)))
+    recording = PRICE_RECORDING_WINDOWS.get(window_key)
+    if not recording:
+        prefix = f"{city}:{station}:"
+        for existing_key, existing_recording in PRICE_RECORDING_WINDOWS.items():
+            if existing_key.startswith(prefix) and now_mono < float(existing_recording.get("record_until_monotonic", 0.0)):
+                window_key = existing_key
+                recording = existing_recording
+                timing = dict(timing)
+                timing["expected_next_obs_utc"] = existing_key[len(prefix):]
+                break
+    if not in_window:
+        if not recording:
+            return
+        if now_mono < float(recording.get("record_until_monotonic", 0.0)):
+            append_price_window_record(config, price_record_payload("websocket_tick", asset, asset_id, price, previous_price, price_field, timing))
+            return
+        if not recording.get("ended_logged"):
+            recording["ended_logged"] = True
+            LOGGER.info("price window recording ended city=%s station=%s expected_next_obs_utc=%s record_seconds=%s", city, station, expected_next, record_seconds)
+        return
+    if recording and now_mono >= float(recording.get("record_until_monotonic", 0.0)):
+        if not recording.get("ended_logged"):
+            recording["ended_logged"] = True
+            LOGGER.info("price window recording ended city=%s station=%s expected_next_obs_utc=%s record_seconds=%s", city, station, expected_next, record_seconds)
+        return
+    if not recording:
+        recording = {
+            "record_until_monotonic": now_mono + record_seconds,
+            "started_at_utc": datetime.now(timezone.utc).isoformat(timespec="milliseconds"),
+            "record_seconds": record_seconds,
+            "ended_logged": False,
+        }
+        PRICE_RECORDING_WINDOWS[window_key] = recording
+        for snapshot_asset_id, snapshot_asset in assets.items():
+            if snapshot_asset.get("city") != city or snapshot_asset.get("station") != station:
+                continue
+            snapshot_price = snapshot_asset.get("last_price")
+            append_price_window_record(config, price_record_payload("window_snapshot", snapshot_asset, snapshot_asset_id, snapshot_price, None, "last_price", timing))
+        LOGGER.info("price window recording started city=%s station=%s expected_next_obs_utc=%s record_seconds=%s assets=%s", city, station, expected_next, record_seconds, sum(1 for a in assets.values() if a.get("city") == city and a.get("station") == station))
+    append_price_window_record(config, price_record_payload("websocket_tick", asset, asset_id, price, previous_price, price_field, timing))
+
+
 def monitor_websocket(config: dict[str, Any], duration_seconds: int = 0) -> bool:
     """Connect to Polymarket WebSocket, subscribe to assets, and dispatch significant price triggers.
     
@@ -3848,6 +3952,7 @@ def monitor_websocket(config: dict[str, Any], duration_seconds: int = 0) -> bool
                     continue
                 previous = asset.get("last_price")
                 asset["last_price"] = price
+                record_price_window_tick(config, assets, asset, asset_id, price, float(previous) if previous is not None else None, price_field)
                 if previous is None:
                     continue
                 previous_price = float(previous)

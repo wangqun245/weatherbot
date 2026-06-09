@@ -49,7 +49,7 @@
     "twc_post_entry_verify_seconds": 7200,
     "aviation_poll_after_observation_minutes": 15,
     "aviation_poll_interval_seconds": 60,
-    "aviation_refresh_probe_seconds": 5,
+    "aviation_refresh_probe_seconds": 180,
     "allowed_cities": [
       "Austin",
       "Dallas",
@@ -106,7 +106,7 @@
     "awc_extreme_harvest_enabled": false,
     "no_change_pct": 0.3,
     "yes_change_pct": 0.3,
-    "report_window_seconds": 90,
+    "report_window_seconds": 120,
     "no_max_price": 0.99,
     "yes_max_price": 0.99,
     "tgftp_verify_interval_seconds": 10,
@@ -135,7 +135,7 @@
         "twc_post_entry_verify_seconds": 7200,
         "aviation_poll_after_observation_minutes": 15,
         "aviation_poll_interval_seconds": 60,
-        "aviation_refresh_probe_seconds": 5,
+        "aviation_refresh_probe_seconds": 180,
         "allowed_cities": [
           "Austin",
           "Dallas",

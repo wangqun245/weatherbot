@@ -26,6 +26,7 @@ import os
 import re
 import threading
 import time
+from collections import Counter
 from dataclasses import MISSING, asdict, dataclass, fields
 from datetime import date, datetime, timedelta, timezone
 from typing import Any, Iterable, Optional
@@ -279,7 +280,7 @@ def default_config() -> dict[str, Any]:
         "twc_post_entry_verify_seconds": 7200,
         "aviation_poll_after_observation_minutes": 15,
         "aviation_poll_interval_seconds": 60,
-        "aviation_refresh_probe_seconds": 5,
+        "aviation_refresh_probe_seconds": 180,
         "allowed_cities": allowed,
         "websocket_enabled": True,
         "websocket_url": "wss://ws-subscriptions-clob.polymarket.com/ws/market",
@@ -341,7 +342,7 @@ def default_config() -> dict[str, Any]:
             "awc_extreme_harvest_enabled": False,
             "no_change_pct": 0.30,
             "yes_change_pct": 0.30,
-            "report_window_seconds": 90,
+            "report_window_seconds": 120,
             "no_max_price": 0.99,
             "yes_max_price": 0.99,
             "tgftp_verify_interval_seconds": 10,
@@ -1624,7 +1625,41 @@ def aviation_observed_extremes(config: dict[str, Any], station: str, city: str, 
     return high, low, latest_dt, points
 
 
-def aviation_report_timing(station: str, hours: int = 24, config: Optional[dict[str, Any]] = None) -> tuple[Optional[datetime], Optional[int], int]:
+def infer_report_schedule_from_times(times: list[datetime], hours: int = 24) -> tuple[Optional[datetime], Optional[int], int, list[int], Optional[datetime]]:
+    """Infer regular METAR schedule minutes from recent observation times."""
+    clean_times = sorted({dt.astimezone(timezone.utc).replace(second=0, microsecond=0) for dt in times})
+    if not clean_times:
+        return None, None, 0, [], None
+
+    report_count = len(clean_times)
+    reports_per_hour = max(1, int(report_count / max(1, hours)))
+    reports_per_hour = min(6, reports_per_hour)
+    minute_counts = Counter(dt.minute for dt in clean_times)
+    scheduled_minutes = sorted(
+        minute
+        for minute, _ in sorted(minute_counts.items(), key=lambda item: (-item[1], item[0]))[:reports_per_hour]
+    )
+    if not scheduled_minutes:
+        scheduled_minutes = [clean_times[-1].minute]
+
+    latest = clean_times[-1]
+    interval_seconds = max(60, int(3600 / max(1, len(scheduled_minutes))))
+    expected_next: Optional[datetime] = None
+    for hour_offset in range(0, 3):
+        base_hour = latest.replace(minute=0) + timedelta(hours=hour_offset)
+        for minute in scheduled_minutes:
+            candidate = base_hour + timedelta(minutes=minute)
+            if candidate > latest:
+                expected_next = candidate
+                break
+        if expected_next is not None:
+            break
+    if expected_next is None:
+        expected_next = latest + timedelta(seconds=interval_seconds)
+    return latest, interval_seconds, report_count, scheduled_minutes, expected_next
+
+
+def aviation_report_timing(station: str, hours: int = 24, config: Optional[dict[str, Any]] = None) -> tuple[Optional[datetime], Optional[int], int, list[int], Optional[datetime]]:
     """Compute report cadence metadata from recent AviationWeather obsTime values.
     
     Args:
@@ -1632,7 +1667,7 @@ def aviation_report_timing(station: str, hours: int = 24, config: Optional[dict[
         hours (int): METAR lookback window in hours.
     
     Returns:
-        tuple[Optional[datetime], Optional[int], int]: Latest UTC observation time, shortest positive observation interval in seconds, and number of unique observation times.
+        tuple[Optional[datetime], Optional[int], int, list[int], Optional[datetime]]: Latest UTC observation time, inferred interval, report count, scheduled UTC minutes, and next expected observation time.
     
     Side effects:
         Calls the AviationWeather METAR API.
@@ -1643,16 +1678,9 @@ def aviation_report_timing(station: str, hours: int = 24, config: Optional[dict[
     times = sorted({
         parsed
         for row in rows
-        if (parsed := parse_aviation_obs_time(row.get("obsTime") or row.get("reportTime") or row.get("receiptTime"))) is not None
+        if (parsed := parse_aviation_obs_time(row.get("obsTime"))) is not None
     })
-    if not times:
-        return None, None, 0
-    intervals = [
-        int((right - left).total_seconds())
-        for left, right in zip(times, times[1:])
-        if right > left
-    ]
-    return times[-1], min(intervals) if intervals else None, len(times)
+    return infer_report_schedule_from_times(times, hours)
 
 
 def parse_metar_temperature_c(raw_ob: str) -> Optional[float]:
@@ -1718,7 +1746,15 @@ def tgftp_metar_observation(station: str) -> Optional[dict[str, Any]]:
     return parse_tgftp_metar(r.text)
 
 
-def update_station_report_timing(city: str, station: str, latest_obs_dt: datetime, interval_seconds: Optional[int], report_count: int) -> dict[str, Any]:
+def update_station_report_timing(
+    city: str,
+    station: str,
+    latest_obs_dt: datetime,
+    interval_seconds: Optional[int],
+    report_count: int,
+    scheduled_minutes: Optional[list[int]] = None,
+    expected_next_obs_dt: Optional[datetime] = None,
+) -> dict[str, Any]:
     """Update in-memory METAR observation cadence for one city/station.
     
     Args:
@@ -1733,12 +1769,13 @@ def update_station_report_timing(city: str, station: str, latest_obs_dt: datetim
     """
     latest_utc = latest_obs_dt.astimezone(timezone.utc)
     effective_interval = max(60, int(interval_seconds or 3600))
-    expected_next = latest_utc + timedelta(seconds=effective_interval)
+    expected_next = (expected_next_obs_dt or (latest_utc + timedelta(seconds=effective_interval))).astimezone(timezone.utc)
     state = {
         "city": city,
         "station": station,
         "latest_obs_utc": latest_utc.isoformat(),
         "interval_seconds": effective_interval,
+        "scheduled_minutes_utc": scheduled_minutes or [],
         "expected_next_obs_utc": expected_next.isoformat(),
         "report_count": report_count,
         "updated_at": datetime.now(timezone.utc).isoformat(),
@@ -1768,8 +1805,8 @@ def in_station_report_window(config: dict[str, Any], city: str, station: str, no
     except ValueError:
         return False, state
     now_value = (now_utc or datetime.now(timezone.utc)).astimezone(timezone.utc)
-    window_seconds = max(1, int(config.get("price_momentum", {}).get("report_window_seconds", 90)))
-    return expected <= now_value <= expected + timedelta(seconds=window_seconds), state
+    window_seconds = max(1, int(config.get("price_momentum", {}).get("report_window_seconds", 120)))
+    return expected <= now_value < expected + timedelta(seconds=window_seconds), state
 
 
 def taker_fee_usdc(shares: float, price: float, fee_rate: float, fee_enabled: bool) -> float:
@@ -3910,7 +3947,7 @@ def aviation_supervisor(config: dict[str, Any]) -> None:
                 city = str(group["city"])
                 station = str(group["station"])
                 try:
-                    latest_dt, min_interval_seconds, report_count = aviation_report_timing(station, 24, config)
+                    latest_dt, min_interval_seconds, report_count, scheduled_minutes, expected_next_dt = aviation_report_timing(station, 24, config)
                     if latest_dt is None:
                         schedule.update({"next_probe_at": now_mono + fallback_poll_seconds, "probing": False})
                         LOGGER.info("aviation timing unavailable city=%s station=%s next_probe_seconds=%s", city, station, fallback_poll_seconds)
@@ -3920,9 +3957,10 @@ def aviation_supervisor(config: dict[str, Any]) -> None:
                     previous_latest = str(schedule.get("latest_obs_utc") or "")
                     has_new_report = latest_utc != previous_latest
                     effective_interval = max(60, int(min_interval_seconds or fallback_poll_seconds))
-                    next_probe_wall = latest_dt.astimezone(timezone.utc) + timedelta(seconds=max(0, effective_interval - pre_probe_seconds))
+                    next_probe_anchor = expected_next_dt or (latest_dt.astimezone(timezone.utc) + timedelta(seconds=effective_interval))
+                    next_probe_wall = next_probe_anchor.astimezone(timezone.utc) - timedelta(seconds=pre_probe_seconds)
                     next_probe_delay = max(0.0, (next_probe_wall - datetime.now(timezone.utc)).total_seconds())
-                    timing = update_station_report_timing(city, station, latest_dt, effective_interval, report_count)
+                    timing = update_station_report_timing(city, station, latest_dt, effective_interval, report_count, scheduled_minutes, expected_next_dt)
 
                     if not has_new_report:
                         schedule.update({
@@ -3931,10 +3969,11 @@ def aviation_supervisor(config: dict[str, Any]) -> None:
                             "probing": True,
                         })
                         LOGGER.info(
-                            "aviation no new report city=%s station=%s latest_obs_utc=%s expected_next_obs_utc=%s retry_seconds=%s",
+                            "aviation no new report city=%s station=%s latest_obs_utc=%s scheduled_minutes_utc=%s expected_next_obs_utc=%s retry_seconds=%s",
                             city,
                             station,
                             latest_utc,
+                            timing.get("scheduled_minutes_utc"),
                             timing.get("expected_next_obs_utc"),
                             probe_seconds,
                         )
@@ -3947,12 +3986,13 @@ def aviation_supervisor(config: dict[str, Any]) -> None:
                         "probing": False,
                     })
                     LOGGER.info(
-                        "aviation new report city=%s station=%s latest_obs_utc=%s interval_seconds=%s report_count=%s expected_next_obs_utc=%s next_probe_at_utc=%s next_probe_seconds=%.1f",
+                        "aviation new report city=%s station=%s latest_obs_utc=%s interval_seconds=%s report_count=%s scheduled_minutes_utc=%s expected_next_obs_utc=%s next_probe_at_utc=%s next_probe_seconds=%.1f",
                         city,
                         station,
                         latest_utc,
                         effective_interval,
                         report_count,
+                        timing.get("scheduled_minutes_utc"),
                         timing.get("expected_next_obs_utc"),
                         next_probe_wall.isoformat(),
                         next_probe_delay,

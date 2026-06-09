@@ -53,6 +53,9 @@ WU_URL_RE = re.compile(r"https?://(?:www\.)?wunderground\.com/[^\s\"'<)]+", re.I
 EXTREMES_BY_EVENT: dict[tuple[str, str, str], dict[str, Any]] = {}
 WEBSOCKET_AVIATION_OBS_BY_EVENT: dict[tuple[str, str, str], dict[str, Any]] = {}
 LIVE_TRADER: Optional[Any] = None
+TELEGRAM_NOTIFIER: Optional[Any] = None
+STATION_REPORT_TIMING: dict[tuple[str, str], dict[str, Any]] = {}
+TGFTP_VALIDATION_THREADS: set[str] = set()
 
 
 @dataclass
@@ -287,7 +290,7 @@ def default_config() -> dict[str, Any]:
         "websocket_asset_refresh_seconds": 300,
         "live_trading_enabled": False,
         "live_trading_dry_run": False,
-        "live_order_timeout_seconds": 12,
+        "live_order_timeout_seconds": 20,
         "live_order_check_seconds": 1,
     }
     return {
@@ -312,6 +315,7 @@ def default_config() -> dict[str, Any]:
             "performance_by_cycle_csv": "polymarket_weather_performance_by_cycle.csv",
             "performance_by_event_csv": "polymarket_weather_performance_by_event.csv",
             "state_json": "polymarket_weather_state.json",
+            "aviation_metar_history_jsonl": "aviation_metar_history.jsonl",
             "log_file": "bot.log",
             "log_level": "INFO",
             "console_log_enabled": False,
@@ -326,6 +330,23 @@ def default_config() -> dict[str, Any]:
             "signature_type": 3,
             "sync_positions_on_start": True,
             "sync_positions_on_stop": True,
+        },
+        "notifications": {
+            "telegram_enabled": True,
+            "telegram_notify_order_submitted": True,
+            "telegram_notify_order_filled": True,
+        },
+        "price_momentum": {
+            "enabled": True,
+            "awc_extreme_harvest_enabled": False,
+            "no_change_pct": 0.30,
+            "yes_change_pct": 0.30,
+            "report_window_seconds": 90,
+            "no_max_price": 0.99,
+            "yes_max_price": 0.99,
+            "tgftp_verify_interval_seconds": 10,
+            "tgftp_verify_timeout_seconds": 180,
+            "twc_verify_interval_seconds": 900,
         },
         "strategies": [{"name": "deterministic_harvest", "enabled": True, "events": {"target_dates": ["today"]}, "trading": trading}],
     }
@@ -1235,6 +1256,14 @@ def deterministic_ordered_markets(markets: list[TemperatureMarket], event_unit: 
     return ordered if kind == "Highest" else list(reversed(ordered))
 
 
+def outer_boundary_market(markets: list[TemperatureMarket], event_unit: str, kind: str) -> Optional[TemperatureMarket]:
+    """Return the outside boundary market for a Highest or Lowest event."""
+    ordered = sorted_markets_for_unit(markets, event_unit)
+    if not ordered:
+        return None
+    return ordered[-1] if kind == "Highest" else ordered[0]
+
+
 def deterministic_market_impossible(market: TemperatureMarket, kind: str, observed_high: Optional[float], observed_low: Optional[float], unit: str) -> bool:
     """Determine whether observed extremes make a market impossible to resolve YES.
     
@@ -1477,6 +1506,26 @@ def aviation_metar_observations(station: str, hours: int = 24) -> list[dict[str,
     return payload if isinstance(payload, list) else []
 
 
+def append_aviation_metar_history(config: dict[str, Any], station: str, rows: list[dict[str, Any]], reason: str) -> None:
+    """Append raw AviationWeather METAR rows to a JSONL audit file.
+    
+    Args:
+        config (dict[str, Any]): Active bot configuration, including output paths.
+        station (str): Weather station identifier.
+        rows (list[dict[str, Any]]): Raw AviationWeather METAR rows.
+        reason (str): Caller reason for the fetch.
+    
+    Returns:
+        None: This function is executed for its side effects.
+    """
+    path = str(config.get("outputs", {}).get("aviation_metar_history_jsonl") or "")
+    if not path or not rows:
+        return
+    with IO_LOCK, open(path, "a", encoding="utf-8") as f:
+        for row in rows:
+            f.write(json.dumps({"saved_at": datetime.now(timezone.utc).isoformat(), "station": station, "reason": reason, "row": row}, ensure_ascii=False, sort_keys=True) + "\n")
+
+
 def parse_aviation_obs_time(value: Any) -> Optional[datetime]:
     """Parse a METAR observation timestamp into UTC datetime.
     
@@ -1556,7 +1605,9 @@ def aviation_observed_extremes(config: dict[str, Any], station: str, city: str, 
         )
         return None, None, None, []
     points: list[tuple[datetime, float]] = []
-    for row in aviation_metar_observations(station, aviation_hours_for_local_event_day(city_tz, event_date)):
+    rows = aviation_metar_observations(station, aviation_hours_for_local_event_day(city_tz, event_date))
+    append_aviation_metar_history(config, station, rows, "observed_extremes")
+    for row in rows:
         obs_dt_utc = parse_aviation_obs_time(row.get("obsTime") or row.get("reportTime") or row.get("receiptTime"))
         raw_temp = row.get("temp")
         if obs_dt_utc is None or raw_temp is None:
@@ -1573,23 +1624,26 @@ def aviation_observed_extremes(config: dict[str, Any], station: str, city: str, 
     return high, low, latest_dt, points
 
 
-def aviation_report_timing(station: str, hours: int = 24) -> tuple[Optional[datetime], Optional[int], int]:
-    """Compute report cadence metadata from recent AviationWeather receiptTime values.
+def aviation_report_timing(station: str, hours: int = 24, config: Optional[dict[str, Any]] = None) -> tuple[Optional[datetime], Optional[int], int]:
+    """Compute report cadence metadata from recent AviationWeather obsTime values.
     
     Args:
         station (str): Weather station identifier, usually a four-character ICAO code.
         hours (int): METAR lookback window in hours.
     
     Returns:
-        tuple[Optional[datetime], Optional[int], int]: Latest UTC receipt time, shortest positive receipt interval in seconds, and number of unique receipt times.
+        tuple[Optional[datetime], Optional[int], int]: Latest UTC observation time, shortest positive observation interval in seconds, and number of unique observation times.
     
     Side effects:
         Calls the AviationWeather METAR API.
     """
+    rows = aviation_metar_observations(station, hours)
+    if config is not None:
+        append_aviation_metar_history(config, station, rows, "report_timing")
     times = sorted({
         parsed
-        for row in aviation_metar_observations(station, hours)
-        if (parsed := parse_aviation_obs_time(row.get("receiptTime"))) is not None
+        for row in rows
+        if (parsed := parse_aviation_obs_time(row.get("obsTime") or row.get("reportTime") or row.get("receiptTime"))) is not None
     })
     if not times:
         return None, None, 0
@@ -1599,6 +1653,123 @@ def aviation_report_timing(station: str, hours: int = 24) -> tuple[Optional[date
         if right > left
     ]
     return times[-1], min(intervals) if intervals else None, len(times)
+
+
+def parse_metar_temperature_c(raw_ob: str) -> Optional[float]:
+    """Parse Celsius temperature from a raw METAR string.
+    
+    Args:
+        raw_ob (str): Raw METAR observation text.
+    
+    Returns:
+        Optional[float]: Temperature in Celsius, or None when absent.
+    """
+    exact = re.search(r"\bT([01])(\d{3})([01])(\d{3})\b", raw_ob)
+    if exact:
+        sign = -1 if exact.group(1) == "1" else 1
+        return sign * (int(exact.group(2)) / 10.0)
+    for token in raw_ob.split():
+        match = re.fullmatch(r"(M?\d{2})/(?:M?\d{2}|//)", token)
+        if not match:
+            continue
+        text = match.group(1)
+        return -float(text[1:]) if text.startswith("M") else float(text)
+    return None
+
+
+def parse_tgftp_metar(text: str) -> Optional[dict[str, Any]]:
+    """Parse a NOAA TGFTP station METAR TXT response.
+    
+    Args:
+        text (str): Two-line TGFTP station response.
+    
+    Returns:
+        Optional[dict[str, Any]]: Parsed observation fields, or None when unusable.
+    """
+    lines = [line.strip() for line in str(text or "").splitlines() if line.strip()]
+    if len(lines) < 2:
+        return None
+    try:
+        obs_dt = datetime.strptime(lines[0], "%Y/%m/%d %H:%M").replace(tzinfo=timezone.utc)
+    except ValueError:
+        return None
+    raw_ob = lines[1]
+    temp_c = parse_metar_temperature_c(raw_ob)
+    if temp_c is None:
+        return None
+    return {"obs_dt": obs_dt, "raw_ob": raw_ob, "temp_c": temp_c}
+
+
+def tgftp_metar_observation(station: str) -> Optional[dict[str, Any]]:
+    """Fetch and parse the latest NOAA TGFTP station METAR.
+    
+    Args:
+        station (str): Weather station identifier, usually a four-character ICAO code.
+    
+    Returns:
+        Optional[dict[str, Any]]: Parsed latest station observation.
+    
+    Side effects:
+        Calls the NOAA TGFTP endpoint.
+    """
+    url = f"https://tgftp.nws.noaa.gov/data/observations/metar/stations/{station.upper()}.TXT"
+    r = requests.get(url, headers=HEADERS, timeout=15)
+    r.raise_for_status()
+    return parse_tgftp_metar(r.text)
+
+
+def update_station_report_timing(city: str, station: str, latest_obs_dt: datetime, interval_seconds: Optional[int], report_count: int) -> dict[str, Any]:
+    """Update in-memory METAR observation cadence for one city/station.
+    
+    Args:
+        city (str): Polymarket city name.
+        station (str): ICAO station id.
+        latest_obs_dt (datetime): Latest METAR obsTime in UTC.
+        interval_seconds (Optional[int]): Estimated observation cadence.
+        report_count (int): Number of observations used to infer cadence.
+    
+    Returns:
+        dict[str, Any]: Updated timing state.
+    """
+    latest_utc = latest_obs_dt.astimezone(timezone.utc)
+    effective_interval = max(60, int(interval_seconds or 3600))
+    expected_next = latest_utc + timedelta(seconds=effective_interval)
+    state = {
+        "city": city,
+        "station": station,
+        "latest_obs_utc": latest_utc.isoformat(),
+        "interval_seconds": effective_interval,
+        "expected_next_obs_utc": expected_next.isoformat(),
+        "report_count": report_count,
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    }
+    STATION_REPORT_TIMING[(city, station)] = state
+    return state
+
+
+def in_station_report_window(config: dict[str, Any], city: str, station: str, now_utc: Optional[datetime] = None) -> tuple[bool, dict[str, Any]]:
+    """Return whether current time is inside the expected next METAR report window.
+    
+    Args:
+        config (dict[str, Any]): Active bot configuration, including price momentum settings.
+        city (str): Polymarket city name.
+        station (str): ICAO station id.
+        now_utc (Optional[datetime]): Current UTC time override for tests.
+    
+    Returns:
+        tuple[bool, dict[str, Any]]: Whether inside the window and the timing state.
+    """
+    state = STATION_REPORT_TIMING.get((city, station), {})
+    expected_raw = state.get("expected_next_obs_utc")
+    if not expected_raw:
+        return False, state
+    try:
+        expected = datetime.fromisoformat(str(expected_raw).replace("Z", "+00:00")).astimezone(timezone.utc)
+    except ValueError:
+        return False, state
+    now_value = (now_utc or datetime.now(timezone.utc)).astimezone(timezone.utc)
+    window_seconds = max(1, int(config.get("price_momentum", {}).get("report_window_seconds", 90)))
+    return expected <= now_value <= expected + timedelta(seconds=window_seconds), state
 
 
 def taker_fee_usdc(shares: float, price: float, fee_rate: float, fee_enabled: bool) -> float:
@@ -1686,6 +1857,98 @@ def _as_float(value: Any, default: float = 0.0) -> float:
         return float(value)
     except Exception:
         return default
+
+
+def get_telegram_notifier(config: dict[str, Any]) -> Optional[Any]:
+    """Return the process-wide Telegram notifier when enabled and configured.
+    
+    Args:
+        config (dict[str, Any]): Active bot configuration, including notification settings.
+    
+    Returns:
+        Optional[Any]: TelegramNotifier instance, or None when disabled/unavailable.
+    """
+    global TELEGRAM_NOTIFIER
+    if not config.get("notifications", {}).get("telegram_enabled", True):
+        return None
+    if TELEGRAM_NOTIFIER is not None:
+        return TELEGRAM_NOTIFIER
+    try:
+        from weather_telegram_notifier import TelegramNotifier
+    except Exception:
+        LOGGER.exception("telegram notifier import failed")
+        return None
+    TELEGRAM_NOTIFIER = TelegramNotifier()
+    return TELEGRAM_NOTIFIER if getattr(TELEGRAM_NOTIFIER, "enabled", False) else None
+
+
+def _telegram_escape(value: Any) -> str:
+    """Escape dynamic text for Telegram legacy Markdown used by the notifier."""
+    text = str(value or "")
+    for char in ("\\", "`", "*", "_", "["):
+        text = text.replace(char, "\\" + char)
+    return text
+
+
+def notify_trade(config: dict[str, Any], trade: PaperTrade, action: str, status: str, reason: str = "", source: str = "") -> None:
+    """Send one Telegram notification for a trade lifecycle event.
+    
+    Args:
+        config (dict[str, Any]): Active bot configuration, including notification settings.
+        trade (PaperTrade): Trade row that was submitted, filled, or closed.
+        action (str): Trade action such as BUY or SELL.
+        status (str): Lifecycle status such as SUBMITTED, FILLED, or CLOSED.
+        reason (str): Strategy reason or order source to include in the message.
+        source (str): Confirmation source, such as poll or user_websocket.
+    
+    Returns:
+        None: This function is executed for its side effects.
+    """
+    notifications = config.get("notifications", {})
+    normalized_status = status.upper()
+    if normalized_status == "SUBMITTED" and not notifications.get("telegram_notify_order_submitted", True):
+        return
+    if normalized_status in {"FILLED", "CLOSED"} and not notifications.get("telegram_notify_order_filled", True):
+        return
+    notifier = get_telegram_notifier(config)
+    if not notifier:
+        return
+
+    action = action.upper()
+    side = (trade.position_side or "YES").upper()
+    mode = trade.execution_mode or ("LIVE" if live_trading_enabled(config) else "PAPER")
+    if action == "SELL":
+        price = trade.exit_no_price if side == "NO" else trade.exit_yes_price
+        amount = trade.exit_proceeds_usdc or (trade.shares * float(price or 0.0))
+        order_id = trade.live_sell_order_id
+    else:
+        price = trade.yes_price
+        amount = trade.notional_usdc
+        order_id = trade.live_buy_order_id
+
+    lines = [
+        f"*{_telegram_escape(mode)} {action} {normalized_status}*",
+        f"Side: *{_telegram_escape(side)}*",
+        f"Price: ${float(price or 0.0):.4f}",
+        f"Amount: ${float(amount or 0.0):.2f}",
+        f"Shares: {float(trade.shares or 0.0):.4f}",
+        f"Market: {_telegram_escape(trade.city)} {_telegram_escape(trade.kind)} {trade.event_date}",
+        f"Question: {_telegram_escape(trade.market_question)}",
+        f"Reason: {_telegram_escape(reason or trade.exit_reason or trade.forecast_source)}",
+    ]
+    if order_id:
+        lines.append(f"Order: `{_telegram_escape(order_id)}`")
+    if source:
+        lines.append(f"Source: {_telegram_escape(source)}")
+    if action == "SELL":
+        lines.append(f"P&L: ${float(trade.pnl_usdc or 0.0):+.2f}")
+    if trade.polymarket_url:
+        lines.append(_telegram_escape(trade.polymarket_url))
+
+    try:
+        notifier.send("\n".join(lines))
+    except Exception:
+        LOGGER.exception("telegram trade notification failed trade=%s action=%s status=%s", trade.trade_id, action, status)
 
 
 class LiveTradingManager:
@@ -1814,6 +2077,7 @@ class LiveTradingManager:
             )
         )
         LOGGER.info("live buy pending trade=%s order=%s side=%s market=%s price=%s shares=%s", trade.trade_id, trade.live_buy_order_id, side, market.market_id, trade.yes_price, trade.shares)
+        notify_trade(config, trade, "BUY", "SUBMITTED", reason)
         return trade
 
     def submit_sell_trade(self, config: dict[str, Any], trade: PaperTrade, market: TemperatureMarket, reason: str, exit_price: float) -> bool:
@@ -1870,6 +2134,7 @@ class LiveTradingManager:
             )
         )
         LOGGER.info("live sell pending trade=%s order=%s market=%s price=%s shares=%s", trade.trade_id, trade.live_sell_order_id, market.market_id, exit_price, trade.shares)
+        notify_trade(config, trade, "SELL", "SUBMITTED", reason)
         return True
 
     def _register_pending(self, pending: LivePendingOrder) -> None:
@@ -2067,6 +2332,7 @@ class LiveTradingManager:
         write_performance_reports(self.config, trades)
         with self._lock:
             self._pending.pop(pending.order_id, None)
+        notify_trade(self.config, trade, pending.kind, "FILLED", source=source)
 
     def _apply_buy_result_to_trade(self, trade: PaperTrade, result: Any, pending: bool) -> None:
         """Copy live buy order result fields onto a trade row.
@@ -2268,6 +2534,7 @@ def close_trade(config: dict[str, Any], trade: PaperTrade, market: TemperatureMa
     trade.exit_proceeds_usdc = round(proceeds, 8)
     trade.payout_usdc = trade.exit_proceeds_usdc
     trade.pnl_usdc = round(proceeds - trade.total_cost_usdc, 8)
+    notify_trade(config, trade, "SELL", "CLOSED", reason)
     return True
 
 
@@ -2836,9 +3103,10 @@ def verify_open_positions_with_twc(config: dict[str, Any], trigger_context: Opti
                 continue
 
             triggered_by_position_price = bool(trigger_market_id and trigger_market_id == trade.market_id)
+            price_momentum_trade = "price_momentum" in (trade.forecast_source or "").lower()
             expired = trade_age_seconds(trade) >= verify_seconds
-            if triggered_by_position_price or expired:
-                reason = "twc_inconsistent_after_position_price_move" if triggered_by_position_price else "twc_not_verified_within_2h"
+            if triggered_by_position_price or expired or price_momentum_trade:
+                reason = "twc_invalidated_price_momentum" if price_momentum_trade else "twc_inconsistent_after_position_price_move" if triggered_by_position_price else "twc_not_verified_within_2h"
                 if close_trade(config, trade, market, reason):
                     changed = True
                     LOGGER.info(
@@ -2959,6 +3227,8 @@ def process_deterministic_harvest(config: dict[str, Any], trigger_context: dict[
             if trade:
                 new_trades.append(trade)
                 changed = True
+                if not live_trader:
+                    notify_trade(config, trade, "BUY", "FILLED", "metar_extreme_yes_reached")
                 LOGGER.info("metar buy_yes city=%s kind=%s market=%s price=%s observed_high=%s observed_low=%s status=%s", city, kind, extreme_market.market_id, price, observed_high, observed_low, trade.status)
         else:
             LOGGER.info("metar skip_buy_yes_price_too_high city=%s kind=%s market=%s yes_clob_buy_price=%s max=%s observed_high=%s observed_low=%s", city, kind, extreme_market.market_id, price, yes_max, observed_high, observed_low)
@@ -3002,6 +3272,8 @@ def process_deterministic_harvest(config: dict[str, Any], trigger_context: dict[
             if trade:
                 new_trades.append(trade)
                 changed = True
+                if not live_trader:
+                    notify_trade(config, trade, "BUY", "FILLED", "metar_impossible_no")
                 LOGGER.info("metar buy_no city=%s kind=%s market=%s no_price=%s observed_high=%s observed_low=%s status=%s", city, kind, market.market_id, no_price, observed_high, observed_low, trade.status)
             break
 
@@ -3012,6 +3284,214 @@ def process_deterministic_harvest(config: dict[str, Any], trigger_context: dict[
         write_csv(config["outputs"]["settled_trades_csv"], trades)
         write_performance_reports(config, trades)
     return trades
+
+
+def process_price_momentum_buy(config: dict[str, Any], context: dict[str, Any]) -> Optional[PaperTrade]:
+    """Buy a fast-rising token inside the expected METAR report window.
+    
+    Args:
+        config (dict[str, Any]): Active bot configuration, including price momentum settings.
+        context (dict[str, Any]): WebSocket trigger context for a temperature market.
+    
+    Returns:
+        Optional[PaperTrade]: Created trade row, or None when skipped.
+    """
+    settings = config.get("price_momentum", {})
+    if not settings.get("enabled", True):
+        return None
+    side = str(context.get("position_side") or "").upper()
+    if str(context.get("role") or "") != "temperature_market" or side not in {"YES", "NO"}:
+        return None
+    price = float(context.get("price") or 0.0)
+    previous_price = float(context.get("previous_price") or 0.0)
+    if price <= previous_price or previous_price <= 0:
+        return None
+    price_change_pct = (price - previous_price) / previous_price
+    threshold = float(settings.get("yes_change_pct" if side == "YES" else "no_change_pct", 0.30))
+    if price_change_pct < threshold:
+        return None
+    max_price = float(settings.get("yes_max_price" if side == "YES" else "no_max_price", 1.0))
+    if price <= 0 or price > max_price:
+        LOGGER.info("price momentum skip price city=%s market=%s side=%s price=%s max=%s change_pct=%s", context.get("city"), context.get("market_id"), side, price, max_price, price_change_pct)
+        return None
+
+    city = str(context.get("city") or "")
+    kind = str(context.get("kind") or "")
+    event_date = str(context.get("event_date") or "")
+    event_url = str(context.get("polymarket_url") or "")
+    station = str(context.get("station") or "")
+    market_id = str(context.get("market_id") or "")
+    if not city or not kind or not event_date or not event_url or not station or not market_id:
+        return None
+    in_window, timing = in_station_report_window(config, city, station)
+    if not in_window:
+        LOGGER.info(
+            "price momentum skip outside_report_window city=%s station=%s market=%s expected_next_obs_utc=%s change_pct=%s",
+            city,
+            station,
+            market_id,
+            timing.get("expected_next_obs_utc", ""),
+            price_change_pct,
+        )
+        return None
+
+    event = fetch_event_by_url(config, event_url, city, kind, event_date)
+    if not event:
+        return None
+    markets = markets_for_event(config, event)
+    market = next((m for m in markets if m.market_id == market_id), None)
+    if not market:
+        return None
+    if side == "YES":
+        boundary = outer_boundary_market(markets, event_market_unit(markets), kind)
+        if not boundary or boundary.market_id != market.market_id:
+            LOGGER.info(
+                "price momentum skip yes_not_outer_boundary city=%s kind=%s market=%s boundary_market=%s change_pct=%s question=%r",
+                city,
+                kind,
+                market.market_id,
+                boundary.market_id if boundary else "",
+                price_change_pct,
+                market.market_question,
+            )
+            return None
+    trades = read_trades(config["outputs"]["trades_csv"])
+    strategy_name = str(config["trading"]["strategy_name"])
+    if open_trade_exists(trades, strategy_name, market.market_id, side):
+        return None
+
+    reason = "metar_price_momentum_boundary_yes" if side == "YES" else "metar_price_momentum_no"
+    cycle_id = datetime.now().strftime("%Y%m%dT%H%M%S") + f":price_momentum_{side.lower()}"
+    live_trader = get_live_trader() if live_trading_enabled(config) else None
+    trade = (
+        live_trader.submit_buy_trade(config, cycle_id, market, "", station, side, price, None, None, reason)
+        if live_trader
+        else make_trade(config, cycle_id, market, "", station, side, price, None, None, reason)
+    )
+    if not trade:
+        return None
+    if not live_trader:
+        notify_trade(config, trade, "BUY", "FILLED", reason)
+    trades.append(trade)
+    write_csv(config["outputs"]["trades_csv"], trades)
+    write_csv(config["outputs"]["settled_trades_csv"], trades)
+    write_performance_reports(config, trades)
+    LOGGER.info(
+        "price momentum buy city=%s station=%s market=%s side=%s price=%s change_pct=%s expected_next_obs_utc=%s status=%s",
+        city,
+        station,
+        market.market_id,
+        side,
+        price,
+        price_change_pct,
+        timing.get("expected_next_obs_utc", ""),
+        trade.status,
+    )
+    start_tgftp_validation_thread(config, trade.trade_id, station, str(timing.get("expected_next_obs_utc") or ""))
+    return trade
+
+
+def process_price_momentum_no_buy(config: dict[str, Any], context: dict[str, Any]) -> Optional[PaperTrade]:
+    """Backward-compatible wrapper for the generalized price momentum strategy."""
+    return process_price_momentum_buy(config, context)
+
+
+def start_tgftp_validation_thread(config: dict[str, Any], trade_id: str, station: str, min_obs_utc: str) -> None:
+    """Start one TGFTP validation worker for a just-created price momentum trade."""
+    if not trade_id or trade_id in TGFTP_VALIDATION_THREADS:
+        return
+    TGFTP_VALIDATION_THREADS.add(trade_id)
+    thread = threading.Thread(target=tgftp_validation_worker, args=(config, trade_id, station, min_obs_utc), name=f"tgftp-verify-{trade_id[:24]}", daemon=True)
+    thread.start()
+
+
+def tgftp_validation_worker(config: dict[str, Any], trade_id: str, station: str, min_obs_utc: str) -> None:
+    """Poll TGFTP until a new station report validates or rejects a price momentum trade."""
+    settings = config.get("price_momentum", {})
+    interval = max(1, int(settings.get("tgftp_verify_interval_seconds", 10)))
+    timeout = max(interval, int(settings.get("tgftp_verify_timeout_seconds", 180)))
+    try:
+        min_obs_dt = datetime.fromisoformat(min_obs_utc.replace("Z", "+00:00")).astimezone(timezone.utc)
+    except ValueError:
+        min_obs_dt = datetime.now(timezone.utc)
+    deadline = time.monotonic() + timeout
+    try:
+        while time.monotonic() <= deadline:
+            try:
+                obs = tgftp_metar_observation(station)
+            except Exception:
+                LOGGER.exception("tgftp validation fetch failed trade=%s station=%s", trade_id, station)
+                time.sleep(interval)
+                continue
+            if not obs:
+                time.sleep(interval)
+                continue
+            obs_dt = obs["obs_dt"].astimezone(timezone.utc)
+            if obs_dt < min_obs_dt:
+                LOGGER.info("tgftp validation wait trade=%s station=%s obs_utc=%s min_obs_utc=%s", trade_id, station, obs_dt.isoformat(), min_obs_dt.isoformat())
+                time.sleep(interval)
+                continue
+            validate_trade_with_tgftp_observation(config, trade_id, station, obs)
+            return
+        LOGGER.warning("tgftp validation timeout trade=%s station=%s min_obs_utc=%s", trade_id, station, min_obs_dt.isoformat())
+    finally:
+        TGFTP_VALIDATION_THREADS.discard(trade_id)
+
+
+def validate_trade_with_tgftp_observation(config: dict[str, Any], trade_id: str, station: str, obs: dict[str, Any]) -> None:
+    """Apply one latest TGFTP METAR observation to an open price momentum trade."""
+    trades = read_trades(config["outputs"]["trades_csv"])
+    trade = next((t for t in trades if t.trade_id == trade_id), None)
+    if not trade:
+        return
+    event = fetch_event_by_url(config, trade.polymarket_url, trade.city, trade.kind, trade.event_date)
+    if not event:
+        return
+    markets = markets_for_event(config, event)
+    market = next((m for m in markets if m.market_id == trade.market_id), None)
+    if not market:
+        return
+    event_unit = event_market_unit(markets)
+    temp_f = convert_temperature(float(obs["temp_c"]), "C", "F")
+    temp = convert_temperature(temp_f, "F", event_unit) if event_unit.upper() != "F" else temp_f
+    if temp is None:
+        return
+    rounded_temp = round(float(temp))
+    key = (trade.event_date, trade.city, trade.kind)
+    previous = EXTREMES_BY_EVENT.get(key, {})
+    observed_high = previous.get("observed_high")
+    observed_low = previous.get("observed_low")
+    if trade.kind == "Highest":
+        observed_high = max(float(observed_high), rounded_temp) if observed_high is not None else rounded_temp
+    else:
+        observed_low = min(float(observed_low), rounded_temp) if observed_low is not None else rounded_temp
+    EXTREMES_BY_EVENT[key] = {
+        "source": "tgftp_metar",
+        "observed_high": observed_high,
+        "observed_low": observed_low,
+        "checked_at": datetime.now().isoformat(timespec="seconds"),
+        "obs_utc": obs["obs_dt"].astimezone(timezone.utc).isoformat(),
+        "raw_ob": obs["raw_ob"],
+    }
+    trade.forecast_high = float(observed_high) if observed_high is not None else trade.forecast_high
+    trade.forecast_low = float(observed_low) if observed_low is not None else trade.forecast_low
+    trade.forecast_temp = float(observed_high) if trade.kind == "Highest" and observed_high is not None else float(observed_low) if trade.kind == "Lowest" and observed_low is not None else trade.forecast_temp
+    trade.forecast_observed_at = obs["obs_dt"].astimezone(timezone.utc).isoformat()
+    if trade.status != "OPEN":
+        trade.error = f"tgftp validated while trade status={trade.status}; raw={obs['raw_ob']}"
+        write_csv(config["outputs"]["trades_csv"], trades)
+        write_csv(config["outputs"]["settled_trades_csv"], trades)
+        return
+    if trade_observation_verified(trade, market, observed_high, observed_low, event_unit):
+        trade.settlement_source = "tgftp_verified_hold"
+        trade.error = ""
+        LOGGER.info("tgftp validation hold trade=%s station=%s obs_utc=%s temp=%s high=%s low=%s raw=%r", trade_id, station, obs["obs_dt"].isoformat(), rounded_temp, observed_high, observed_low, obs["raw_ob"])
+    else:
+        if close_trade(config, trade, market, "tgftp_invalidated_price_momentum"):
+            LOGGER.info("tgftp validation sell trade=%s station=%s obs_utc=%s temp=%s high=%s low=%s raw=%r", trade_id, station, obs["obs_dt"].isoformat(), rounded_temp, observed_high, observed_low, obs["raw_ob"])
+    write_csv(config["outputs"]["trades_csv"], trades)
+    write_csv(config["outputs"]["settled_trades_csv"], trades)
+    write_performance_reports(config, trades)
 
 
 def market_clob_tokens(market_json: dict[str, Any]) -> list[tuple[str, str]]:
@@ -3086,7 +3566,9 @@ def websocket_assets(config: dict[str, Any]) -> dict[str, dict[str, Any]]:
             city = event["_parsed_city"]
             kind = event["_parsed_kind"]
             event_date = event["_parsed_event_date"]
+            event_url = poly_url_from_event(event)
             try:
+                station = station_from_wu_url(extract_wunderground_source(config, event_url))
                 markets = markets_for_event(config, event)
                 markets_by_id = {m.market_id: m for m in markets}
                 for trade in open_trades:
@@ -3106,7 +3588,8 @@ def websocket_assets(config: dict[str, Any]) -> dict[str, dict[str, Any]]:
                             "city": city,
                             "kind": kind,
                             "event_date": event_date,
-                            "polymarket_url": poly_url_from_event(event),
+                            "polymarket_url": event_url,
+                            "station": station,
                             "last_price": current_price,
                         }
                         continue
@@ -3124,7 +3607,8 @@ def websocket_assets(config: dict[str, Any]) -> dict[str, dict[str, Any]]:
                                 "city": city,
                                 "kind": kind,
                                 "event_date": event_date,
-                                "polymarket_url": poly_url_from_event(event),
+                                "polymarket_url": event_url,
+                                "station": station,
                                 "last_price": current_price,
                             }
                 for market in markets:
@@ -3141,7 +3625,8 @@ def websocket_assets(config: dict[str, Any]) -> dict[str, dict[str, Any]]:
                             "city": city,
                             "kind": kind,
                             "event_date": event_date,
-                            "polymarket_url": poly_url_from_event(event),
+                            "polymarket_url": event_url,
+                            "station": station,
                             "last_price": None,
                         }
             except Exception:
@@ -3310,7 +3795,7 @@ def monitor_websocket(config: dict[str, Any], duration_seconds: int = 0) -> bool
                 LOGGER.info("websocket trigger %s", json.dumps(context, ensure_ascii=False, sort_keys=True))
                 if asset.get("role") == "held_position":
                     verify_open_positions_with_twc(config, context)
-                process_harvest_if_new_websocket_metar(config, context)
+                process_price_momentum_buy(config, context)
                 assets = websocket_assets(config)
     finally:
         try:
@@ -3406,7 +3891,7 @@ def aviation_supervisor(config: dict[str, Any]) -> None:
                     group_key = (city, station)
                     group = station_groups.setdefault(group_key, {"city": city, "station": station, "events": []})
                     group["events"].append(event)
-                    station_state.setdefault(group_key, {"next_probe_at": now_mono, "latest_utc": "", "min_interval_seconds": None, "probing": False})
+                    station_state.setdefault(group_key, {"next_probe_at": now_mono, "latest_obs_utc": "", "min_interval_seconds": None, "probing": False})
                 for stale_key in set(station_state) - set(station_groups):
                     station_state.pop(stale_key, None)
                 event_refresh_at = now_mono + 300
@@ -3418,25 +3903,26 @@ def aviation_supervisor(config: dict[str, Any]) -> None:
 
             now_mono = time.monotonic()
             for group_key, group in station_groups.items():
-                schedule = station_state.setdefault(group_key, {"next_probe_at": now_mono, "latest_utc": "", "min_interval_seconds": None, "probing": False})
+                schedule = station_state.setdefault(group_key, {"next_probe_at": now_mono, "latest_obs_utc": "", "min_interval_seconds": None, "probing": False})
                 if now_mono < float(schedule.get("next_probe_at", 0.0)):
                     continue
 
                 city = str(group["city"])
                 station = str(group["station"])
                 try:
-                    latest_dt, min_interval_seconds, report_count = aviation_report_timing(station, 24)
+                    latest_dt, min_interval_seconds, report_count = aviation_report_timing(station, 24, config)
                     if latest_dt is None:
                         schedule.update({"next_probe_at": now_mono + fallback_poll_seconds, "probing": False})
                         LOGGER.info("aviation timing unavailable city=%s station=%s next_probe_seconds=%s", city, station, fallback_poll_seconds)
                         continue
 
                     latest_utc = latest_dt.astimezone(timezone.utc).isoformat()
-                    previous_latest = str(schedule.get("latest_utc") or "")
+                    previous_latest = str(schedule.get("latest_obs_utc") or "")
                     has_new_report = latest_utc != previous_latest
                     effective_interval = max(60, int(min_interval_seconds or fallback_poll_seconds))
                     next_probe_wall = latest_dt.astimezone(timezone.utc) + timedelta(seconds=max(0, effective_interval - pre_probe_seconds))
                     next_probe_delay = max(0.0, (next_probe_wall - datetime.now(timezone.utc)).total_seconds())
+                    timing = update_station_report_timing(city, station, latest_dt, effective_interval, report_count)
 
                     if not has_new_report:
                         schedule.update({
@@ -3445,27 +3931,29 @@ def aviation_supervisor(config: dict[str, Any]) -> None:
                             "probing": True,
                         })
                         LOGGER.info(
-                            "aviation no new report city=%s station=%s latest_receipt_utc=%s retry_seconds=%s",
+                            "aviation no new report city=%s station=%s latest_obs_utc=%s expected_next_obs_utc=%s retry_seconds=%s",
                             city,
                             station,
                             latest_utc,
+                            timing.get("expected_next_obs_utc"),
                             probe_seconds,
                         )
                         continue
 
                     schedule.update({
-                        "latest_utc": latest_utc,
+                        "latest_obs_utc": latest_utc,
                         "min_interval_seconds": effective_interval,
                         "next_probe_at": now_mono + next_probe_delay,
                         "probing": False,
                     })
                     LOGGER.info(
-                        "aviation new report city=%s station=%s latest_receipt_utc=%s min_receipt_interval_seconds=%s report_count=%s next_probe_at_utc=%s next_probe_seconds=%.1f",
+                        "aviation new report city=%s station=%s latest_obs_utc=%s interval_seconds=%s report_count=%s expected_next_obs_utc=%s next_probe_at_utc=%s next_probe_seconds=%.1f",
                         city,
                         station,
                         latest_utc,
                         effective_interval,
                         report_count,
+                        timing.get("expected_next_obs_utc"),
                         next_probe_wall.isoformat(),
                         next_probe_delay,
                     )
@@ -3494,18 +3982,19 @@ def aviation_supervisor(config: dict[str, Any]) -> None:
                             if not changed:
                                 continue
                             LOGGER.info("aviation extreme changed city=%s kind=%s high=%s low=%s latest=%s", city, kind, aviation_high, aviation_low, event_latest_dt.isoformat())
-                            process_deterministic_harvest(
-                                config,
-                                {
-                                    "source": "aviation_metar",
-                                    "city": city,
-                                    "kind": kind,
-                                    "event_date": event_date,
-                                    "polymarket_url": event_url,
-                                    "aviation_high": aviation_high,
-                                    "aviation_low": aviation_low,
-                                },
-                            )
+                            if config.get("price_momentum", {}).get("awc_extreme_harvest_enabled", False):
+                                process_deterministic_harvest(
+                                    config,
+                                    {
+                                        "source": "aviation_metar",
+                                        "city": city,
+                                        "kind": kind,
+                                        "event_date": event_date,
+                                        "polymarket_url": event_url,
+                                        "aviation_high": aviation_high,
+                                        "aviation_low": aviation_low,
+                                    },
+                                )
                         except Exception:
                             LOGGER.exception("aviation event failed city=%s kind=%s", city, kind)
                 except Exception:
@@ -3616,6 +4105,7 @@ def run(config: dict[str, Any]) -> None:
     """
     cycle_num = 0
     max_cycles = int(config["scheduler"].get("max_cycles", 0))
+    last_twc_verify_ts = 0.0
     LOGGER.info("bot started config=%s", json.dumps(redacted_config(config), ensure_ascii=False, sort_keys=True))
     start_live_trader(config)
     sync_polymarket_positions_to_disk(config, reason="start")
@@ -3625,7 +4115,10 @@ def run(config: dict[str, Any]) -> None:
         while True:
             cycle_num += 1
             if config["scheduler"].get("settle_after_each_cycle", True):
-                verify_open_positions_with_twc(config, {"source": "scheduled_twc_position_verification"})
+                twc_interval = max(60, int(config.get("price_momentum", {}).get("twc_verify_interval_seconds", int(config["scheduler"].get("poll_interval_minutes", 15)) * 60)))
+                if time.time() - last_twc_verify_ts >= twc_interval:
+                    verify_open_positions_with_twc(config, {"source": "scheduled_twc_position_verification"})
+                    last_twc_verify_ts = time.time()
                 settle_open_trades(config)
                 summarize_settled(config)
             write_state(config, cycle_num)

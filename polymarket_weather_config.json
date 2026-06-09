@@ -64,7 +64,7 @@
     "websocket_asset_refresh_seconds": 300,
     "live_trading_enabled": true,
     "live_trading_dry_run": false,
-    "live_order_timeout_seconds": 12,
+    "live_order_timeout_seconds": 20,
     "live_order_check_seconds": 1
   },
   "scheduler": {
@@ -80,6 +80,7 @@
     "performance_by_cycle_csv": "polymarket_weather_performance_by_cycle.csv",
     "performance_by_event_csv": "polymarket_weather_performance_by_event.csv",
     "state_json": "polymarket_weather_state.json",
+    "aviation_metar_history_jsonl": "aviation_metar_history.jsonl",
     "log_file": "bot.log",
     "log_level": "INFO",
     "console_log_enabled": false
@@ -94,6 +95,23 @@
     "signature_type": 3,
     "sync_positions_on_start": true,
     "sync_positions_on_stop": true
+  },
+  "notifications": {
+    "telegram_enabled": true,
+    "telegram_notify_order_submitted": true,
+    "telegram_notify_order_filled": true
+  },
+  "price_momentum": {
+    "enabled": true,
+    "awc_extreme_harvest_enabled": false,
+    "no_change_pct": 0.3,
+    "yes_change_pct": 0.3,
+    "report_window_seconds": 90,
+    "no_max_price": 0.99,
+    "yes_max_price": 0.99,
+    "tgftp_verify_interval_seconds": 10,
+    "tgftp_verify_timeout_seconds": 180,
+    "twc_verify_interval_seconds": 900
   },
   "strategies": [
     {
@@ -132,7 +150,7 @@
         "websocket_asset_refresh_seconds": 300,
         "live_trading_enabled": true,
         "live_trading_dry_run": false,
-        "live_order_timeout_seconds": 12,
+        "live_order_timeout_seconds": 20,
         "live_order_check_seconds": 1
       }
     }

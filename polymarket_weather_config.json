@@ -104,6 +104,7 @@
   "price_momentum": {
     "enabled": true,
     "awc_extreme_harvest_enabled": false,
+    "move_to_one_fraction": 0.3,
     "no_change_pct": 0.3,
     "yes_change_pct": 0.3,
     "report_window_seconds": 120,

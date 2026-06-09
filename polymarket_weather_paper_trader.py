@@ -57,6 +57,7 @@ LIVE_TRADER: Optional[Any] = None
 TELEGRAM_NOTIFIER: Optional[Any] = None
 STATION_REPORT_TIMING: dict[tuple[str, str], dict[str, Any]] = {}
 TGFTP_VALIDATION_THREADS: set[str] = set()
+PRICE_MOMENTUM_WINDOWS: dict[str, dict[str, Any]] = {}
 
 
 @dataclass
@@ -340,6 +341,7 @@ def default_config() -> dict[str, Any]:
         "price_momentum": {
             "enabled": True,
             "awc_extreme_harvest_enabled": False,
+            "move_to_one_fraction": 0.30,
             "no_change_pct": 0.30,
             "yes_change_pct": 0.30,
             "report_window_seconds": 120,
@@ -1807,6 +1809,13 @@ def in_station_report_window(config: dict[str, Any], city: str, station: str, no
     now_value = (now_utc or datetime.now(timezone.utc)).astimezone(timezone.utc)
     window_seconds = max(1, int(config.get("price_momentum", {}).get("report_window_seconds", 120)))
     return expected <= now_value < expected + timedelta(seconds=window_seconds), state
+
+
+def momentum_target_price(base_price: float, fraction: float) -> float:
+    """Return the price needed after moving a fraction of the remaining path to 1.0."""
+    base = min(0.999999, max(0.0, float(base_price)))
+    move_fraction = min(1.0, max(0.0, float(fraction)))
+    return base + move_fraction * (1.0 - base)
 
 
 def taker_fee_usdc(shares: float, price: float, fee_rate: float, fee_enabled: bool) -> float:
@@ -3343,13 +3352,9 @@ def process_price_momentum_buy(config: dict[str, Any], context: dict[str, Any]) 
     previous_price = float(context.get("previous_price") or 0.0)
     if price <= previous_price or previous_price <= 0:
         return None
-    price_change_pct = (price - previous_price) / previous_price
-    threshold = float(settings.get("yes_change_pct" if side == "YES" else "no_change_pct", 0.30))
-    if price_change_pct < threshold:
-        return None
     max_price = float(settings.get("yes_max_price" if side == "YES" else "no_max_price", 1.0))
     if price <= 0 or price > max_price:
-        LOGGER.info("price momentum skip price city=%s market=%s side=%s price=%s max=%s change_pct=%s", context.get("city"), context.get("market_id"), side, price, max_price, price_change_pct)
+        LOGGER.info("price momentum skip price city=%s market=%s side=%s price=%s max=%s", context.get("city"), context.get("market_id"), side, price, max_price)
         return None
 
     city = str(context.get("city") or "")
@@ -3361,14 +3366,43 @@ def process_price_momentum_buy(config: dict[str, Any], context: dict[str, Any]) 
     if not city or not kind or not event_date or not event_url or not station or not market_id:
         return None
     in_window, timing = in_station_report_window(config, city, station)
+    asset_id = str(context.get("asset_id") or market_id)
+    expected_next_obs_utc = str(timing.get("expected_next_obs_utc") or "")
     if not in_window:
+        if asset_id:
+            PRICE_MOMENTUM_WINDOWS.pop(asset_id, None)
+        if context.get("log_skip"):
+            LOGGER.info(
+                "price momentum skip outside_report_window city=%s station=%s market=%s expected_next_obs_utc=%s",
+                city,
+                station,
+                market_id,
+                expected_next_obs_utc,
+            )
+        return None
+    window = PRICE_MOMENTUM_WINDOWS.get(asset_id)
+    if not window or window.get("expected_next_obs_utc") != expected_next_obs_utc:
+        window = {
+            "expected_next_obs_utc": expected_next_obs_utc,
+            "base_price": previous_price,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+        }
+        PRICE_MOMENTUM_WINDOWS[asset_id] = window
+    base_price = float(window.get("base_price") or previous_price)
+    move_fraction = float(settings.get("move_to_one_fraction", settings.get("yes_change_pct" if side == "YES" else "no_change_pct", 0.30)))
+    target_price = momentum_target_price(base_price, move_fraction)
+    if price < target_price:
         LOGGER.info(
-            "price momentum skip outside_report_window city=%s station=%s market=%s expected_next_obs_utc=%s change_pct=%s",
+            "price momentum skip below_target city=%s station=%s market=%s side=%s base_price=%s price=%s target_price=%s move_to_one_fraction=%s expected_next_obs_utc=%s",
             city,
             station,
             market_id,
-            timing.get("expected_next_obs_utc", ""),
-            price_change_pct,
+            side,
+            base_price,
+            price,
+            target_price,
+            move_fraction,
+            expected_next_obs_utc,
         )
         return None
 
@@ -3383,12 +3417,12 @@ def process_price_momentum_buy(config: dict[str, Any], context: dict[str, Any]) 
         boundary = outer_boundary_market(markets, event_market_unit(markets), kind)
         if not boundary or boundary.market_id != market.market_id:
             LOGGER.info(
-                "price momentum skip yes_not_outer_boundary city=%s kind=%s market=%s boundary_market=%s change_pct=%s question=%r",
+                "price momentum skip yes_not_outer_boundary city=%s kind=%s market=%s boundary_market=%s move_to_one_fraction=%s question=%r",
                 city,
                 kind,
                 market.market_id,
                 boundary.market_id if boundary else "",
-                price_change_pct,
+                move_fraction,
                 market.market_question,
             )
             return None
@@ -3414,14 +3448,16 @@ def process_price_momentum_buy(config: dict[str, Any], context: dict[str, Any]) 
     write_csv(config["outputs"]["settled_trades_csv"], trades)
     write_performance_reports(config, trades)
     LOGGER.info(
-        "price momentum buy city=%s station=%s market=%s side=%s price=%s change_pct=%s expected_next_obs_utc=%s status=%s",
+        "price momentum buy city=%s station=%s market=%s side=%s base_price=%s price=%s target_price=%s move_to_one_fraction=%s expected_next_obs_utc=%s status=%s",
         city,
         station,
         market.market_id,
         side,
+        base_price,
         price,
-        price_change_pct,
-        timing.get("expected_next_obs_utc", ""),
+        target_price,
+        move_fraction,
+        expected_next_obs_utc,
         trade.status,
     )
     start_tgftp_validation_thread(config, trade.trade_id, station, str(timing.get("expected_next_obs_utc") or ""))
@@ -3818,22 +3854,23 @@ def monitor_websocket(config: dict[str, Any], duration_seconds: int = 0) -> bool
                 if previous_price <= 0:
                     continue
                 price_change_pct = abs(float(price) - previous_price) / previous_price
-                if price_change_pct < trigger_pct:
-                    continue
                 context = {
                     "source": "polymarket_websocket_temperature_market",
                     "asset_id": asset_id,
                     "price": price,
                     "previous_price": previous_price,
                     "price_change_pct": price_change_pct,
+                    "log_skip": price_change_pct >= trigger_pct,
                     "price_field": price_field,
                     **asset,
                 }
-                LOGGER.info("websocket trigger %s", json.dumps(context, ensure_ascii=False, sort_keys=True))
-                if asset.get("role") == "held_position":
+                if price_change_pct >= trigger_pct:
+                    LOGGER.info("websocket trigger %s", json.dumps(context, ensure_ascii=False, sort_keys=True))
+                if asset.get("role") == "held_position" and price_change_pct >= trigger_pct:
                     verify_open_positions_with_twc(config, context)
-                process_price_momentum_buy(config, context)
-                assets = websocket_assets(config)
+                trade = process_price_momentum_buy(config, context)
+                if price_change_pct >= trigger_pct or trade:
+                    assets = websocket_assets(config)
     finally:
         try:
             ws.close()

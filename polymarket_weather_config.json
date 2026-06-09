@@ -98,6 +98,7 @@
     "state_json": "polymarket_weather_state.json",
     "aviation_metar_history_jsonl": "aviation_metar_history.jsonl",
     "price_window_ticks_jsonl": "price_window_ticks.jsonl",
+    "price_window_raw_jsonl": "price_window_raw.jsonl",
     "log_file": "bot.log",
     "log_level": "INFO",
     "console_log_enabled": false

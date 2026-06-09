@@ -320,6 +320,7 @@ def default_config() -> dict[str, Any]:
             "state_json": "polymarket_weather_state.json",
             "aviation_metar_history_jsonl": "aviation_metar_history.jsonl",
             "price_window_ticks_jsonl": "price_window_ticks.jsonl",
+            "price_window_raw_jsonl": "price_window_raw.jsonl",
             "log_file": "bot.log",
             "log_level": "INFO",
             "console_log_enabled": False,
@@ -1537,6 +1538,13 @@ def append_price_window_record(config: dict[str, Any], record: dict[str, Any]) -
     path = str(config.get("outputs", {}).get("price_window_ticks_jsonl") or "price_window_ticks.jsonl")
     with IO_LOCK, open(path, "a", encoding="utf-8") as f:
         f.write(json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n")
+
+
+def append_price_window_raw_record(config: dict[str, Any], record: dict[str, Any]) -> None:
+    """Append one raw Polymarket websocket message captured during an observation window."""
+    path = str(config.get("outputs", {}).get("price_window_raw_jsonl") or "price_window_raw.jsonl")
+    with IO_LOCK, open(path, "a", encoding="utf-8") as f:
+        f.write(json.dumps(record, separators=(",", ":"), ensure_ascii=False) + "\n")
 
 
 def parse_aviation_obs_time(value: Any) -> Optional[datetime]:
@@ -3611,23 +3619,36 @@ def websocket_message_prices(message: Any) -> list[tuple[str, float, str]]:
         except json.JSONDecodeError:
             return []
     rows: list[tuple[str, float, str]] = []
-    if isinstance(message, list):
-        for item in message:
-            rows.extend(websocket_message_prices(item))
-        return rows
-    if not isinstance(message, dict):
-        return rows
-    for nested_key in ("data", "payload", "event"):
-        nested = message.get(nested_key)
-        if isinstance(nested, (dict, list)):
-            rows.extend(websocket_message_prices(nested))
-    asset_id = str(message.get("asset_id") or message.get("assetId") or message.get("token_id") or message.get("tokenId") or "")
-    for field_name in ("price", "best_bid", "best_ask", "last_price"):
-        if asset_id and message.get(field_name) not in (None, ""):
+    seen: set[tuple[str, float, str]] = set()
+
+    def walk(node: Any) -> None:
+        if isinstance(node, str):
             try:
-                rows.append((asset_id, float(message[field_name]), field_name))
-            except (TypeError, ValueError):
-                pass
+                node = json.loads(node)
+            except json.JSONDecodeError:
+                return
+        if isinstance(node, list):
+            for item in node:
+                walk(item)
+            return
+        if not isinstance(node, dict):
+            return
+        asset = str(node.get("asset_id") or node.get("assetId") or node.get("token_id") or node.get("tokenId") or node.get("asset") or "")
+        for field_name in ("price", "best_bid", "best_ask", "last_price"):
+            if asset and node.get(field_name) not in (None, ""):
+                try:
+                    price = float(node[field_name])
+                except (TypeError, ValueError):
+                    continue
+                key = (asset, price, field_name)
+                if key not in seen:
+                    seen.add(key)
+                    rows.append(key)
+        for value in node.values():
+            if isinstance(value, (dict, list)):
+                walk(value)
+
+    walk(message)
     return rows
 
 
@@ -3847,6 +3868,69 @@ def price_record_payload(event_type: str, asset: dict[str, Any], asset_id: str, 
     }
 
 
+def raw_ws_record_payload(message: Any, matched_assets: list[dict[str, Any]], timing: dict[str, Any]) -> dict[str, Any]:
+    """Build a raw websocket capture record for replay/debugging parser gaps."""
+    now_utc = datetime.now(timezone.utc)
+    return {
+        "event_type": "websocket_raw",
+        "captured_at_utc": now_utc.isoformat(timespec="milliseconds"),
+        "captured_at_epoch_ms": int(now_utc.timestamp() * 1000),
+        "expected_next_obs_utc": timing.get("expected_next_obs_utc", ""),
+        "latest_obs_utc": timing.get("latest_obs_utc", ""),
+        "scheduled_minutes_utc": timing.get("scheduled_minutes_utc", []),
+        "matched_assets": matched_assets,
+        "raw_message": message,
+    }
+
+
+def record_raw_price_window_message(config: dict[str, Any], assets: dict[str, dict[str, Any]], message: Any, rows: list[tuple[str, float, str]], received_ts: float) -> None:
+    """Record every raw websocket message while any city observation recording window is active."""
+    now_mono = time.monotonic()
+    active_windows = [
+        (key, recording)
+        for key, recording in PRICE_RECORDING_WINDOWS.items()
+        if now_mono < float(recording.get("record_until_monotonic", 0.0))
+    ]
+    if not active_windows:
+        return
+    parsed_assets = []
+    seen_assets: set[str] = set()
+    for asset_id, price, price_field in rows:
+        if asset_id in seen_assets:
+            continue
+        seen_assets.add(asset_id)
+        asset = assets.get(asset_id, {})
+        parsed_assets.append({
+            "asset_id": asset_id,
+            "price": price,
+            "price_field": price_field,
+            "city": asset.get("city", ""),
+            "station": asset.get("station", ""),
+            "market_id": asset.get("market_id", ""),
+            "position_side": asset.get("position_side", ""),
+        })
+    append_price_window_raw_record(
+        config,
+        {
+            "source": "polymarket",
+            "event_type": "websocket_raw",
+            "received_ts": received_ts,
+            "received_ms": int(received_ts * 1000),
+            "received_at_utc": datetime.fromtimestamp(received_ts, timezone.utc).isoformat(timespec="milliseconds"),
+            "active_windows": [
+                {
+                    "window_key": key,
+                    "started_at_utc": recording.get("started_at_utc", ""),
+                    "record_seconds": recording.get("record_seconds", 0),
+                }
+                for key, recording in active_windows
+            ],
+            "parsed_assets": parsed_assets,
+            "raw": message,
+        },
+    )
+
+
 def record_price_window_tick(config: dict[str, Any], assets: dict[str, dict[str, Any]], asset: dict[str, Any], asset_id: str, price: float, previous_price: Optional[float], price_field: str) -> None:
     """Record city-wide websocket prices while a station is inside its observation window."""
     city = str(asset.get("city") or "")
@@ -3894,10 +3978,58 @@ def record_price_window_tick(config: dict[str, Any], assets: dict[str, dict[str,
         for snapshot_asset_id, snapshot_asset in assets.items():
             if snapshot_asset.get("city") != city or snapshot_asset.get("station") != station:
                 continue
-            snapshot_price = snapshot_asset.get("last_price")
+            snapshot_price = previous_price if snapshot_asset_id == asset_id and previous_price is not None else snapshot_asset.get("last_price")
+            if snapshot_price not in (None, ""):
+                PRICE_MOMENTUM_WINDOWS[snapshot_asset_id] = {
+                    "expected_next_obs_utc": expected_next,
+                    "base_price": float(snapshot_price),
+                    "created_at": recording["started_at_utc"],
+                    "source": "window_snapshot",
+                }
             append_price_window_record(config, price_record_payload("window_snapshot", snapshot_asset, snapshot_asset_id, snapshot_price, None, "last_price", timing))
         LOGGER.info("price window recording started city=%s station=%s expected_next_obs_utc=%s record_seconds=%s assets=%s", city, station, expected_next, record_seconds, sum(1 for a in assets.values() if a.get("city") == city and a.get("station") == station))
     append_price_window_record(config, price_record_payload("websocket_tick", asset, asset_id, price, previous_price, price_field, timing))
+
+
+def ensure_price_recording_windows(config: dict[str, Any], assets: dict[str, dict[str, Any]]) -> None:
+    """Start city-wide price recording as soon as a station enters its observation window."""
+    seen: set[tuple[str, str]] = set()
+    for asset_id, asset in assets.items():
+        city = str(asset.get("city") or "")
+        station = str(asset.get("station") or "")
+        if not city or not station or (city, station) in seen:
+            continue
+        seen.add((city, station))
+        in_window, timing = in_station_report_window(config, city, station)
+        if not in_window:
+            continue
+        expected_next = str(timing.get("expected_next_obs_utc") or "")
+        window_key = f"{city}:{station}:{expected_next}"
+        if window_key in PRICE_RECORDING_WINDOWS:
+            continue
+        record_seconds = max(1, int(config.get("price_momentum", {}).get("price_window_record_seconds", 300)))
+        recording = {
+            "record_until_monotonic": time.monotonic() + record_seconds,
+            "started_at_utc": datetime.now(timezone.utc).isoformat(timespec="milliseconds"),
+            "record_seconds": record_seconds,
+            "ended_logged": False,
+        }
+        PRICE_RECORDING_WINDOWS[window_key] = recording
+        count = 0
+        for snapshot_asset_id, snapshot_asset in assets.items():
+            if snapshot_asset.get("city") != city or snapshot_asset.get("station") != station:
+                continue
+            snapshot_price = snapshot_asset.get("last_price")
+            if snapshot_price not in (None, ""):
+                PRICE_MOMENTUM_WINDOWS[snapshot_asset_id] = {
+                    "expected_next_obs_utc": expected_next,
+                    "base_price": float(snapshot_price),
+                    "created_at": recording["started_at_utc"],
+                    "source": "window_snapshot",
+                }
+            append_price_window_record(config, price_record_payload("window_snapshot", snapshot_asset, snapshot_asset_id, snapshot_price, None, "last_price", timing))
+            count += 1
+        LOGGER.info("price window recording started city=%s station=%s expected_next_obs_utc=%s record_seconds=%s assets=%s", city, station, expected_next, record_seconds, count)
 
 
 def monitor_websocket(config: dict[str, Any], duration_seconds: int = 0) -> bool:
@@ -3931,7 +4063,7 @@ def monitor_websocket(config: dict[str, Any], duration_seconds: int = 0) -> bool
     asset_ids = sorted(assets)
     ws = websocket.create_connection(ws_url, timeout=timeout_seconds)
     try:
-        ws.send(json.dumps({"assets_ids": asset_ids, "type": "market"}))
+        ws.send(json.dumps({"assets_ids": asset_ids, "type": "market", "custom_feature_enabled": True}))
         started = time.monotonic()
         last_refresh = started
         while duration_seconds <= 0 or time.monotonic() - started < duration_seconds:
@@ -3940,13 +4072,17 @@ def monitor_websocket(config: dict[str, Any], duration_seconds: int = 0) -> bool
                 new_ids = sorted(assets)
                 if new_ids and new_ids != asset_ids:
                     asset_ids = new_ids
-                    ws.send(json.dumps({"assets_ids": asset_ids, "type": "market"}))
+                    ws.send(json.dumps({"assets_ids": asset_ids, "type": "market", "custom_feature_enabled": True}))
                 last_refresh = time.monotonic()
             try:
                 message = ws.recv()
+                received_ts = time.time()
             except Exception:
                 break
-            for asset_id, price, price_field in websocket_message_prices(message):
+            ensure_price_recording_windows(config, assets)
+            price_rows = websocket_message_prices(message)
+            record_raw_price_window_message(config, assets, message, price_rows, received_ts)
+            for asset_id, price, price_field in price_rows:
                 asset = assets.get(asset_id)
                 if not asset:
                     continue

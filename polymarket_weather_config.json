@@ -129,6 +129,11 @@
     "yes_change_pct": 0.3,
     "report_window_seconds": 210,
     "price_window_record_seconds": 300,
+    "websocket_signal_fields": [
+      "price",
+      "last_price",
+      "best_bid"
+    ],
     "no_max_price": 0.99,
     "yes_max_price": 0.99,
     "tgftp_verify_interval_seconds": 10,

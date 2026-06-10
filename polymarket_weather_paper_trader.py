@@ -1913,6 +1913,19 @@ def momentum_target_price(base_price: float, fraction: float) -> float:
     return base + move_fraction * (1.0 - base)
 
 
+def websocket_momentum_signal_fields(config: dict[str, Any]) -> set[str]:
+    """Return websocket price fields allowed to drive observation-window momentum buys."""
+    fields = config.get("price_momentum", {}).get("websocket_signal_fields")
+    if not fields:
+        return {"price", "last_price", "best_bid"}
+    return {str(field).strip() for field in fields if str(field).strip()}
+
+
+def price_momentum_window_key(asset_id: str, price_field: str) -> str:
+    """Keep independent momentum baselines for trade prices and top-of-book prices."""
+    return f"{asset_id}:{price_field or 'price'}"
+
+
 def taker_fee_usdc(shares: float, price: float, fee_rate: float, fee_enabled: bool) -> float:
     """Compute the Polymarket taker fee for a simulated trade.
     
@@ -3445,6 +3458,7 @@ def process_price_momentum_buy(config: dict[str, Any], context: dict[str, Any]) 
         return None
     price = float(context.get("price") or 0.0)
     previous_price = float(context.get("previous_price") or 0.0)
+    price_field = str(context.get("price_field") or "price")
     if price <= previous_price or previous_price <= 0:
         return None
     max_price = float(settings.get("yes_max_price" if side == "YES" else "no_max_price", 1.0))
@@ -3462,37 +3476,41 @@ def process_price_momentum_buy(config: dict[str, Any], context: dict[str, Any]) 
         return None
     in_window, timing = in_station_report_window(config, city, station)
     asset_id = str(context.get("asset_id") or market_id)
+    momentum_key = str(context.get("momentum_key") or price_momentum_window_key(asset_id, price_field))
     expected_next_obs_utc = str(timing.get("expected_next_obs_utc") or "")
     if not in_window:
-        if asset_id:
-            PRICE_MOMENTUM_WINDOWS.pop(asset_id, None)
+        if momentum_key:
+            PRICE_MOMENTUM_WINDOWS.pop(momentum_key, None)
         if context.get("log_skip"):
             LOGGER.info(
-                "price momentum skip outside_report_window city=%s station=%s market=%s expected_next_obs_utc=%s",
+                "price momentum skip outside_report_window city=%s station=%s market=%s price_field=%s expected_next_obs_utc=%s",
                 city,
                 station,
                 market_id,
+                price_field,
                 expected_next_obs_utc,
             )
         return None
-    window = PRICE_MOMENTUM_WINDOWS.get(asset_id)
+    window = PRICE_MOMENTUM_WINDOWS.get(momentum_key)
     if not window or window.get("expected_next_obs_utc") != expected_next_obs_utc:
         window = {
             "expected_next_obs_utc": expected_next_obs_utc,
             "base_price": previous_price,
             "created_at": datetime.now(timezone.utc).isoformat(),
+            "price_field": price_field,
         }
-        PRICE_MOMENTUM_WINDOWS[asset_id] = window
+        PRICE_MOMENTUM_WINDOWS[momentum_key] = window
     base_price = float(window.get("base_price") or previous_price)
     move_fraction = float(settings.get("move_to_one_fraction", settings.get("yes_change_pct" if side == "YES" else "no_change_pct", 0.30)))
     target_price = momentum_target_price(base_price, move_fraction)
     if price < target_price:
         LOGGER.info(
-            "price momentum skip below_target city=%s station=%s market=%s side=%s base_price=%s price=%s target_price=%s move_to_one_fraction=%s expected_next_obs_utc=%s",
+            "price momentum skip below_target city=%s station=%s market=%s side=%s price_field=%s base_price=%s price=%s target_price=%s move_to_one_fraction=%s expected_next_obs_utc=%s",
             city,
             station,
             market_id,
             side,
+            price_field,
             base_price,
             price,
             target_price,
@@ -3529,10 +3547,38 @@ def process_price_momentum_buy(config: dict[str, Any], context: dict[str, Any]) 
     reason = "metar_price_momentum_boundary_yes" if side == "YES" else "metar_price_momentum_no"
     cycle_id = datetime.now().strftime("%Y%m%dT%H%M%S") + f":price_momentum_{side.lower()}"
     live_trader = get_live_trader() if live_trading_enabled(config) else None
+    buy_price = price
+    if live_trader:
+        executable_price = best_buy_price(config, market, side)
+        if executable_price is None or executable_price <= 0:
+            LOGGER.info(
+                "price momentum skip no_executable_price city=%s station=%s market=%s side=%s signal_price=%s price_field=%s",
+                city,
+                station,
+                market.market_id,
+                side,
+                price,
+                price_field,
+            )
+            return None
+        if executable_price > max_price:
+            LOGGER.info(
+                "price momentum skip executable_price_too_high city=%s station=%s market=%s side=%s signal_price=%s executable_price=%s max=%s price_field=%s",
+                city,
+                station,
+                market.market_id,
+                side,
+                price,
+                executable_price,
+                max_price,
+                price_field,
+            )
+            return None
+        buy_price = executable_price
     trade = (
-        live_trader.submit_buy_trade(config, cycle_id, market, "", station, side, price, None, None, reason)
+        live_trader.submit_buy_trade(config, cycle_id, market, "", station, side, buy_price, None, None, reason)
         if live_trader
-        else make_trade(config, cycle_id, market, "", station, side, price, None, None, reason)
+        else make_trade(config, cycle_id, market, "", station, side, buy_price, None, None, reason)
     )
     if not trade:
         return None
@@ -3543,13 +3589,15 @@ def process_price_momentum_buy(config: dict[str, Any], context: dict[str, Any]) 
     write_csv(config["outputs"]["settled_trades_csv"], trades)
     write_performance_reports(config, trades)
     LOGGER.info(
-        "price momentum buy city=%s station=%s market=%s side=%s base_price=%s price=%s target_price=%s move_to_one_fraction=%s expected_next_obs_utc=%s status=%s",
+        "price momentum buy city=%s station=%s market=%s side=%s price_field=%s base_price=%s signal_price=%s buy_price=%s target_price=%s move_to_one_fraction=%s expected_next_obs_utc=%s status=%s",
         city,
         station,
         market.market_id,
         side,
+        price_field,
         base_price,
         price,
+        buy_price,
         target_price,
         move_fraction,
         expected_next_obs_utc,
@@ -3967,11 +4015,12 @@ def record_raw_price_window_message(config: dict[str, Any], assets: dict[str, di
     if not active_windows:
         return
     parsed_assets = []
-    seen_assets: set[str] = set()
+    seen_assets: set[tuple[str, str]] = set()
     for asset_id, price, price_field in rows:
-        if asset_id in seen_assets:
+        asset_field = (asset_id, price_field)
+        if asset_field in seen_assets:
             continue
-        seen_assets.add(asset_id)
+        seen_assets.add(asset_field)
         asset = assets.get(asset_id, {})
         parsed_assets.append({
             "asset_id": asset_id,
@@ -4048,29 +4097,39 @@ def record_price_window_tick(config: dict[str, Any], assets: dict[str, dict[str,
             "ended_logged": False,
         }
         PRICE_RECORDING_WINDOWS[window_key] = recording
+        signal_fields = websocket_momentum_signal_fields(config)
         for snapshot_asset_id, snapshot_asset in assets.items():
             if snapshot_asset.get("city") != city or snapshot_asset.get("station") != station:
                 continue
-            snapshot_price = previous_price if snapshot_asset_id == asset_id and previous_price is not None else snapshot_asset.get("last_price")
-            if snapshot_price not in (None, ""):
-                PRICE_MOMENTUM_WINDOWS[snapshot_asset_id] = {
+            snapshot_fields = dict(snapshot_asset.get("last_prices_by_field") or {})
+            if snapshot_asset.get("last_price") not in (None, ""):
+                snapshot_fields.setdefault("last_price", snapshot_asset.get("last_price"))
+            if snapshot_asset_id == asset_id and previous_price is not None:
+                snapshot_fields[price_field] = previous_price
+            for snapshot_field, snapshot_price in snapshot_fields.items():
+                if snapshot_field not in signal_fields or snapshot_price in (None, ""):
+                    continue
+                PRICE_MOMENTUM_WINDOWS[price_momentum_window_key(snapshot_asset_id, snapshot_field)] = {
                     "expected_next_obs_utc": expected_next,
                     "base_price": float(snapshot_price),
                     "created_at": recording["started_at_utc"],
                     "source": "window_snapshot",
+                    "price_field": snapshot_field,
                 }
-            append_price_window_record(config, price_record_payload("window_snapshot", snapshot_asset, snapshot_asset_id, snapshot_price, None, "last_price", timing))
+                append_price_window_record(config, price_record_payload("window_snapshot", snapshot_asset, snapshot_asset_id, float(snapshot_price), None, snapshot_field, timing))
         LOGGER.info("price window recording started city=%s station=%s expected_next_obs_utc=%s record_seconds=%s assets=%s", city, station, expected_next, record_seconds, sum(1 for a in assets.values() if a.get("city") == city and a.get("station") == station))
-    momentum_window = PRICE_MOMENTUM_WINDOWS.get(asset_id)
-    if price_field in {"price", "last_price"} and (
+    momentum_key = price_momentum_window_key(asset_id, price_field)
+    momentum_window = PRICE_MOMENTUM_WINDOWS.get(momentum_key)
+    if price_field in websocket_momentum_signal_fields(config) and (
         not momentum_window or momentum_window.get("expected_next_obs_utc") != expected_next
     ):
         base_price = previous_price if previous_price is not None else price
-        PRICE_MOMENTUM_WINDOWS[asset_id] = {
+        PRICE_MOMENTUM_WINDOWS[momentum_key] = {
             "expected_next_obs_utc": expected_next,
             "base_price": float(base_price),
             "created_at": recording.get("started_at_utc", datetime.now(timezone.utc).isoformat(timespec="milliseconds")),
             "source": "first_window_tick",
+            "price_field": price_field,
         }
     append_price_window_record(config, price_record_payload("websocket_tick", asset, asset_id, price, previous_price, price_field, timing))
 
@@ -4100,18 +4159,24 @@ def ensure_price_recording_windows(config: dict[str, Any], assets: dict[str, dic
         }
         PRICE_RECORDING_WINDOWS[window_key] = recording
         count = 0
+        signal_fields = websocket_momentum_signal_fields(config)
         for snapshot_asset_id, snapshot_asset in assets.items():
             if snapshot_asset.get("city") != city or snapshot_asset.get("station") != station:
                 continue
-            snapshot_price = snapshot_asset.get("last_price")
-            if snapshot_price not in (None, ""):
-                PRICE_MOMENTUM_WINDOWS[snapshot_asset_id] = {
+            snapshot_fields = dict(snapshot_asset.get("last_prices_by_field") or {})
+            if snapshot_asset.get("last_price") not in (None, ""):
+                snapshot_fields.setdefault("last_price", snapshot_asset.get("last_price"))
+            for snapshot_field, snapshot_price in snapshot_fields.items():
+                if snapshot_field not in signal_fields or snapshot_price in (None, ""):
+                    continue
+                PRICE_MOMENTUM_WINDOWS[price_momentum_window_key(snapshot_asset_id, snapshot_field)] = {
                     "expected_next_obs_utc": expected_next,
                     "base_price": float(snapshot_price),
                     "created_at": recording["started_at_utc"],
                     "source": "window_snapshot",
+                    "price_field": snapshot_field,
                 }
-            append_price_window_record(config, price_record_payload("window_snapshot", snapshot_asset, snapshot_asset_id, snapshot_price, None, "last_price", timing))
+                append_price_window_record(config, price_record_payload("window_snapshot", snapshot_asset, snapshot_asset_id, float(snapshot_price), None, snapshot_field, timing))
             count += 1
         LOGGER.info("price window recording started city=%s station=%s expected_next_obs_utc=%s record_seconds=%s assets=%s", city, station, expected_next, record_seconds, count)
 
@@ -4138,8 +4203,10 @@ def monitor_websocket(config: dict[str, Any], duration_seconds: int = 0) -> bool
         return False
     ws_url = str(config["trading"].get("websocket_url"))
     timeout_seconds = int(config["trading"].get("websocket_timeout_seconds", 10))
+    ping_seconds = max(1, int(config["trading"].get("websocket_ping_seconds", 10)))
     refresh_seconds = int(config["trading"].get("websocket_asset_refresh_seconds", 300))
     trigger_pct = float(config["trading"].get("monitor_price_change_pct", 0.03))
+    signal_fields = websocket_momentum_signal_fields(config)
     assets = websocket_assets(config)
     if not assets:
         LOGGER.info("websocket no temperature market assets")
@@ -4147,10 +4214,15 @@ def monitor_websocket(config: dict[str, Any], duration_seconds: int = 0) -> bool
     asset_ids = sorted(assets)
     ws = websocket.create_connection(ws_url, timeout=timeout_seconds)
     try:
+        ws.settimeout(min(1, timeout_seconds))
         ws.send(json.dumps({"assets_ids": asset_ids, "type": "market", "custom_feature_enabled": True}))
         started = time.monotonic()
         last_refresh = started
+        last_ping = started
         while duration_seconds <= 0 or time.monotonic() - started < duration_seconds:
+            if time.monotonic() - last_ping >= ping_seconds:
+                ws.send("PING")
+                last_ping = time.monotonic()
             if time.monotonic() - last_refresh >= refresh_seconds:
                 assets = websocket_assets(config)
                 new_ids = sorted(assets)
@@ -4161,6 +4233,10 @@ def monitor_websocket(config: dict[str, Any], duration_seconds: int = 0) -> bool
             try:
                 message = ws.recv()
                 received_ts = time.time()
+                if message == "PONG":
+                    continue
+            except websocket.WebSocketTimeoutException:
+                continue
             except Exception:
                 break
             ensure_price_recording_windows(config, assets)
@@ -4174,10 +4250,13 @@ def monitor_websocket(config: dict[str, Any], duration_seconds: int = 0) -> bool
                 previous_field = field_prices.get(price_field)
                 field_prices[price_field] = price
                 record_price_window_tick(config, assets, asset, asset_id, price, float(previous_field) if previous_field is not None else None, price_field)
-                if price_field not in {"price", "last_price"}:
+                if price_field not in signal_fields:
                     continue
-                previous = asset.get("last_price")
-                asset["last_price"] = price
+                if price_field in {"price", "last_price"}:
+                    previous = asset.get("last_price")
+                    asset["last_price"] = price
+                else:
+                    previous = previous_field
                 if previous is None:
                     continue
                 previous_price = float(previous)
@@ -4192,6 +4271,7 @@ def monitor_websocket(config: dict[str, Any], duration_seconds: int = 0) -> bool
                     "price_change_pct": price_change_pct,
                     "log_skip": price_change_pct >= trigger_pct,
                     "price_field": price_field,
+                    "momentum_key": price_momentum_window_key(asset_id, price_field),
                     **asset,
                 }
                 if price_change_pct >= trigger_pct:

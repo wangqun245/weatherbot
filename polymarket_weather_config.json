@@ -81,7 +81,9 @@
     "live_trading_enabled": true,
     "live_trading_dry_run": false,
     "live_order_timeout_seconds": 20,
-    "live_order_check_seconds": 1
+    "live_order_check_seconds": 1,
+    "depth_price_notional_multiplier": 2.0,
+    "depth_price_extra_levels": 1
   },
   "scheduler": {
     "poll_interval_minutes": 15,

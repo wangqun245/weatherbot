@@ -295,6 +295,8 @@ def default_config() -> dict[str, Any]:
         "live_trading_dry_run": False,
         "live_order_timeout_seconds": 20,
         "live_order_check_seconds": 1,
+        "depth_price_notional_multiplier": 2.0,
+        "depth_price_extra_levels": 1,
     }
     return {
     "api": {
@@ -1095,6 +1097,34 @@ def asset_id_for_market_side(market: TemperatureMarket, side: str) -> str:
     return ""
 
 
+def parse_clob_levels(levels: Any) -> list[tuple[float, float]]:
+    """Parse CLOB book levels into ``(price, size)`` tuples."""
+    parsed: list[tuple[float, float]] = []
+    if not isinstance(levels, list):
+        return parsed
+    for level in levels:
+        if not isinstance(level, dict):
+            continue
+        try:
+            price = float(level.get("price"))
+            size = float(level.get("size") or level.get("quantity") or level.get("qty") or 0.0)
+        except (TypeError, ValueError):
+            continue
+        if price > 0 and size > 0:
+            parsed.append((price, size))
+    return parsed
+
+
+def clob_book_levels(config: dict[str, Any], asset_id: str) -> tuple[list[tuple[float, float]], list[tuple[float, float]]]:
+    """Fetch parsed bid and ask levels for one CLOB token id."""
+    if not asset_id:
+        return [], []
+    payload = clob_get(config, "/book", {"token_id": asset_id})
+    bids = payload.get("bids") if isinstance(payload, dict) else []
+    asks = payload.get("asks") if isinstance(payload, dict) else []
+    return parse_clob_levels(bids), parse_clob_levels(asks)
+
+
 def clob_book_prices(config: dict[str, Any], asset_id: str) -> tuple[Optional[float], Optional[float], int, int]:
     """Fetch best bid and ask prices for one CLOB token id.
     
@@ -1108,38 +1138,10 @@ def clob_book_prices(config: dict[str, Any], asset_id: str) -> tuple[Optional[fl
     Side effects:
         Calls the Polymarket CLOB API.
     """
-    if not asset_id:
-        return None, None, 0, 0
-    payload = clob_get(config, "/book", {"token_id": asset_id})
-    bids = payload.get("bids") if isinstance(payload, dict) else []
-    asks = payload.get("asks") if isinstance(payload, dict) else []
-
-    def best_level(levels: Any, *, ask_side: bool) -> Optional[float]:
-        """Extract the best price from one side of a CLOB book.
-        
-        Args:
-            levels (Any): Raw bid or ask levels from the CLOB book payload.
-            ask_side (bool): True when lower price is better, False when higher price is better.
-        
-        Returns:
-            Optional[float]: Best parsed level price, or None when no level is available.
-        """
-        prices: list[float] = []
-        if isinstance(levels, list):
-            for level in levels:
-                if not isinstance(level, dict):
-                    continue
-                try:
-                    prices.append(float(level.get("price")))
-                except (TypeError, ValueError):
-                    continue
-        if not prices:
-            return None
-        return min(prices) if ask_side else max(prices)
-
-    bid_count = len(bids) if isinstance(bids, list) else 0
-    ask_count = len(asks) if isinstance(asks, list) else 0
-    return best_level(bids, ask_side=False), best_level(asks, ask_side=True), bid_count, ask_count
+    bids, asks = clob_book_levels(config, asset_id)
+    bid_prices = [price for price, _ in bids]
+    ask_prices = [price for price, _ in asks]
+    return (max(bid_prices) if bid_prices else None), (min(ask_prices) if ask_prices else None), len(bids), len(asks)
 
 
 def clamp_price(value: Optional[float]) -> Optional[float]:
@@ -1168,6 +1170,56 @@ def opposite_side(side: str) -> str:
     return "YES" if side.strip().upper() == "NO" else "NO"
 
 
+def depth_target_notional(config: dict[str, Any]) -> float:
+    """Return the notional depth to inspect when selecting a live buy price."""
+    trading = config.get("trading", {})
+    notional = float(trading.get("buy_notional_usdc", 5.0))
+    multiplier = max(1.0, float(trading.get("depth_price_notional_multiplier", 2.0)))
+    return max(notional, notional * multiplier)
+
+
+def depth_extra_levels(config: dict[str, Any]) -> int:
+    """Return how many levels beyond the target depth to step for buy aggressiveness."""
+    try:
+        return max(0, int(float(config.get("trading", {}).get("depth_price_extra_levels", 1))))
+    except (TypeError, ValueError):
+        return 1
+
+
+def price_for_buy_notional(asks: list[tuple[float, float]], target_notional: float, extra_levels: int = 0) -> Optional[float]:
+    """Return the ask price that covers target notional, optionally one or more levels higher."""
+    if target_notional <= 0:
+        return None
+    ordered = [(price, size) for price, size in sorted(asks or [], key=lambda item: item[0]) if price > 0 and size > 0]
+    cumulative = 0.0
+    for idx, (price, size) in enumerate(ordered):
+        cumulative += price * size
+        if cumulative >= target_notional:
+            return ordered[min(idx + max(0, extra_levels), len(ordered) - 1)][0]
+    return None
+
+
+def price_for_complement_bid_notional(bids: list[tuple[float, float]], target_notional: float, extra_levels: int = 0) -> Optional[float]:
+    """Infer a buy price from the opposite token's bid depth."""
+    if target_notional <= 0:
+        return None
+    levels = sorted(
+        [(clamp_price(1.0 - bid), size) for bid, size in (bids or []) if bid > 0 and size > 0],
+        key=lambda item: float(item[0] or 0.0),
+    )
+    cumulative = 0.0
+    clean: list[tuple[float, float]] = []
+    for price, size in levels:
+        if price is None or price <= 0:
+            continue
+        clean.append((price, size))
+    for idx, (price, size) in enumerate(clean):
+        cumulative += price * size
+        if cumulative >= target_notional:
+            return clean[min(idx + max(0, extra_levels), len(clean) - 1)][0]
+    return None
+
+
 def best_buy_price(config: dict[str, Any], market: TemperatureMarket, side: str) -> Optional[float]:
     """Return the best currently executable buy price for a YES/NO market side.
     
@@ -1189,29 +1241,54 @@ def best_buy_price(config: dict[str, Any], market: TemperatureMarket, side: str)
         LOGGER.warning("clob buy unavailable missing asset_id side=%s market=%s question=%r", normalized, market.market_id, market.market_question)
         return None
     try:
-        direct_bid, direct_ask, direct_bid_count, direct_ask_count = clob_book_prices(config, direct_asset_id)
-        complement_bid, complement_ask, complement_bid_count, complement_ask_count = clob_book_prices(config, complement_asset_id)
+        target_notional = depth_target_notional(config)
+        extra_levels = depth_extra_levels(config)
+        direct_bids, direct_asks = clob_book_levels(config, direct_asset_id)
+        complement_bids, complement_asks = clob_book_levels(config, complement_asset_id)
+        direct_bid = max((price for price, _ in direct_bids), default=None)
+        direct_ask = min((price for price, _ in direct_asks), default=None)
+        complement_bid = max((price for price, _ in complement_bids), default=None)
+        complement_ask = min((price for price, _ in complement_asks), default=None)
+        direct_depth_price = price_for_buy_notional(direct_asks, target_notional, extra_levels)
+        complement_depth_price = price_for_complement_bid_notional(complement_bids, target_notional, extra_levels)
         complement_bid_as_buy = clamp_price(1.0 - complement_bid) if complement_bid is not None else None
-        prices = [p for p in (direct_ask, complement_bid_as_buy) if p is not None]
+        prices = [p for p in (direct_depth_price, complement_depth_price) if p is not None]
+        if not prices:
+            prices = [p for p in (direct_ask, complement_bid_as_buy) if p is not None]
         if not prices:
             LOGGER.info(
-                "clob buy unavailable side=%s market=%s direct_asset=%s direct_bids=%s direct_asks=%s direct_best_bid=%s direct_best_ask=%s complement_asset=%s complement_bids=%s complement_asks=%s complement_best_bid=%s complement_best_ask=%s question=%r",
+                "clob buy unavailable side=%s market=%s direct_asset=%s direct_bids=%s direct_asks=%s direct_best_bid=%s direct_best_ask=%s complement_asset=%s complement_bids=%s complement_asks=%s complement_best_bid=%s complement_best_ask=%s target_notional=%s extra_levels=%s question=%r",
                 normalized,
                 market.market_id,
                 direct_asset_id,
-                direct_bid_count,
-                direct_ask_count,
+                len(direct_bids),
+                len(direct_asks),
                 direct_bid,
                 direct_ask,
                 complement_asset_id,
-                complement_bid_count,
-                complement_ask_count,
+                len(complement_bids),
+                len(complement_asks),
                 complement_bid,
                 complement_ask,
+                target_notional,
+                extra_levels,
                 market.market_question,
             )
             return None
-        return min(prices)
+        selected = min(prices)
+        LOGGER.info(
+            "clob depth buy price side=%s market=%s selected=%s direct_depth=%s complement_depth=%s direct_best_ask=%s complement_bid_as_buy=%s target_notional=%s extra_levels=%s",
+            normalized,
+            market.market_id,
+            selected,
+            direct_depth_price,
+            complement_depth_price,
+            direct_ask,
+            complement_bid_as_buy,
+            target_notional,
+            extra_levels,
+        )
+        return selected
     except Exception:
         LOGGER.exception("clob buy query failed side=%s market=%s question=%r", normalized, market.market_id, market.market_question)
         return None
@@ -3619,7 +3696,6 @@ def websocket_message_prices(message: Any) -> list[tuple[str, float, str]]:
         except json.JSONDecodeError:
             return []
     rows: list[tuple[str, float, str]] = []
-    seen: set[tuple[str, float, str]] = set()
 
     def walk(node: Any) -> None:
         if isinstance(node, str):
@@ -3640,10 +3716,7 @@ def websocket_message_prices(message: Any) -> list[tuple[str, float, str]]:
                     price = float(node[field_name])
                 except (TypeError, ValueError):
                     continue
-                key = (asset, price, field_name)
-                if key not in seen:
-                    seen.add(key)
-                    rows.append(key)
+                rows.append((asset, price, field_name))
         for value in node.values():
             if isinstance(value, (dict, list)):
                 walk(value)
@@ -3988,6 +4061,17 @@ def record_price_window_tick(config: dict[str, Any], assets: dict[str, dict[str,
                 }
             append_price_window_record(config, price_record_payload("window_snapshot", snapshot_asset, snapshot_asset_id, snapshot_price, None, "last_price", timing))
         LOGGER.info("price window recording started city=%s station=%s expected_next_obs_utc=%s record_seconds=%s assets=%s", city, station, expected_next, record_seconds, sum(1 for a in assets.values() if a.get("city") == city and a.get("station") == station))
+    momentum_window = PRICE_MOMENTUM_WINDOWS.get(asset_id)
+    if price_field in {"price", "last_price"} and (
+        not momentum_window or momentum_window.get("expected_next_obs_utc") != expected_next
+    ):
+        base_price = previous_price if previous_price is not None else price
+        PRICE_MOMENTUM_WINDOWS[asset_id] = {
+            "expected_next_obs_utc": expected_next,
+            "base_price": float(base_price),
+            "created_at": recording.get("started_at_utc", datetime.now(timezone.utc).isoformat(timespec="milliseconds")),
+            "source": "first_window_tick",
+        }
     append_price_window_record(config, price_record_payload("websocket_tick", asset, asset_id, price, previous_price, price_field, timing))
 
 
@@ -4086,9 +4170,14 @@ def monitor_websocket(config: dict[str, Any], duration_seconds: int = 0) -> bool
                 asset = assets.get(asset_id)
                 if not asset:
                     continue
+                field_prices = asset.setdefault("last_prices_by_field", {})
+                previous_field = field_prices.get(price_field)
+                field_prices[price_field] = price
+                record_price_window_tick(config, assets, asset, asset_id, price, float(previous_field) if previous_field is not None else None, price_field)
+                if price_field not in {"price", "last_price"}:
+                    continue
                 previous = asset.get("last_price")
                 asset["last_price"] = price
-                record_price_window_tick(config, assets, asset, asset_id, price, float(previous) if previous is not None else None, price_field)
                 if previous is None:
                     continue
                 previous_price = float(previous)

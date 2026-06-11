@@ -57,6 +57,7 @@ LIVE_TRADER: Optional[Any] = None
 TELEGRAM_NOTIFIER: Optional[Any] = None
 STATION_REPORT_TIMING: dict[tuple[str, str], dict[str, Any]] = {}
 TGFTP_VALIDATION_THREADS: set[str] = set()
+TGFTP_OBS_BY_STATION: dict[str, dict[str, Any]] = {}
 PRICE_MOMENTUM_WINDOWS: dict[str, dict[str, Any]] = {}
 PRICE_RECORDING_WINDOWS: dict[str, dict[str, Any]] = {}
 
@@ -1059,6 +1060,36 @@ def sorted_markets_for_unit(markets: list[TemperatureMarket], target_unit: str) 
     return sorted([m for m in markets if not m.closed], key=sort_key)
 
 
+def websocket_relevant_markets_for_observed_extreme(
+    markets: list[TemperatureMarket],
+    kind: str,
+    event_unit: str,
+    observed_high: Optional[float],
+    observed_low: Optional[float],
+) -> list[TemperatureMarket]:
+    """Keep only temperature ranges still reachable from today's observed high/low."""
+    normalized_kind = kind.strip().lower()
+    if normalized_kind == "highest":
+        if observed_high is None:
+            return markets
+        relevant = []
+        for market in markets:
+            _, hi, _ = comparable_rule_bounds(market, event_unit)
+            if hi is None or observed_high <= hi:
+                relevant.append(market)
+        return relevant
+    if normalized_kind == "lowest":
+        if observed_low is None:
+            return markets
+        relevant = []
+        for market in markets:
+            lo, _, _ = comparable_rule_bounds(market, event_unit)
+            if lo is None or observed_low >= lo:
+                relevant.append(market)
+        return relevant
+    return markets
+
+
 def market_no_price(market: TemperatureMarket) -> Optional[float]:
     """Derive the NO price for a market from explicit outcome prices or the complement of YES.
     
@@ -1617,11 +1648,12 @@ def append_price_window_record(config: dict[str, Any], record: dict[str, Any]) -
         f.write(json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n")
 
 
-def append_price_window_raw_record(config: dict[str, Any], record: dict[str, Any]) -> None:
-    """Append one raw Polymarket websocket message captured during an observation window."""
+def append_price_window_raw_record(config: dict[str, Any], message: Any) -> None:
+    """Append exactly one Polymarket websocket payload as received."""
     path = str(config.get("outputs", {}).get("price_window_raw_jsonl") or "price_window_raw.jsonl")
+    raw = message if isinstance(message, str) else json.dumps(message, separators=(",", ":"), ensure_ascii=False)
     with IO_LOCK, open(path, "a", encoding="utf-8") as f:
-        f.write(json.dumps(record, separators=(",", ":"), ensure_ascii=False) + "\n")
+        f.write(raw.rstrip("\r\n") + "\n")
 
 
 def parse_aviation_obs_time(value: Any) -> Optional[datetime]:
@@ -1843,6 +1875,63 @@ def tgftp_metar_observation(station: str) -> Optional[dict[str, Any]]:
     return parse_tgftp_metar(r.text)
 
 
+def tgftp_observation_changed(previous: Optional[dict[str, Any]], current: Optional[dict[str, Any]]) -> bool:
+    """Return True when TGFTP has a new observation timestamp or reported temperature."""
+    if not current:
+        return False
+    if not previous:
+        return True
+    previous_dt = previous.get("obs_dt")
+    current_dt = current.get("obs_dt")
+    if isinstance(previous_dt, datetime) and isinstance(current_dt, datetime):
+        if previous_dt.astimezone(timezone.utc) != current_dt.astimezone(timezone.utc):
+            return True
+    elif previous_dt != current_dt:
+        return True
+    try:
+        return abs(float(previous.get("temp_c")) - float(current.get("temp_c"))) > 1e-9
+    except (TypeError, ValueError):
+        return previous.get("temp_c") != current.get("temp_c")
+
+
+def cached_tgftp_observation(station: str) -> Optional[dict[str, Any]]:
+    """Return the latest in-memory TGFTP baseline for a station."""
+    return TGFTP_OBS_BY_STATION.get(station.upper())
+
+
+def update_cached_tgftp_observation(station: str, obs: dict[str, Any]) -> None:
+    """Store the latest TGFTP observation for a station in memory."""
+    TGFTP_OBS_BY_STATION[station.upper()] = obs
+
+
+def initialize_tgftp_observation_cache(config: dict[str, Any]) -> None:
+    """Fetch one TGFTP baseline for every station in currently tradable configured cities."""
+    stations: set[str] = set()
+    for target in resolve_event_target_dates(config):
+        for event in discover_temperature_events(config, target):
+            event_url = poly_url_from_event(event)
+            station = station_from_wu_url(extract_wunderground_source(config, event_url))
+            if station:
+                stations.add(station.upper())
+    for station in sorted(stations):
+        try:
+            obs = tgftp_metar_observation(station)
+        except Exception:
+            LOGGER.exception("tgftp baseline fetch failed station=%s", station)
+            continue
+        if not obs:
+            LOGGER.info("tgftp baseline unavailable station=%s", station)
+            continue
+        update_cached_tgftp_observation(station, obs)
+        LOGGER.info(
+            "tgftp baseline saved station=%s obs_utc=%s temp_c=%s raw=%r",
+            station,
+            obs["obs_dt"].astimezone(timezone.utc).isoformat(),
+            obs["temp_c"],
+            obs["raw_ob"],
+        )
+
+
 def update_station_report_timing(
     city: str,
     station: str,
@@ -1917,7 +2006,7 @@ def websocket_momentum_signal_fields(config: dict[str, Any]) -> set[str]:
     """Return websocket price fields allowed to drive observation-window momentum buys."""
     fields = config.get("price_momentum", {}).get("websocket_signal_fields")
     if not fields:
-        return {"price", "last_price", "best_bid"}
+        return {"last_price", "best_bid"}
     return {str(field).strip() for field in fields if str(field).strip()}
 
 
@@ -3626,10 +3715,7 @@ def tgftp_validation_worker(config: dict[str, Any], trade_id: str, station: str,
     settings = config.get("price_momentum", {})
     interval = max(1, int(settings.get("tgftp_verify_interval_seconds", 10)))
     timeout = max(interval, int(settings.get("tgftp_verify_timeout_seconds", 180)))
-    try:
-        min_obs_dt = datetime.fromisoformat(min_obs_utc.replace("Z", "+00:00")).astimezone(timezone.utc)
-    except ValueError:
-        min_obs_dt = datetime.now(timezone.utc)
+    station_key = station.upper()
     deadline = time.monotonic() + timeout
     try:
         while time.monotonic() <= deadline:
@@ -3642,14 +3728,42 @@ def tgftp_validation_worker(config: dict[str, Any], trade_id: str, station: str,
             if not obs:
                 time.sleep(interval)
                 continue
-            obs_dt = obs["obs_dt"].astimezone(timezone.utc)
-            if obs_dt < min_obs_dt:
-                LOGGER.info("tgftp validation wait trade=%s station=%s obs_utc=%s min_obs_utc=%s", trade_id, station, obs_dt.isoformat(), min_obs_dt.isoformat())
+            previous = cached_tgftp_observation(station_key)
+            if previous is None:
+                update_cached_tgftp_observation(station_key, obs)
+                LOGGER.info(
+                    "tgftp validation baseline initialized trade=%s station=%s obs_utc=%s temp_c=%s",
+                    trade_id,
+                    station_key,
+                    obs["obs_dt"].astimezone(timezone.utc).isoformat(),
+                    obs["temp_c"],
+                )
                 time.sleep(interval)
                 continue
+            if not tgftp_observation_changed(previous, obs):
+                update_cached_tgftp_observation(station_key, obs)
+                LOGGER.info(
+                    "tgftp validation wait unchanged trade=%s station=%s obs_utc=%s temp_c=%s",
+                    trade_id,
+                    station_key,
+                    obs["obs_dt"].astimezone(timezone.utc).isoformat(),
+                    obs["temp_c"],
+                )
+                time.sleep(interval)
+                continue
+            update_cached_tgftp_observation(station_key, obs)
+            LOGGER.info(
+                "tgftp validation new observation trade=%s station=%s obs_utc=%s temp_c=%s previous_obs_utc=%s previous_temp_c=%s",
+                trade_id,
+                station_key,
+                obs["obs_dt"].astimezone(timezone.utc).isoformat(),
+                obs["temp_c"],
+                previous["obs_dt"].astimezone(timezone.utc).isoformat() if previous and isinstance(previous.get("obs_dt"), datetime) else "",
+                previous.get("temp_c") if previous else "",
+            )
             validate_trade_with_tgftp_observation(config, trade_id, station, obs)
             return
-        LOGGER.warning("tgftp validation timeout trade=%s station=%s min_obs_utc=%s", trade_id, station, min_obs_dt.isoformat())
+        LOGGER.warning("tgftp validation timeout trade=%s station=%s", trade_id, station_key)
     finally:
         TGFTP_VALIDATION_THREADS.discard(trade_id)
 
@@ -3745,6 +3859,33 @@ def websocket_message_prices(message: Any) -> list[tuple[str, float, str]]:
             return []
     rows: list[tuple[str, float, str]] = []
 
+    def add_price(asset: str, value: Any, field_name: str) -> None:
+        if not asset or value in (None, ""):
+            return
+        try:
+            price = float(value)
+        except (TypeError, ValueError):
+            return
+        rows.append((asset, price, field_name))
+
+    def best_book_price(levels: Any, bid: bool) -> Optional[float]:
+        prices: list[float] = []
+        if not isinstance(levels, list):
+            return None
+        for level in levels:
+            if not isinstance(level, dict):
+                continue
+            raw_price = level.get("price")
+            if raw_price in (None, ""):
+                continue
+            try:
+                prices.append(float(raw_price))
+            except (TypeError, ValueError):
+                continue
+        if not prices:
+            return None
+        return max(prices) if bid else min(prices)
+
     def walk(node: Any) -> None:
         if isinstance(node, str):
             try:
@@ -3758,13 +3899,17 @@ def websocket_message_prices(message: Any) -> list[tuple[str, float, str]]:
         if not isinstance(node, dict):
             return
         asset = str(node.get("asset_id") or node.get("assetId") or node.get("token_id") or node.get("tokenId") or node.get("asset") or "")
-        for field_name in ("price", "best_bid", "best_ask", "last_price"):
-            if asset and node.get(field_name) not in (None, ""):
-                try:
-                    price = float(node[field_name])
-                except (TypeError, ValueError):
-                    continue
-                rows.append((asset, price, field_name))
+        event_type = str(node.get("event_type") or node.get("eventType") or "").strip()
+        if event_type == "last_trade_price":
+            add_price(asset, node.get("price"), "last_price")
+        elif event_type == "book":
+            add_price(asset, best_book_price(node.get("bids"), bid=True), "best_bid")
+            add_price(asset, best_book_price(node.get("asks"), bid=False), "best_ask")
+        else:
+            add_price(asset, node.get("best_bid"), "best_bid")
+            add_price(asset, node.get("best_ask"), "best_ask")
+            if "last_price" in node:
+                add_price(asset, node.get("last_price"), "last_price")
         for value in node.values():
             if isinstance(value, (dict, list)):
                 walk(value)
@@ -3784,6 +3929,7 @@ def websocket_assets(config: dict[str, Any]) -> dict[str, dict[str, Any]]:
     """
     trades = read_trades(config["outputs"]["trades_csv"])
     assets: dict[str, dict[str, Any]] = {}
+    observed_cache: dict[tuple[str, str, str, str], tuple[Optional[float], Optional[float]]] = {}
     strategy_name = str(config["trading"]["strategy_name"])
     open_trades = [t for t in trades if t.status == "OPEN" and t.strategy == strategy_name]
     for target in resolve_event_target_dates(config):
@@ -3795,6 +3941,43 @@ def websocket_assets(config: dict[str, Any]) -> dict[str, dict[str, Any]]:
             try:
                 station = station_from_wu_url(extract_wunderground_source(config, event_url))
                 markets = markets_for_event(config, event)
+                event_unit = event_market_unit(markets)
+                observed_high: Optional[float] = None
+                observed_low: Optional[float] = None
+                if station:
+                    cache_key = (station, city, event_date, event_unit)
+                    if cache_key not in observed_cache:
+                        try:
+                            observed_high, observed_low, _, _ = aviation_observed_extremes(config, station, city, event_date, event_unit)
+                        except Exception:
+                            LOGGER.exception("websocket asset filter aviation fallback all city=%s kind=%s station=%s event_date=%s", city, kind, station, event_date)
+                            observed_high, observed_low = None, None
+                        observed_cache[cache_key] = (observed_high, observed_low)
+                        LOGGER.info(
+                            "websocket asset filter observed extremes city=%s kind=%s station=%s event_date=%s high=%s low=%s unit=%s markets_before=%s",
+                            city,
+                            kind,
+                            station,
+                            event_date,
+                            observed_high,
+                            observed_low,
+                            event_unit,
+                            len(markets),
+                        )
+                    observed_high, observed_low = observed_cache[cache_key]
+                relevant_markets = websocket_relevant_markets_for_observed_extreme(markets, kind, event_unit, observed_high, observed_low)
+                if len(relevant_markets) != len(markets):
+                    LOGGER.info(
+                        "websocket asset filter applied city=%s kind=%s station=%s event_date=%s high=%s low=%s markets_before=%s markets_after=%s",
+                        city,
+                        kind,
+                        station,
+                        event_date,
+                        observed_high,
+                        observed_low,
+                        len(markets),
+                        len(relevant_markets),
+                    )
                 markets_by_id = {m.market_id: m for m in markets}
                 for trade in open_trades:
                     if trade.city != city or trade.kind != kind or trade.event_date != event_date:
@@ -3844,7 +4027,7 @@ def websocket_assets(config: dict[str, Any]) -> dict[str, dict[str, Any]]:
                                 "station": station,
                                 "last_price": current_price,
                             }
-                for market in markets:
+                for market in relevant_markets:
                     raw = parse_jsonish(market.raw_market_json, {})
                     for asset_id, outcome in market_clob_tokens(raw):
                         side = outcome.strip().upper()
@@ -4007,50 +4190,9 @@ def raw_ws_record_payload(message: Any, matched_assets: list[dict[str, Any]], ti
 def record_raw_price_window_message(config: dict[str, Any], assets: dict[str, dict[str, Any]], message: Any, rows: list[tuple[str, float, str]], received_ts: float) -> None:
     """Record every raw websocket message while any city observation recording window is active."""
     now_mono = time.monotonic()
-    active_windows = [
-        (key, recording)
-        for key, recording in PRICE_RECORDING_WINDOWS.items()
-        if now_mono < float(recording.get("record_until_monotonic", 0.0))
-    ]
-    if not active_windows:
+    if not any(now_mono < float(recording.get("record_until_monotonic", 0.0)) for recording in PRICE_RECORDING_WINDOWS.values()):
         return
-    parsed_assets = []
-    seen_assets: set[tuple[str, str]] = set()
-    for asset_id, price, price_field in rows:
-        asset_field = (asset_id, price_field)
-        if asset_field in seen_assets:
-            continue
-        seen_assets.add(asset_field)
-        asset = assets.get(asset_id, {})
-        parsed_assets.append({
-            "asset_id": asset_id,
-            "price": price,
-            "price_field": price_field,
-            "city": asset.get("city", ""),
-            "station": asset.get("station", ""),
-            "market_id": asset.get("market_id", ""),
-            "position_side": asset.get("position_side", ""),
-        })
-    append_price_window_raw_record(
-        config,
-        {
-            "source": "polymarket",
-            "event_type": "websocket_raw",
-            "received_ts": received_ts,
-            "received_ms": int(received_ts * 1000),
-            "received_at_utc": datetime.fromtimestamp(received_ts, timezone.utc).isoformat(timespec="milliseconds"),
-            "active_windows": [
-                {
-                    "window_key": key,
-                    "started_at_utc": recording.get("started_at_utc", ""),
-                    "record_seconds": recording.get("record_seconds", 0),
-                }
-                for key, recording in active_windows
-            ],
-            "parsed_assets": parsed_assets,
-            "raw": message,
-        },
-    )
+    append_price_window_raw_record(config, message)
 
 
 def record_price_window_tick(config: dict[str, Any], assets: dict[str, dict[str, Any]], asset: dict[str, Any], asset_id: str, price: float, previous_price: Optional[float], price_field: str) -> None:
@@ -4220,6 +4362,7 @@ def monitor_websocket(config: dict[str, Any], duration_seconds: int = 0) -> bool
         last_refresh = started
         last_ping = started
         while duration_seconds <= 0 or time.monotonic() - started < duration_seconds:
+            ensure_price_recording_windows(config, assets)
             if time.monotonic() - last_ping >= ping_seconds:
                 ws.send("PING")
                 last_ping = time.monotonic()
@@ -4239,7 +4382,6 @@ def monitor_websocket(config: dict[str, Any], duration_seconds: int = 0) -> bool
                 continue
             except Exception:
                 break
-            ensure_price_recording_windows(config, assets)
             price_rows = websocket_message_prices(message)
             record_raw_price_window_message(config, assets, message, price_rows, received_ts)
             for asset_id, price, price_field in price_rows:
@@ -4594,6 +4736,7 @@ def run(config: dict[str, Any]) -> None:
     max_cycles = int(config["scheduler"].get("max_cycles", 0))
     last_twc_verify_ts = 0.0
     LOGGER.info("bot started config=%s", json.dumps(redacted_config(config), ensure_ascii=False, sort_keys=True))
+    initialize_tgftp_observation_cache(config)
     start_live_trader(config)
     sync_polymarket_positions_to_disk(config, reason="start")
     start_websocket_thread(config)

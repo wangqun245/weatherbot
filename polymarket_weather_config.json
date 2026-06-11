@@ -26,7 +26,9 @@
       "Miami",
       "NYC",
       "San Francisco",
-      "Seattle"
+      "Seattle",
+      "Shanghai",
+      "Tokyo"
     ],
     "include_closed": false,
     "max_offsets": 1200,
@@ -41,7 +43,9 @@
       "Miami": "America/New_York",
       "NYC": "America/New_York",
       "San Francisco": "America/Los_Angeles",
-      "Seattle": "America/Los_Angeles"
+      "Seattle": "America/Los_Angeles",
+      "Shanghai": "Asia/Shanghai",
+      "Tokyo": "Asia/Tokyo"
     }
   },
   "trading": {
@@ -69,7 +73,9 @@
       "Miami",
       "NYC",
       "San Francisco",
-      "Seattle"
+      "Seattle",
+      "Shanghai",
+      "Tokyo"
     ],
     "websocket_enabled": true,
     "websocket_url": "wss://ws-subscriptions-clob.polymarket.com/ws/market",
@@ -130,7 +136,6 @@
     "report_window_seconds": 210,
     "price_window_record_seconds": 300,
     "websocket_signal_fields": [
-      "price",
       "last_price",
       "best_bid"
     ],
@@ -174,7 +179,9 @@
           "Miami",
           "NYC",
           "San Francisco",
-          "Seattle"
+          "Seattle",
+          "Shanghai",
+          "Tokyo"
         ],
         "websocket_enabled": true,
         "websocket_url": "wss://ws-subscriptions-clob.polymarket.com/ws/market",

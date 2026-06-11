@@ -46,6 +46,21 @@
       "Seattle": "America/Los_Angeles",
       "Shanghai": "Asia/Shanghai",
       "Tokyo": "Asia/Tokyo"
+    },
+    "city_stations": {
+      "Atlanta": "KATL",
+      "Austin": "KAUS",
+      "Chicago": "KMDW",
+      "Dallas": "KDAL",
+      "Denver": "KDEN",
+      "Houston": "KHOU",
+      "Los Angeles": "KLAX",
+      "Miami": "KMIA",
+      "NYC": "KLGA",
+      "San Francisco": "KSFO",
+      "Seattle": "KSEA",
+      "Shanghai": "ZSPD",
+      "Tokyo": "RJTT"
     }
   },
   "trading": {
@@ -83,7 +98,8 @@
     "websocket_reconnect_seconds": 5,
     "websocket_ping_seconds": 10,
     "websocket_timeout_seconds": 10,
-    "websocket_asset_refresh_seconds": 300,
+    "websocket_asset_refresh_seconds": 0,
+    "websocket_asset_refresh_workers": 3,
     "live_trading_enabled": true,
     "live_trading_dry_run": false,
     "live_order_timeout_seconds": 20,
@@ -189,7 +205,8 @@
         "websocket_reconnect_seconds": 5,
         "websocket_ping_seconds": 10,
         "websocket_timeout_seconds": 10,
-        "websocket_asset_refresh_seconds": 300,
+        "websocket_asset_refresh_seconds": 0,
+        "websocket_asset_refresh_workers": 3,
         "live_trading_enabled": true,
         "live_trading_dry_run": false,
         "live_order_timeout_seconds": 20,

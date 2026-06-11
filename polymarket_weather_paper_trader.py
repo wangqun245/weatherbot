@@ -23,6 +23,7 @@ import csv
 import json
 import logging
 import os
+import queue
 import re
 import threading
 import time
@@ -60,6 +61,12 @@ TGFTP_VALIDATION_THREADS: set[str] = set()
 TGFTP_OBS_BY_STATION: dict[str, dict[str, Any]] = {}
 PRICE_MOMENTUM_WINDOWS: dict[str, dict[str, Any]] = {}
 PRICE_RECORDING_WINDOWS: dict[str, dict[str, Any]] = {}
+STATION_BY_EVENT_URL: dict[str, str] = {}
+WEBSOCKET_ASSET_REFRESH_REQUESTS: "queue.Queue[dict[str, Any]]" = queue.Queue()
+WEBSOCKET_ASSET_UPDATES: "queue.Queue[dict[str, Any]]" = queue.Queue()
+WEBSOCKET_ASSET_REFRESH_DEDUP: set[tuple[str, str, str]] = set()
+WEBSOCKET_ASSET_REFRESH_LOCK = threading.RLock()
+WEBSOCKET_ASSET_REFRESH_THREADS: list[threading.Thread] = []
 
 
 @dataclass
@@ -270,6 +277,11 @@ def default_config() -> dict[str, Any]:
         "Los Angeles": "America/Los_Angeles", "Miami": "America/New_York", "NYC": "America/New_York",
         "San Francisco": "America/Los_Angeles", "Seattle": "America/Los_Angeles",
     }
+    city_stations = {
+        "Atlanta": "KATL", "Austin": "KAUS", "Chicago": "KMDW", "Dallas": "KDAL",
+        "Denver": "KDEN", "Houston": "KHOU", "Los Angeles": "KLAX", "Miami": "KMIA",
+        "NYC": "KLGA", "San Francisco": "KSFO", "Seattle": "KSEA",
+    }
     trading = {
         "strategy_name": "deterministic_harvest",
         "strategy_mode": "deterministic_harvest",
@@ -291,7 +303,8 @@ def default_config() -> dict[str, Any]:
         "websocket_reconnect_seconds": 5,
         "websocket_ping_seconds": 10,
         "websocket_timeout_seconds": 10,
-        "websocket_asset_refresh_seconds": 300,
+        "websocket_asset_refresh_seconds": 0,
+        "websocket_asset_refresh_workers": 3,
         "live_trading_enabled": False,
         "live_trading_dry_run": False,
         "live_order_timeout_seconds": 20,
@@ -311,7 +324,7 @@ def default_config() -> dict[str, Any]:
             "request_timeout_seconds": 30,
             "per_request_delay_seconds": 0.25,
         },
-        "events": {"target_dates": ["today"], "city_filter": "", "allowed_cities": allowed, "include_closed": False, "max_offsets": 1200, "city_timezones": city_timezones},
+        "events": {"target_dates": ["today"], "city_filter": "", "allowed_cities": allowed, "include_closed": False, "max_offsets": 1200, "city_timezones": city_timezones, "city_stations": city_stations},
         "trading": trading,
         "scheduler": {"poll_interval_minutes": 15, "run_once": False, "max_cycles": 0, "settle_after_each_cycle": True},
         "outputs": {
@@ -858,6 +871,34 @@ def station_from_wu_url(url: str) -> str:
         parts = parts[: parts.index("date")]
     station = parts[-1].upper() if parts else ""
     return station if re.fullmatch(r"[A-Z0-9]{4}", station) else ""
+
+
+def configured_station_for_city(config: dict[str, Any], city: str) -> str:
+    """Return a configured station code for a city, if one is available."""
+    station = str(config.get("events", {}).get("city_stations", {}).get(city) or "").strip().upper()
+    return station if re.fullmatch(r"[A-Z0-9]{4}", station) else ""
+
+
+def station_for_event(config: dict[str, Any], city: str, event_url: str, allow_network: bool = True) -> str:
+    """Resolve an event station from config first, then cached/page Weather Underground source."""
+    configured = configured_station_for_city(config, city)
+    if configured:
+        return configured
+    if event_url in STATION_BY_EVENT_URL:
+        return STATION_BY_EVENT_URL[event_url]
+    if not allow_network or not event_url:
+        return ""
+    try:
+        station = station_from_wu_url(extract_wunderground_source(config, event_url))
+    except requests.RequestException as exc:
+        LOGGER.warning("station discovery page request failed city=%s url=%s error=%s", city, event_url, exc)
+        return ""
+    except Exception:
+        LOGGER.exception("station discovery failed city=%s url=%s", city, event_url)
+        return ""
+    if station:
+        STATION_BY_EVENT_URL[event_url] = station
+    return station
 
 
 def infer_temperature_unit(text: str, default_unit: str = "F") -> str:
@@ -1910,7 +1951,7 @@ def initialize_tgftp_observation_cache(config: dict[str, Any]) -> None:
     for target in resolve_event_target_dates(config):
         for event in discover_temperature_events(config, target):
             event_url = poly_url_from_event(event)
-            station = station_from_wu_url(extract_wunderground_source(config, event_url))
+            station = station_for_event(config, event.get("_parsed_city", ""), event_url)
             if station:
                 stations.add(station.upper())
     for station in sorted(stations):
@@ -2000,6 +2041,17 @@ def momentum_target_price(base_price: float, fraction: float) -> float:
     base = min(0.999999, max(0.0, float(base_price)))
     move_fraction = min(1.0, max(0.0, float(fraction)))
     return base + move_fraction * (1.0 - base)
+
+
+def directional_price_change_fraction(previous_price: float, price: float) -> float:
+    """Return directional price movement, using remaining upside space for upward moves."""
+    previous = min(0.999999, max(0.0, float(previous_price)))
+    current = min(1.0, max(0.0, float(price)))
+    if current >= previous:
+        return (current - previous) / max(1e-9, 1.0 - previous)
+    if previous <= 0:
+        return 0.0
+    return (previous - current) / previous
 
 
 def websocket_momentum_signal_fields(config: dict[str, Any]) -> set[str]:
@@ -3323,7 +3375,7 @@ def verify_open_positions_with_twc(config: dict[str, Any], trigger_context: Opti
             if not market:
                 continue
             event_unit = event_market_unit(markets)
-            station = trade.forecast_station or station_from_wu_url(extract_wunderground_source(config, trade.polymarket_url))
+            station = trade.forecast_station or station_for_event(config, trade.city, trade.polymarket_url)
             if not station:
                 continue
             city_local_dt, _, _ = city_local_now(config, trade.city)
@@ -3397,11 +3449,16 @@ def process_deterministic_harvest(config: dict[str, Any], trigger_context: dict[
         return []
     markets = markets_for_event(config, event)
     event_unit = event_market_unit(markets)
-    wu_source = extract_wunderground_source(config, event_url)
-    station = station_from_wu_url(wu_source)
+    station = station_for_event(config, city, event_url)
     if not station:
         LOGGER.warning("deterministic skip missing station city=%s kind=%s url=%s", city, kind, event_url)
         return []
+    wu_source = ""
+    if not configured_station_for_city(config, city):
+        try:
+            wu_source = extract_wunderground_source(config, event_url)
+        except requests.RequestException as exc:
+            LOGGER.warning("deterministic source url unavailable city=%s kind=%s url=%s error=%s", city, kind, event_url, exc)
     observed_high = trigger_context.get("aviation_high")
     observed_low = trigger_context.get("aviation_low")
     if observed_high is None and observed_low is None:
@@ -3918,7 +3975,12 @@ def websocket_message_prices(message: Any) -> list[tuple[str, float, str]]:
     return rows
 
 
-def websocket_assets(config: dict[str, Any]) -> dict[str, dict[str, Any]]:
+def websocket_assets(
+    config: dict[str, Any],
+    only_city: str = "",
+    only_kind: str = "",
+    only_event_date: str = "",
+) -> dict[str, dict[str, Any]]:
     """Discover all WebSocket asset ids to subscribe for current target weather events and open positions.
     
     Args:
@@ -3937,9 +3999,15 @@ def websocket_assets(config: dict[str, Any]) -> dict[str, dict[str, Any]]:
             city = event["_parsed_city"]
             kind = event["_parsed_kind"]
             event_date = event["_parsed_event_date"]
+            if only_city and city != only_city:
+                continue
+            if only_kind and kind != only_kind:
+                continue
+            if only_event_date and event_date != only_event_date:
+                continue
             event_url = poly_url_from_event(event)
             try:
-                station = station_from_wu_url(extract_wunderground_source(config, event_url))
+                station = station_for_event(config, city, event_url)
                 markets = markets_for_event(config, event)
                 event_unit = event_market_unit(markets)
                 observed_high: Optional[float] = None
@@ -4054,6 +4122,135 @@ def websocket_assets(config: dict[str, Any]) -> dict[str, dict[str, Any]]:
     return assets
 
 
+def request_websocket_asset_refresh(city: str, kind: str = "", event_date: str = "", station: str = "", reason: str = "") -> None:
+    """Queue a non-blocking, targeted websocket asset refresh request."""
+    city = str(city or "")
+    kind = str(kind or "")
+    event_date = str(event_date or "")
+    if not city:
+        return
+    key = (city, kind, event_date)
+    with WEBSOCKET_ASSET_REFRESH_LOCK:
+        if key in WEBSOCKET_ASSET_REFRESH_DEDUP:
+            return
+        WEBSOCKET_ASSET_REFRESH_DEDUP.add(key)
+    WEBSOCKET_ASSET_REFRESH_REQUESTS.put(
+        {
+            "city": city,
+            "kind": kind,
+            "event_date": event_date,
+            "station": str(station or ""),
+            "reason": str(reason or ""),
+            "requested_at_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        }
+    )
+    LOGGER.info("websocket asset refresh queued city=%s kind=%s event_date=%s station=%s reason=%s", city, kind, event_date, station, reason)
+
+
+def websocket_asset_refresh_worker(config: dict[str, Any]) -> None:
+    """Build targeted websocket asset updates away from the hot receive loop."""
+    LOGGER.info("websocket asset refresh worker started")
+    while True:
+        request = WEBSOCKET_ASSET_REFRESH_REQUESTS.get()
+        key = (str(request.get("city") or ""), str(request.get("kind") or ""), str(request.get("event_date") or ""))
+        try:
+            assets = websocket_assets(
+                config,
+                only_city=key[0],
+                only_kind=key[1],
+                only_event_date=key[2],
+            )
+            WEBSOCKET_ASSET_UPDATES.put({"request": request, "assets": assets})
+            LOGGER.info(
+                "websocket asset refresh built city=%s kind=%s event_date=%s reason=%s assets=%s",
+                key[0],
+                key[1],
+                key[2],
+                request.get("reason", ""),
+                len(assets),
+            )
+        except Exception:
+            LOGGER.exception("websocket asset refresh failed city=%s kind=%s event_date=%s reason=%s", key[0], key[1], key[2], request.get("reason", ""))
+        finally:
+            with WEBSOCKET_ASSET_REFRESH_LOCK:
+                WEBSOCKET_ASSET_REFRESH_DEDUP.discard(key)
+            WEBSOCKET_ASSET_REFRESH_REQUESTS.task_done()
+
+
+def start_websocket_asset_refresh_thread(config: dict[str, Any]) -> list[threading.Thread]:
+    """Start the background asset refresh worker pool once per process."""
+    with WEBSOCKET_ASSET_REFRESH_LOCK:
+        alive = [thread for thread in WEBSOCKET_ASSET_REFRESH_THREADS if thread.is_alive()]
+        WEBSOCKET_ASSET_REFRESH_THREADS[:] = alive
+        worker_count = max(1, int(config.get("trading", {}).get("websocket_asset_refresh_workers", 3)))
+        while len(WEBSOCKET_ASSET_REFRESH_THREADS) < worker_count:
+            thread = threading.Thread(
+                target=websocket_asset_refresh_worker,
+                args=(config,),
+                name=f"websocket-asset-refresh-{len(WEBSOCKET_ASSET_REFRESH_THREADS) + 1}",
+                daemon=True,
+            )
+            thread.start()
+            WEBSOCKET_ASSET_REFRESH_THREADS.append(thread)
+        return list(WEBSOCKET_ASSET_REFRESH_THREADS)
+
+
+def drain_websocket_asset_updates(max_updates: int = 20) -> list[dict[str, Any]]:
+    """Return completed background asset updates without blocking."""
+    updates: list[dict[str, Any]] = []
+    for _ in range(max_updates):
+        try:
+            updates.append(WEBSOCKET_ASSET_UPDATES.get_nowait())
+        except queue.Empty:
+            break
+    return updates
+
+
+def asset_matches_refresh_request(asset: dict[str, Any], request: dict[str, Any]) -> bool:
+    """Check whether an existing asset belongs to a targeted refresh scope."""
+    for field in ("city", "kind", "event_date"):
+        wanted = str(request.get(field) or "")
+        if wanted and str(asset.get(field) or "") != wanted:
+            return False
+    return True
+
+
+def merge_websocket_asset_updates(assets: dict[str, dict[str, Any]], updates: list[dict[str, Any]]) -> bool:
+    """Merge targeted asset refresh results while preserving live price state."""
+    changed = False
+    for update in updates:
+        request = update.get("request") or {}
+        new_assets = update.get("assets") or {}
+        remove_ids = [
+            asset_id
+            for asset_id, asset in assets.items()
+            if asset.get("role") == "temperature_market" and asset_matches_refresh_request(asset, request)
+        ]
+        for asset_id in remove_ids:
+            assets.pop(asset_id, None)
+            changed = True
+        for asset_id, new_asset in new_assets.items():
+            old_asset = assets.get(asset_id)
+            if old_asset:
+                if "last_prices_by_field" in old_asset:
+                    new_asset.setdefault("last_prices_by_field", dict(old_asset.get("last_prices_by_field") or {}))
+                if new_asset.get("last_price") is None and old_asset.get("last_price") is not None:
+                    new_asset["last_price"] = old_asset.get("last_price")
+            if assets.get(asset_id) != new_asset:
+                assets[asset_id] = new_asset
+                changed = True
+        LOGGER.info(
+            "websocket asset refresh applied city=%s kind=%s event_date=%s reason=%s assets=%s removed=%s",
+            request.get("city", ""),
+            request.get("kind", ""),
+            request.get("event_date", ""),
+            request.get("reason", ""),
+            len(new_assets),
+            len(remove_ids),
+        )
+    return changed
+
+
 def process_harvest_if_new_websocket_metar(config: dict[str, Any], context: dict[str, Any]) -> None:
     """Refresh METAR after a WebSocket price trigger and run harvest only when observations changed.
     
@@ -4079,7 +4276,7 @@ def process_harvest_if_new_websocket_metar(config: dict[str, Any], context: dict
             return
         markets = markets_for_event(config, event)
         event_unit = event_market_unit(markets)
-        station = station_from_wu_url(extract_wunderground_source(config, event_url))
+        station = station_for_event(config, city, event_url)
         if not station:
             LOGGER.warning("websocket metar refresh skip missing station city=%s kind=%s url=%s", city, kind, event_url)
             return
@@ -4346,9 +4543,9 @@ def monitor_websocket(config: dict[str, Any], duration_seconds: int = 0) -> bool
     ws_url = str(config["trading"].get("websocket_url"))
     timeout_seconds = int(config["trading"].get("websocket_timeout_seconds", 10))
     ping_seconds = max(1, int(config["trading"].get("websocket_ping_seconds", 10)))
-    refresh_seconds = int(config["trading"].get("websocket_asset_refresh_seconds", 300))
     trigger_pct = float(config["trading"].get("monitor_price_change_pct", 0.03))
     signal_fields = websocket_momentum_signal_fields(config)
+    start_websocket_asset_refresh_thread(config)
     assets = websocket_assets(config)
     if not assets:
         LOGGER.info("websocket no temperature market assets")
@@ -4359,20 +4556,19 @@ def monitor_websocket(config: dict[str, Any], duration_seconds: int = 0) -> bool
         ws.settimeout(min(1, timeout_seconds))
         ws.send(json.dumps({"assets_ids": asset_ids, "type": "market", "custom_feature_enabled": True}))
         started = time.monotonic()
-        last_refresh = started
         last_ping = started
         while duration_seconds <= 0 or time.monotonic() - started < duration_seconds:
-            ensure_price_recording_windows(config, assets)
-            if time.monotonic() - last_ping >= ping_seconds:
-                ws.send("PING")
-                last_ping = time.monotonic()
-            if time.monotonic() - last_refresh >= refresh_seconds:
-                assets = websocket_assets(config)
+            updates = drain_websocket_asset_updates()
+            if updates and merge_websocket_asset_updates(assets, updates):
                 new_ids = sorted(assets)
                 if new_ids and new_ids != asset_ids:
                     asset_ids = new_ids
                     ws.send(json.dumps({"assets_ids": asset_ids, "type": "market", "custom_feature_enabled": True}))
-                last_refresh = time.monotonic()
+                    LOGGER.info("websocket subscription updated assets=%s", len(asset_ids))
+            ensure_price_recording_windows(config, assets)
+            if time.monotonic() - last_ping >= ping_seconds:
+                ws.send("PING")
+                last_ping = time.monotonic()
             try:
                 message = ws.recv()
                 received_ts = time.time()
@@ -4404,7 +4600,7 @@ def monitor_websocket(config: dict[str, Any], duration_seconds: int = 0) -> bool
                 previous_price = float(previous)
                 if previous_price <= 0:
                     continue
-                price_change_pct = abs(float(price) - previous_price) / previous_price
+                price_change_pct = directional_price_change_fraction(previous_price, float(price))
                 context = {
                     "source": "polymarket_websocket_temperature_market",
                     "asset_id": asset_id,
@@ -4421,8 +4617,14 @@ def monitor_websocket(config: dict[str, Any], duration_seconds: int = 0) -> bool
                 if asset.get("role") == "held_position" and price_change_pct >= trigger_pct:
                     verify_open_positions_with_twc(config, context)
                 trade = process_price_momentum_buy(config, context)
-                if price_change_pct >= trigger_pct or trade:
-                    assets = websocket_assets(config)
+                if trade:
+                    request_websocket_asset_refresh(
+                        str(asset.get("city") or ""),
+                        str(asset.get("kind") or ""),
+                        str(asset.get("event_date") or ""),
+                        str(asset.get("station") or ""),
+                        "trade_opened",
+                    )
     finally:
         try:
             ws.close()
@@ -4508,7 +4710,7 @@ def aviation_supervisor(config: dict[str, Any]) -> None:
                     city = event["_parsed_city"]
                     event_url = poly_url_from_event(event)
                     try:
-                        station = station_from_wu_url(extract_wunderground_source(config, event_url))
+                        station = station_for_event(config, city, event_url)
                     except Exception:
                         LOGGER.exception("aviation station discovery failed city=%s url=%s", city, event_url)
                         continue
@@ -4611,6 +4813,7 @@ def aviation_supervisor(config: dict[str, Any]) -> None:
                             if not changed:
                                 continue
                             LOGGER.info("aviation extreme changed city=%s kind=%s high=%s low=%s latest=%s", city, kind, aviation_high, aviation_low, event_latest_dt.isoformat())
+                            request_websocket_asset_refresh(city, kind, event_date, station, "aviation_extreme_changed")
                             if config.get("price_momentum", {}).get("awc_extreme_harvest_enabled", False):
                                 process_deterministic_harvest(
                                     config,

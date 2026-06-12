@@ -3,8 +3,8 @@
 Deterministic Polymarket weather trader.
 
 Only keeps the current strategy:
-- Watch every temperature market YES/NO token per event over Polymarket websocket.
-- Use price movement as the cheap trigger to refresh AviationWeather METAR.
+- Poll Jack AI Solutions airport weather records during each airport report window.
+- Use returned observation time and temperature records as the trigger signal.
 - Verify changed observed extremes with TWC historical observations.
 - Buy NO when an option is already impossible, buy YES when the extreme bucket is reached.
 - Sell held NO only if corrected observations make that NO possible again.
@@ -12,7 +12,7 @@ Only keeps the current strategy:
 By default this runs as a paper trader. If live trading is explicitly enabled
 in config, real Polymarket orders are posted through executor.py and confirmed
 through the authenticated Polymarket user websocket, with REST polling as a
-fallback.
+fallback. Market-price websocket momentum is not used for strategy decisions.
 """
 
 from __future__ import annotations
@@ -67,6 +67,7 @@ WEBSOCKET_ASSET_UPDATES: "queue.Queue[dict[str, Any]]" = queue.Queue()
 WEBSOCKET_ASSET_REFRESH_DEDUP: set[tuple[str, str, str]] = set()
 WEBSOCKET_ASSET_REFRESH_LOCK = threading.RLock()
 WEBSOCKET_ASSET_REFRESH_THREADS: list[threading.Thread] = []
+WEATHER_RECORD_POINTS_BY_STATION_EVENT: dict[tuple[str, str], dict[str, tuple[datetime, float]]] = {}
 
 
 @dataclass
@@ -296,15 +297,10 @@ def default_config() -> dict[str, Any]:
         "aviation_poll_after_observation_minutes": 15,
         "aviation_poll_interval_seconds": 60,
         "aviation_refresh_probe_seconds": 180,
+        "weather_record_poll_interval_seconds": 2,
+        "weather_record_timing_refresh_seconds": 60,
         "allowed_cities": allowed,
-        "websocket_enabled": True,
-        "websocket_url": "wss://ws-subscriptions-clob.polymarket.com/ws/market",
-        "websocket_persistent": True,
-        "websocket_reconnect_seconds": 5,
-        "websocket_ping_seconds": 10,
-        "websocket_timeout_seconds": 10,
-        "websocket_asset_refresh_seconds": 0,
-        "websocket_asset_refresh_workers": 3,
+        "websocket_enabled": False,
         "live_trading_enabled": False,
         "live_trading_dry_run": False,
         "live_order_timeout_seconds": 20,
@@ -317,6 +313,7 @@ def default_config() -> dict[str, Any]:
         "polymarket_gamma_base": "https://gamma-api.polymarket.com",
         "polymarket_data_base": "https://data-api.polymarket.com",
         "polymarket_clob_base": "https://clob.polymarket.com",
+        "weather_record_url": "https://jackaisolutions.us/api/weatherrecord",
         "weather_company_base": "https://api.weather.com",
             "twc_api_key_env": "TWC_API_KEY",
             "twc_api_key": "",
@@ -1790,6 +1787,96 @@ def aviation_observed_extremes(config: dict[str, Any], station: str, city: str, 
         temp = convert_temperature(temp_f, "F", unit) if unit.upper() != "F" else temp_f
         if temp is not None:
             points.append((local_dt, round(float(temp))))
+    high, low, _, _, _, _ = summarize_points(points)
+    latest_dt = max((dt for dt, _ in points), default=None)
+    return high, low, latest_dt, points
+
+
+def parse_weather_record_timestamp(value: Any) -> Optional[datetime]:
+    """Parse Jack AI weather record timestamps into UTC datetimes."""
+    if value is None:
+        return None
+    try:
+        raw = float(value)
+    except (TypeError, ValueError):
+        try:
+            parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        except ValueError:
+            return None
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(timezone.utc)
+    if raw > 10_000_000_000:
+        raw = raw / 1000.0
+    return datetime.fromtimestamp(raw, timezone.utc)
+
+
+def weather_record_rows(config: dict[str, Any]) -> list[dict[str, Any]]:
+    """Fetch the latest airport temperature records from Jack AI Solutions."""
+    url = str(config.get("api", {}).get("weather_record_url") or "https://jackaisolutions.us/api/weatherrecord")
+    timeout = int(config.get("api", {}).get("request_timeout_seconds", 30))
+    r = requests.get(url, headers=HEADERS, timeout=timeout)
+    r.raise_for_status()
+    payload = r.json()
+    rows = payload.get("value") if isinstance(payload, dict) else payload
+    if not isinstance(rows, list):
+        return []
+    normalized: list[dict[str, Any]] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        station = str(row.get("StationCode") or row.get("stationCode") or row.get("station") or "").strip().upper()
+        obs_dt = parse_weather_record_timestamp(row.get("TimeStamp") or row.get("timestamp") or row.get("time"))
+        temp_raw = row.get("Temperature") if row.get("Temperature") is not None else row.get("temperature")
+        if not station or obs_dt is None or temp_raw is None:
+            continue
+        try:
+            temp_c = float(temp_raw)
+        except (TypeError, ValueError):
+            continue
+        normalized.append({"station": station, "obs_dt": obs_dt, "temp_c": temp_c, "raw": row})
+    return normalized
+
+
+def append_weather_record_history(config: dict[str, Any], rows: list[dict[str, Any]], reason: str) -> None:
+    """Append weatherrecord API rows to the existing observation audit JSONL."""
+    path = str(config.get("outputs", {}).get("aviation_metar_history_jsonl") or "")
+    if not path or not rows:
+        return
+    with IO_LOCK, open(path, "a", encoding="utf-8") as f:
+        for row in rows:
+            raw = row.get("raw", row)
+            station = str(row.get("station") or raw.get("StationCode") or "")
+            f.write(json.dumps({"saved_at": datetime.now(timezone.utc).isoformat(), "station": station, "reason": reason, "row": raw}, ensure_ascii=False, sort_keys=True) + "\n")
+
+
+def weather_record_observed_extremes(
+    config: dict[str, Any],
+    station: str,
+    city: str,
+    event_date: str,
+    unit: str,
+    rows: list[dict[str, Any]],
+) -> tuple[Optional[float], Optional[float], Optional[datetime], list[tuple[datetime, float]]]:
+    """Update in-memory event-day extremes from weatherrecord API rows for one station."""
+    station_key = station.strip().upper()
+    city_tz = city_timezone(config, city)
+    points_by_time = WEATHER_RECORD_POINTS_BY_STATION_EVENT.setdefault((station_key, event_date), {})
+    for row in rows:
+        if str(row.get("station") or "").upper() != station_key:
+            continue
+        obs_dt = row.get("obs_dt")
+        if not isinstance(obs_dt, datetime):
+            continue
+        local_dt = obs_dt.astimezone(city_tz)
+        if local_dt.date().isoformat() != event_date:
+            continue
+        temp_f = convert_temperature(float(row["temp_c"]), "C", "F")
+        temp = convert_temperature(temp_f, "F", unit) if unit.upper() != "F" else temp_f
+        if temp is None:
+            continue
+        points_by_time[obs_dt.astimezone(timezone.utc).isoformat()] = (local_dt, round(float(temp)))
+    points = sorted(points_by_time.values(), key=lambda item: item[0])
     high, low, _, _, _, _ = summarize_points(points)
     latest_dt = max((dt for dt, _ in points), default=None)
     return high, low, latest_dt, points
@@ -3459,6 +3546,7 @@ def process_deterministic_harvest(config: dict[str, Any], trigger_context: dict[
             wu_source = extract_wunderground_source(config, event_url)
         except requests.RequestException as exc:
             LOGGER.warning("deterministic source url unavailable city=%s kind=%s url=%s error=%s", city, kind, event_url, exc)
+    signal_source = str(trigger_context.get("source") or "aviation_metar")
     observed_high = trigger_context.get("aviation_high")
     observed_low = trigger_context.get("aviation_low")
     if observed_high is None and observed_low is None:
@@ -3475,7 +3563,7 @@ def process_deterministic_harvest(config: dict[str, Any], trigger_context: dict[
         )
         return []
     EXTREMES_BY_EVENT[(event_date, city, kind)] = {
-        "source": "aviation_metar",
+        "source": signal_source,
         "observed_high": observed_high,
         "observed_low": observed_low,
         "checked_at": datetime.now().isoformat(timespec="seconds"),
@@ -3520,15 +3608,15 @@ def process_deterministic_harvest(config: dict[str, Any], trigger_context: dict[
             )
         elif price <= yes_max:
             trade = (
-                live_trader.submit_buy_trade(config, cycle_id, extreme_market, wu_source, station, "YES", price, observed_high, observed_low, "metar_extreme_yes_reached")
+                live_trader.submit_buy_trade(config, cycle_id, extreme_market, wu_source, station, "YES", price, observed_high, observed_low, f"{signal_source}_extreme_yes_reached")
                 if live_trader
-                else make_trade(config, cycle_id, extreme_market, wu_source, station, "YES", price, observed_high, observed_low, "metar_extreme_yes_reached")
+                else make_trade(config, cycle_id, extreme_market, wu_source, station, "YES", price, observed_high, observed_low, f"{signal_source}_extreme_yes_reached")
             )
             if trade:
                 new_trades.append(trade)
                 changed = True
                 if not live_trader:
-                    notify_trade(config, trade, "BUY", "FILLED", "metar_extreme_yes_reached")
+                    notify_trade(config, trade, "BUY", "FILLED", f"{signal_source}_extreme_yes_reached")
                 LOGGER.info("metar buy_yes city=%s kind=%s market=%s price=%s observed_high=%s observed_low=%s status=%s", city, kind, extreme_market.market_id, price, observed_high, observed_low, trade.status)
         else:
             LOGGER.info("metar skip_buy_yes_price_too_high city=%s kind=%s market=%s yes_clob_buy_price=%s max=%s observed_high=%s observed_low=%s", city, kind, extreme_market.market_id, price, yes_max, observed_high, observed_low)
@@ -3565,15 +3653,15 @@ def process_deterministic_harvest(config: dict[str, Any], trigger_context: dict[
                 )
                 continue
             trade = (
-                live_trader.submit_buy_trade(config, cycle_id, market, wu_source, station, "NO", no_price, observed_high, observed_low, "metar_impossible_no")
+                live_trader.submit_buy_trade(config, cycle_id, market, wu_source, station, "NO", no_price, observed_high, observed_low, f"{signal_source}_impossible_no")
                 if live_trader
-                else make_trade(config, cycle_id, market, wu_source, station, "NO", no_price, observed_high, observed_low, "metar_impossible_no")
+                else make_trade(config, cycle_id, market, wu_source, station, "NO", no_price, observed_high, observed_low, f"{signal_source}_impossible_no")
             )
             if trade:
                 new_trades.append(trade)
                 changed = True
                 if not live_trader:
-                    notify_trade(config, trade, "BUY", "FILLED", "metar_impossible_no")
+                    notify_trade(config, trade, "BUY", "FILLED", f"{signal_source}_impossible_no")
                 LOGGER.info("metar buy_no city=%s kind=%s market=%s no_price=%s observed_high=%s observed_low=%s status=%s", city, kind, market.market_id, no_price, observed_high, observed_low, trade.status)
             break
 
@@ -4857,6 +4945,155 @@ def start_aviation_thread(config: dict[str, Any]) -> threading.Thread:
     return thread
 
 
+def weather_record_supervisor(config: dict[str, Any]) -> None:
+    """Poll weatherrecord API every two seconds inside airport report windows."""
+    fallback_poll_seconds = max(10, int(config["trading"].get("aviation_poll_interval_seconds", 60)))
+    api_poll_seconds = max(1, int(config["trading"].get("weather_record_poll_interval_seconds", 2)))
+    timing_refresh_seconds = max(10, int(config["trading"].get("weather_record_timing_refresh_seconds", 60)))
+    event_cache: list[dict[str, Any]] = []
+    station_groups: dict[tuple[str, str], dict[str, Any]] = {}
+    station_state: dict[tuple[str, str], dict[str, Any]] = {}
+    event_state: dict[tuple[str, str, str], dict[str, Any]] = {}
+    event_refresh_at = 0.0
+    next_api_poll_at = 0.0
+    LOGGER.info(
+        "weatherrecord supervisor started api_poll_seconds=%s timing_refresh_seconds=%s fallback_poll_seconds=%s",
+        api_poll_seconds,
+        timing_refresh_seconds,
+        fallback_poll_seconds,
+    )
+    while True:
+        try:
+            now_mono = time.monotonic()
+            if now_mono >= event_refresh_at:
+                event_cache = []
+                for target in resolve_event_target_dates(config):
+                    event_cache.extend(discover_temperature_events(config, target))
+                station_groups = {}
+                for event in event_cache:
+                    city = event["_parsed_city"]
+                    event_url = poly_url_from_event(event)
+                    try:
+                        station = station_for_event(config, city, event_url)
+                    except Exception:
+                        LOGGER.exception("weatherrecord station discovery failed city=%s url=%s", city, event_url)
+                        continue
+                    if not station:
+                        continue
+                    group_key = (city, station)
+                    group = station_groups.setdefault(group_key, {"city": city, "station": station, "events": []})
+                    group["events"].append(event)
+                    station_state.setdefault(group_key, {"next_timing_refresh_at": 0.0})
+                for stale_key in set(station_state) - set(station_groups):
+                    station_state.pop(stale_key, None)
+                event_refresh_at = now_mono + 300
+                LOGGER.info("weatherrecord event cache refreshed events=%s station_groups=%s", len(event_cache), len(station_groups))
+
+            for group_key, group in station_groups.items():
+                state = station_state.setdefault(group_key, {"next_timing_refresh_at": 0.0})
+                if now_mono < float(state.get("next_timing_refresh_at", 0.0)):
+                    continue
+                city = str(group["city"])
+                station = str(group["station"])
+                try:
+                    latest_dt, interval_seconds, report_count, scheduled_minutes, expected_next_dt = aviation_report_timing(station, 24, config)
+                    state["next_timing_refresh_at"] = now_mono + timing_refresh_seconds
+                    if latest_dt is None:
+                        LOGGER.info("weatherrecord timing unavailable city=%s station=%s", city, station)
+                        continue
+                    update_station_report_timing(city, station, latest_dt, interval_seconds, report_count, scheduled_minutes, expected_next_dt)
+                except Exception:
+                    state["next_timing_refresh_at"] = now_mono + fallback_poll_seconds
+                    LOGGER.exception("weatherrecord timing refresh failed city=%s station=%s", city, station)
+
+            window_groups = []
+            for group_key, group in station_groups.items():
+                in_window, timing = in_station_report_window(config, str(group["city"]), str(group["station"]))
+                if in_window:
+                    window_groups.append((group_key, group, timing))
+
+            if window_groups and now_mono >= next_api_poll_at:
+                rows = weather_record_rows(config)
+                append_weather_record_history(config, rows, "weatherrecord_window_poll")
+                LOGGER.info("weatherrecord poll rows=%s active_windows=%s", len(rows), len(window_groups))
+                for _, group, _ in window_groups:
+                    city = str(group["city"])
+                    station = str(group["station"])
+                    for event in list(group["events"]):
+                        kind = event["_parsed_kind"]
+                        event_date = event["_parsed_event_date"]
+                        event_url = poly_url_from_event(event)
+                        try:
+                            markets = markets_for_event(config, event)
+                            event_unit = event_market_unit(markets)
+                            observed_high, observed_low, latest_dt, _ = weather_record_observed_extremes(
+                                config,
+                                station,
+                                city,
+                                event_date,
+                                event_unit,
+                                rows,
+                            )
+                            if latest_dt is None:
+                                continue
+                            key = (event_date, city, kind)
+                            previous = event_state.get(key, {})
+                            changed = (
+                                (kind == "Highest" and observed_high is not None and observed_high != previous.get("observed_high")) or
+                                (kind == "Lowest" and observed_low is not None and observed_low != previous.get("observed_low"))
+                            )
+                            event_state[key] = {
+                                "observed_high": observed_high,
+                                "observed_low": observed_low,
+                                "latest_dt": latest_dt.isoformat(),
+                            }
+                            if not changed:
+                                continue
+                            LOGGER.info(
+                                "weatherrecord extreme changed city=%s kind=%s station=%s event_date=%s high=%s low=%s latest=%s",
+                                city,
+                                kind,
+                                station,
+                                event_date,
+                                observed_high,
+                                observed_low,
+                                latest_dt.isoformat(),
+                            )
+                            process_deterministic_harvest(
+                                config,
+                                {
+                                    "source": "weatherrecord_api",
+                                    "city": city,
+                                    "kind": kind,
+                                    "event_date": event_date,
+                                    "polymarket_url": event_url,
+                                    "aviation_high": observed_high,
+                                    "aviation_low": observed_low,
+                                },
+                            )
+                        except Exception:
+                            LOGGER.exception("weatherrecord event failed city=%s kind=%s station=%s", city, kind, station)
+                next_api_poll_at = now_mono + api_poll_seconds
+
+            sleep_seconds = fallback_poll_seconds
+            if window_groups:
+                sleep_seconds = max(0.25, next_api_poll_at - time.monotonic())
+            elif station_groups:
+                next_timing = min((float(s.get("next_timing_refresh_at", now_mono + fallback_poll_seconds)) for s in station_state.values()), default=now_mono + fallback_poll_seconds)
+                sleep_seconds = min(fallback_poll_seconds, max(1.0, next_timing - now_mono), max(1.0, event_refresh_at - now_mono))
+            time.sleep(min(30.0, sleep_seconds))
+        except Exception:
+            LOGGER.exception("weatherrecord supervisor loop failed")
+            time.sleep(min(30, fallback_poll_seconds))
+
+
+def start_weather_record_thread(config: dict[str, Any]) -> threading.Thread:
+    """Start the weatherrecord polling supervisor in a daemon thread."""
+    thread = threading.Thread(target=weather_record_supervisor, args=(config,), name="deterministic-weatherrecord", daemon=True)
+    thread.start()
+    return thread
+
+
 def write_state(config: dict[str, Any], cycle_num: int) -> None:
     """Persist lightweight bot loop state to JSON.
     
@@ -4942,8 +5179,7 @@ def run(config: dict[str, Any]) -> None:
     initialize_tgftp_observation_cache(config)
     start_live_trader(config)
     sync_polymarket_positions_to_disk(config, reason="start")
-    start_websocket_thread(config)
-    start_aviation_thread(config)
+    start_weather_record_thread(config)
     try:
         while True:
             cycle_num += 1

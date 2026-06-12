@@ -1660,7 +1660,7 @@ def aviation_metar_observations(station: str, hours: int = 24) -> list[dict[str,
 
 
 def append_aviation_metar_history(config: dict[str, Any], station: str, rows: list[dict[str, Any]], reason: str) -> None:
-    """Append raw AviationWeather METAR rows to a JSONL audit file.
+    """Raw AviationWeather audit writes are disabled to keep disk usage low.
     
     Args:
         config (dict[str, Any]): Active bot configuration, including output paths.
@@ -1671,12 +1671,7 @@ def append_aviation_metar_history(config: dict[str, Any], station: str, rows: li
     Returns:
         None: This function is executed for its side effects.
     """
-    path = str(config.get("outputs", {}).get("aviation_metar_history_jsonl") or "")
-    if not path or not rows:
-        return
-    with IO_LOCK, open(path, "a", encoding="utf-8") as f:
-        for row in rows:
-            f.write(json.dumps({"saved_at": datetime.now(timezone.utc).isoformat(), "station": station, "reason": reason, "row": row}, ensure_ascii=False, sort_keys=True) + "\n")
+    return
 
 
 def append_price_window_record(config: dict[str, Any], record: dict[str, Any]) -> None:
@@ -1839,15 +1834,8 @@ def weather_record_rows(config: dict[str, Any]) -> list[dict[str, Any]]:
 
 
 def append_weather_record_history(config: dict[str, Any], rows: list[dict[str, Any]], reason: str) -> None:
-    """Append weatherrecord API rows to the existing observation audit JSONL."""
-    path = str(config.get("outputs", {}).get("aviation_metar_history_jsonl") or "")
-    if not path or not rows:
-        return
-    with IO_LOCK, open(path, "a", encoding="utf-8") as f:
-        for row in rows:
-            raw = row.get("raw", row)
-            station = str(row.get("station") or raw.get("StationCode") or "")
-            f.write(json.dumps({"saved_at": datetime.now(timezone.utc).isoformat(), "station": station, "reason": reason, "row": raw}, ensure_ascii=False, sort_keys=True) + "\n")
+    """Raw weatherrecord audit writes are disabled to keep disk usage low."""
+    return
 
 
 def weather_record_observed_extremes(
@@ -5176,7 +5164,6 @@ def run(config: dict[str, Any]) -> None:
     max_cycles = int(config["scheduler"].get("max_cycles", 0))
     last_twc_verify_ts = 0.0
     LOGGER.info("bot started config=%s", json.dumps(redacted_config(config), ensure_ascii=False, sort_keys=True))
-    initialize_tgftp_observation_cache(config)
     start_live_trader(config)
     sync_polymarket_positions_to_disk(config, reason="start")
     start_weather_record_thread(config)

@@ -68,6 +68,7 @@ WEBSOCKET_ASSET_REFRESH_DEDUP: set[tuple[str, str, str]] = set()
 WEBSOCKET_ASSET_REFRESH_LOCK = threading.RLock()
 WEBSOCKET_ASSET_REFRESH_THREADS: list[threading.Thread] = []
 WEATHER_RECORD_POINTS_BY_STATION_EVENT: dict[tuple[str, str], dict[str, tuple[datetime, float]]] = {}
+TWC_VERIFY_NEXT_AT: dict[str, float] = {}
 
 
 @dataclass
@@ -299,6 +300,9 @@ def default_config() -> dict[str, Any]:
         "aviation_refresh_probe_seconds": 180,
         "weather_record_poll_interval_seconds": 2,
         "weather_record_timing_refresh_seconds": 60,
+        "weather_record_timing_stagger_seconds": 60,
+        "tgftp_window_start_delay_seconds": 120,
+        "tgftp_window_poll_min_interval_seconds": 0.5,
         "allowed_cities": allowed,
         "websocket_enabled": False,
         "live_trading_enabled": False,
@@ -367,6 +371,8 @@ def default_config() -> dict[str, Any]:
             "tgftp_verify_interval_seconds": 10,
             "tgftp_verify_timeout_seconds": 180,
             "twc_verify_interval_seconds": 900,
+            "twc_verify_stagger_seconds": 300,
+            "twc_verify_scheduler_tick_seconds": 10,
         },
         "strategies": [{"name": "deterministic_harvest", "enabled": True, "events": {"target_dates": ["today"]}, "trading": trading}],
     }
@@ -480,6 +486,15 @@ def local_date_for_timezone(tz_name: str, *, offset_days: int = 0) -> date:
         date: Local date in the requested timezone.
     """
     return (datetime.now(ZoneInfo(tz_name)) + timedelta(days=offset_days)).date()
+
+
+def stable_stagger_seconds(key: str, spread_seconds: int) -> float:
+    """Return a stable per-key offset inside a scheduling spread."""
+    spread = max(1, int(spread_seconds))
+    total = 0
+    for idx, char in enumerate(str(key)):
+        total += (idx + 1) * ord(char)
+    return float(total % spread)
 
 
 def resolve_date(value: str, *, base_date: Optional[date] = None) -> date:
@@ -1985,8 +2000,10 @@ def tgftp_metar_observation(station: str) -> Optional[dict[str, Any]]:
     Side effects:
         Calls the NOAA TGFTP endpoint.
     """
-    url = f"https://tgftp.nws.noaa.gov/data/observations/metar/stations/{station.upper()}.TXT"
-    r = requests.get(url, headers=HEADERS, timeout=15)
+    url = f"https://tgftp.nws.noaa.gov/data/observations/metar/stations/{station.upper()}.TXT?nocache={int(time.time() * 1000)}"
+    headers = dict(HEADERS)
+    headers.update({"Cache-Control": "no-cache, no-store, max-age=0", "Pragma": "no-cache"})
+    r = requests.get(url, headers=headers, timeout=15)
     r.raise_for_status()
     return parse_tgftp_metar(r.text)
 
@@ -2970,6 +2987,68 @@ def hedge_no_trade_with_yes(config: dict[str, Any], trade: PaperTrade, market: T
     return True
 
 
+def unwind_yes_hedge_if_no_impossible(
+    config: dict[str, Any],
+    trade: PaperTrade,
+    market: TemperatureMarket,
+    observed_high: Optional[float],
+    observed_low: Optional[float],
+    event_unit: str,
+    reason: str,
+) -> bool:
+    """Sell a previously bought YES hedge when the original NO is valid again."""
+    if trade.status != "HEDGED" or (trade.position_side or "YES").upper() != "NO":
+        return False
+    if not deterministic_market_impossible(market, trade.kind, observed_high, observed_low, event_unit):
+        return False
+    token_id = asset_id_for_market_side(market, "YES")
+    if not token_id:
+        trade.error = "no YES token id to unwind hedge"
+        return False
+    sell_price = float(best_sell_price(config, market, "YES") or 0.0)
+    if sell_price <= 0:
+        trade.error = "no CLOB sell price for YES hedge"
+        LOGGER.info("skip unwind hedge no_yes_sell_price trade=%s market=%s", trade.trade_id, market.market_id)
+        return False
+    hedge_shares = float(trade.shares)
+    live_trader = get_live_trader() if live_trading_enabled(config) else None
+    if live_trader and live_trader.executor:
+        result = live_trader.executor.sell(token_id, hedge_shares, price=sell_price)
+        if not _result_value(result, "success", False):
+            trade.error = f"YES hedge sell failed: {_result_value(result, 'error', '')}"
+            LOGGER.info("skip unwind hedge sell_failed trade=%s market=%s error=%s", trade.trade_id, market.market_id, trade.error)
+            return False
+        sell_price = float(_result_value(result, "price", sell_price) or sell_price)
+        hedge_shares = float(_result_value(result, "shares", hedge_shares) or hedge_shares)
+        trade.live_sell_order_id = str(_result_value(result, "order_id", trade.live_sell_order_id))
+        trade.live_order_status = str(_result_value(result, "status", "FILLED"))
+        trade.live_order_error = str(_result_value(result, "error", "") or "")
+    fee = taker_fee_usdc(hedge_shares, sell_price, float(trade.taker_fee_rate), bool(config["trading"].get("fee_enabled", True)))
+    proceeds = hedge_shares * sell_price - fee
+    trade.status = "OPEN"
+    trade.exit_action = "sell_yes_hedge"
+    trade.exit_at = datetime.now().isoformat(timespec="seconds")
+    trade.exit_reason = reason
+    trade.exit_yes_price = sell_price
+    trade.exit_fee_usdc = round(fee, 8)
+    trade.exit_proceeds_usdc = round(proceeds, 8)
+    trade.pnl_usdc = round(proceeds - float(trade.exit_hedge_cost_usdc or 0.0), 8)
+    trade.payout_usdc = 0.0
+    trade.settlement_source = "yes_hedge_unwound_no_impossible"
+    trade.error = ""
+    notify_trade(config, trade, "SELL", "HEDGE_UNWOUND", reason)
+    LOGGER.info(
+        "unwind yes hedge trade=%s market=%s yes_sell_price=%s hedge_shares=%s proceeds=%s reason=%s",
+        trade.trade_id,
+        market.market_id,
+        sell_price,
+        hedge_shares,
+        proceeds,
+        reason,
+    )
+    return True
+
+
 def read_csv_dicts(path: str) -> list[dict[str, str]]:
     """Read a CSV file into dictionaries, returning an empty list if the file is absent.
     
@@ -3496,10 +3575,21 @@ def verify_open_positions_with_twc(config: dict[str, Any], trigger_context: Opti
     verify_seconds = int(config["trading"].get("twc_post_entry_verify_seconds", 7200))
     trigger_context = trigger_context or {}
     trigger_market_id = str(trigger_context.get("market_id") or "")
+    trigger_trade_id = str(trigger_context.get("trade_id") or "")
+    trigger_station = str(trigger_context.get("station") or "").upper()
+    trigger_event_date = str(trigger_context.get("event_date") or "")
+    trigger_city = str(trigger_context.get("city") or "")
+    twc_cache: dict[tuple[str, str, str, str], tuple[Optional[float], Optional[float], list[tuple[datetime, float]], dict[str, Any]]] = {}
     changed = False
 
     for trade in trades:
-        if trade.status != "OPEN" or trade.strategy != strategy_name:
+        if trade.status not in {"OPEN", "HEDGED"} or trade.strategy != strategy_name:
+            continue
+        if trigger_trade_id and trade.trade_id != trigger_trade_id:
+            continue
+        if trigger_event_date and trade.event_date != trigger_event_date:
+            continue
+        if trigger_city and trade.city != trigger_city:
             continue
         source_text = (trade.forecast_source or "").lower()
         if not any(token in source_text for token in ("metar", "weatherrecord_api", "tgftp")):
@@ -3516,8 +3606,14 @@ def verify_open_positions_with_twc(config: dict[str, Any], trigger_context: Opti
             station = trade.forecast_station or station_for_event(config, trade.city, trade.polymarket_url)
             if not station:
                 continue
+            station = station.upper()
+            if trigger_station and station != trigger_station:
+                continue
             city_local_dt, _, _ = city_local_now(config, trade.city)
-            twc_high, twc_low, _, _ = deterministic_observed_extremes_from_twc(config, station, trade.event_date, city_local_dt, event_unit)
+            cache_key = (station, trade.event_date, event_unit.upper(), city_local_dt.date().isoformat())
+            if cache_key not in twc_cache:
+                twc_cache[cache_key] = deterministic_observed_extremes_from_twc(config, station, trade.event_date, city_local_dt, event_unit)
+            twc_high, twc_low, _, _ = twc_cache[cache_key]
             if (trade.kind == "Highest" and twc_high is None) or (trade.kind == "Lowest" and twc_low is None):
                 LOGGER.info(
                     "twc verification skip no local observations trade=%s city=%s kind=%s event_date=%s city_local=%s",
@@ -3528,6 +3624,27 @@ def verify_open_positions_with_twc(config: dict[str, Any], trigger_context: Opti
                     city_local_dt.isoformat(timespec="seconds"),
                 )
                 continue
+            if trade.status == "HEDGED":
+                if unwind_yes_hedge_if_no_impossible(
+                    config,
+                    trade,
+                    market,
+                    twc_high,
+                    twc_low,
+                    event_unit,
+                    "twc_no_impossible_unwind_yes_hedge",
+                ):
+                    changed = True
+                    LOGGER.info(
+                        "twc verification unwind hedge trade=%s city=%s kind=%s market=%s twc_high=%s twc_low=%s",
+                        trade.trade_id,
+                        trade.city,
+                        trade.kind,
+                        trade.market_id,
+                        twc_high,
+                        twc_low,
+                    )
+                continue
             if trade_observation_verified(trade, market, twc_high, twc_low, event_unit):
                 if trade.settlement_source != "twc_verified_hold":
                     trade.settlement_source = "twc_verified_hold"
@@ -3537,9 +3654,16 @@ def verify_open_positions_with_twc(config: dict[str, Any], trigger_context: Opti
 
             triggered_by_position_price = bool(trigger_market_id and trigger_market_id == trade.market_id)
             price_momentum_trade = "price_momentum" in (trade.forecast_source or "").lower()
+            post_buy_validation_trade = any(token in source_text for token in ("weatherrecord_api", "tgftp", "metar"))
+            staggered_validation = str(trigger_context.get("source") or "") == "staggered_twc_position_verification"
             expired = trade_age_seconds(trade) >= verify_seconds
-            if triggered_by_position_price or expired or price_momentum_trade:
-                reason = "twc_invalidated_price_momentum" if price_momentum_trade else "twc_inconsistent_after_position_price_move" if triggered_by_position_price else "twc_not_verified_within_2h"
+            if triggered_by_position_price or expired or price_momentum_trade or (staggered_validation and post_buy_validation_trade):
+                reason = (
+                    "twc_invalidated_price_momentum" if price_momentum_trade
+                    else "twc_inconsistent_after_position_price_move" if triggered_by_position_price
+                    else "twc_invalidated_post_buy_validation" if staggered_validation
+                    else "twc_not_verified_within_2h"
+                )
                 if close_trade(config, trade, market, reason):
                     changed = True
                     LOGGER.info(
@@ -3726,8 +3850,9 @@ def process_deterministic_harvest(config: dict[str, Any], trigger_context: dict[
         write_csv(config["outputs"]["trades_csv"], trades)
         write_csv(config["outputs"]["settled_trades_csv"], trades)
         write_performance_reports(config, trades)
-    for trade_id, validation_station, min_obs_utc in post_buy_validation_requests:
-        start_tgftp_validation_thread(config, trade_id, validation_station, min_obs_utc)
+    if signal_source != "tgftp_metar":
+        for trade_id, validation_station, min_obs_utc in post_buy_validation_requests:
+            start_tgftp_validation_thread(config, trade_id, validation_station, min_obs_utc)
     return trades
 
 
@@ -4039,6 +4164,23 @@ def validate_trade_with_tgftp_observation(config: dict[str, Any], trade_id: str,
     trade.forecast_low = float(observed_low) if observed_low is not None else trade.forecast_low
     trade.forecast_temp = float(observed_high) if trade.kind == "Highest" and observed_high is not None else float(observed_low) if trade.kind == "Lowest" and observed_low is not None else trade.forecast_temp
     trade.forecast_observed_at = obs["obs_dt"].astimezone(timezone.utc).isoformat()
+    if trade.status == "HEDGED":
+        if unwind_yes_hedge_if_no_impossible(
+            config,
+            trade,
+            market,
+            observed_high,
+            observed_low,
+            event_unit,
+            "tgftp_no_impossible_unwind_yes_hedge",
+        ):
+            LOGGER.info("tgftp validation unwind hedge trade=%s station=%s obs_utc=%s temp=%s high=%s low=%s raw=%r", trade_id, station, obs["obs_dt"].isoformat(), rounded_temp, observed_high, observed_low, obs["raw_ob"])
+        else:
+            trade.error = ""
+        write_csv(config["outputs"]["trades_csv"], trades)
+        write_csv(config["outputs"]["settled_trades_csv"], trades)
+        write_performance_reports(config, trades)
+        return
     if trade.status != "OPEN":
         trade.error = f"tgftp validated while trade status={trade.status}; raw={obs['raw_ob']}"
         write_csv(config["outputs"]["trades_csv"], trades)
@@ -4054,6 +4196,102 @@ def validate_trade_with_tgftp_observation(config: dict[str, Any], trade_id: str,
     write_csv(config["outputs"]["trades_csv"], trades)
     write_csv(config["outputs"]["settled_trades_csv"], trades)
     write_performance_reports(config, trades)
+
+
+def tgftp_extremes_for_event(
+    config: dict[str, Any],
+    city: str,
+    station: str,
+    kind: str,
+    event_date: str,
+    event_unit: str,
+    obs: dict[str, Any],
+) -> tuple[Optional[float], Optional[float], Optional[datetime]]:
+    """Merge one TGFTP observation into current event high/low state."""
+    obs_dt = obs.get("obs_dt")
+    if not isinstance(obs_dt, datetime):
+        return None, None, None
+    local_dt = obs_dt.astimezone(city_timezone(config, city))
+    if local_dt.date().isoformat() != event_date:
+        return None, None, obs_dt
+    temp_f = convert_temperature(float(obs["temp_c"]), "C", "F")
+    temp = convert_temperature(temp_f, "F", event_unit) if event_unit.upper() != "F" else temp_f
+    if temp is None:
+        return None, None, obs_dt
+    rounded_temp = round(float(temp))
+    key = (event_date, city, kind)
+    previous = EXTREMES_BY_EVENT.get(key, {})
+    observed_high = previous.get("observed_high")
+    observed_low = previous.get("observed_low")
+    if kind == "Highest":
+        observed_high = max(float(observed_high), rounded_temp) if observed_high is not None else rounded_temp
+    else:
+        observed_low = min(float(observed_low), rounded_temp) if observed_low is not None else rounded_temp
+    EXTREMES_BY_EVENT[key] = {
+        "source": "tgftp_metar",
+        "observed_high": observed_high,
+        "observed_low": observed_low,
+        "checked_at": datetime.now().isoformat(timespec="seconds"),
+        "obs_utc": obs_dt.astimezone(timezone.utc).isoformat(),
+        "raw_ob": obs.get("raw_ob", ""),
+    }
+    return (
+        float(observed_high) if observed_high is not None else None,
+        float(observed_low) if observed_low is not None else None,
+        obs_dt,
+    )
+
+
+def process_tgftp_window_observation(config: dict[str, Any], group: dict[str, Any], timing: dict[str, Any], obs: dict[str, Any]) -> None:
+    """Use a new TGFTP observation to validate existing buys and attempt deterministic buys."""
+    city = str(group["city"])
+    station = str(group["station"])
+    obs_dt = obs["obs_dt"].astimezone(timezone.utc)
+    update_cached_tgftp_observation(station, obs)
+    LOGGER.info(
+        "tgftp window observation city=%s station=%s obs_utc=%s temp_c=%s raw=%r",
+        city,
+        station,
+        obs_dt.isoformat(),
+        obs.get("temp_c"),
+        obs.get("raw_ob", ""),
+    )
+    trades = read_trades(config["outputs"]["trades_csv"])
+    active_event_dates = {str(event.get("_parsed_event_date") or "") for event in group.get("events", [])}
+    for trade in trades:
+        if (
+            trade.status in {"OPEN", "HEDGED"}
+            and trade.city == city
+            and trade.event_date in active_event_dates
+            and (trade.forecast_station or "").upper() == station.upper()
+        ):
+            validate_trade_with_tgftp_observation(config, trade.trade_id, station, obs)
+
+    for event in list(group["events"]):
+        kind = event["_parsed_kind"]
+        event_date = event["_parsed_event_date"]
+        event_url = poly_url_from_event(event)
+        try:
+            markets = markets_for_event(config, event)
+            event_unit = event_market_unit(markets)
+            observed_high, observed_low, latest_dt = tgftp_extremes_for_event(config, city, station, kind, event_date, event_unit, obs)
+            if latest_dt is None or (kind == "Highest" and observed_high is None) or (kind == "Lowest" and observed_low is None):
+                continue
+            process_deterministic_harvest(
+                config,
+                {
+                    "source": "tgftp_metar",
+                    "city": city,
+                    "kind": kind,
+                    "event_date": event_date,
+                    "polymarket_url": event_url,
+                    "aviation_high": observed_high,
+                    "aviation_low": observed_low,
+                    "observed_at_utc": latest_dt.astimezone(timezone.utc).isoformat(),
+                },
+            )
+        except Exception:
+            LOGGER.exception("tgftp window event failed city=%s kind=%s station=%s", city, kind, station)
 
 
 def market_clob_tokens(market_json: dict[str, Any]) -> list[tuple[str, str]]:
@@ -5037,16 +5275,25 @@ def weather_record_supervisor(config: dict[str, Any]) -> None:
     fallback_poll_seconds = max(10, int(config["trading"].get("aviation_poll_interval_seconds", 60)))
     api_poll_seconds = max(1, int(config["trading"].get("weather_record_poll_interval_seconds", 2)))
     timing_refresh_seconds = max(10, int(config["trading"].get("weather_record_timing_refresh_seconds", 60)))
+    timing_stagger_seconds = max(1, int(config["trading"].get("weather_record_timing_stagger_seconds", timing_refresh_seconds)))
+    tgftp_start_delay_seconds = max(0, int(config["trading"].get("tgftp_window_start_delay_seconds", 90)))
+    tgftp_min_interval_seconds = max(0.5, float(config["trading"].get("tgftp_window_poll_min_interval_seconds", 0.5)))
     event_cache: list[dict[str, Any]] = []
     station_groups: dict[tuple[str, str], dict[str, Any]] = {}
     station_state: dict[tuple[str, str], dict[str, Any]] = {}
+    tgftp_window_state: dict[str, dict[str, Any]] = {}
     event_state: dict[tuple[str, str, str], dict[str, Any]] = {}
     event_refresh_at = 0.0
     next_api_poll_at = 0.0
+    next_tgftp_poll_at = 0.0
+    tgftp_round_robin_index = 0
     LOGGER.info(
-        "weatherrecord supervisor started api_poll_seconds=%s timing_refresh_seconds=%s fallback_poll_seconds=%s",
+        "weatherrecord supervisor started api_poll_seconds=%s timing_refresh_seconds=%s timing_stagger_seconds=%s tgftp_start_delay_seconds=%s tgftp_min_interval_seconds=%s fallback_poll_seconds=%s",
         api_poll_seconds,
         timing_refresh_seconds,
+        timing_stagger_seconds,
+        tgftp_start_delay_seconds,
+        tgftp_min_interval_seconds,
         fallback_poll_seconds,
     )
     while True:
@@ -5070,14 +5317,18 @@ def weather_record_supervisor(config: dict[str, Any]) -> None:
                     group_key = (city, station)
                     group = station_groups.setdefault(group_key, {"city": city, "station": station, "events": []})
                     group["events"].append(event)
-                    station_state.setdefault(group_key, {"next_timing_refresh_at": 0.0})
+                    if group_key not in station_state:
+                        spread = min(timing_stagger_seconds, timing_refresh_seconds)
+                        station_state[group_key] = {
+                            "next_timing_refresh_at": now_mono + stable_stagger_seconds(f"{city}:{station}:awc_timing", spread)
+                        }
                 for stale_key in set(station_state) - set(station_groups):
                     station_state.pop(stale_key, None)
                 event_refresh_at = now_mono + 300
                 LOGGER.info("weatherrecord event cache refreshed events=%s station_groups=%s", len(event_cache), len(station_groups))
 
             for group_key, group in station_groups.items():
-                state = station_state.setdefault(group_key, {"next_timing_refresh_at": 0.0})
+                state = station_state.setdefault(group_key, {"next_timing_refresh_at": now_mono})
                 if now_mono < float(state.get("next_timing_refresh_at", 0.0)):
                     continue
                 city = str(group["city"])
@@ -5098,6 +5349,23 @@ def weather_record_supervisor(config: dict[str, Any]) -> None:
                 in_window, timing = in_station_report_window(config, str(group["city"]), str(group["station"]))
                 if in_window:
                     window_groups.append((group_key, group, timing))
+            active_tgftp_keys: set[str] = set()
+            eligible_tgftp_groups = []
+            now_utc = datetime.now(timezone.utc)
+            for group_key, group, timing in window_groups:
+                expected_dt = parse_optional_utc_datetime(timing.get("expected_next_obs_utc"))
+                if expected_dt is None:
+                    continue
+                window_key = f"{group['city']}:{group['station']}:{expected_dt.isoformat()}"
+                active_tgftp_keys.add(window_key)
+                state = tgftp_window_state.setdefault(window_key, {"done": False, "attempts": 0})
+                if state.get("done"):
+                    continue
+                if now_utc < expected_dt + timedelta(seconds=tgftp_start_delay_seconds):
+                    continue
+                eligible_tgftp_groups.append((window_key, group, timing, expected_dt))
+            for stale_key in set(tgftp_window_state) - active_tgftp_keys:
+                tgftp_window_state.pop(stale_key, None)
 
             if window_groups and now_mono >= next_api_poll_at:
                 rows = weather_record_rows(config)
@@ -5163,9 +5431,40 @@ def weather_record_supervisor(config: dict[str, Any]) -> None:
                             LOGGER.exception("weatherrecord event failed city=%s kind=%s station=%s", city, kind, station)
                 next_api_poll_at = now_mono + api_poll_seconds
 
+            if eligible_tgftp_groups and now_mono >= next_tgftp_poll_at:
+                idx = tgftp_round_robin_index % len(eligible_tgftp_groups)
+                window_key, group, timing, expected_dt = eligible_tgftp_groups[idx]
+                tgftp_round_robin_index += 1
+                station = str(group["station"])
+                state = tgftp_window_state.setdefault(window_key, {"done": False, "attempts": 0})
+                state["attempts"] = int(state.get("attempts", 0)) + 1
+                try:
+                    obs = tgftp_metar_observation(station)
+                    if obs and isinstance(obs.get("obs_dt"), datetime):
+                        obs_dt = obs["obs_dt"].astimezone(timezone.utc)
+                        LOGGER.info(
+                            "tgftp window poll city=%s station=%s expected_obs_utc=%s obs_utc=%s attempts=%s",
+                            group.get("city"),
+                            station,
+                            expected_dt.isoformat(),
+                            obs_dt.isoformat(),
+                            state["attempts"],
+                        )
+                        if obs_dt >= expected_dt:
+                            process_tgftp_window_observation(config, group, timing, obs)
+                            state["done"] = True
+                    else:
+                        LOGGER.info("tgftp window poll no observation city=%s station=%s attempts=%s", group.get("city"), station, state["attempts"])
+                except Exception:
+                    LOGGER.exception("tgftp window poll failed city=%s station=%s attempts=%s", group.get("city"), station, state.get("attempts"))
+                next_tgftp_poll_at = now_mono + tgftp_min_interval_seconds
+
             sleep_seconds = fallback_poll_seconds
             if window_groups:
-                sleep_seconds = max(0.25, next_api_poll_at - time.monotonic())
+                next_window_wakeup = next_api_poll_at
+                if eligible_tgftp_groups:
+                    next_window_wakeup = min(next_window_wakeup, next_tgftp_poll_at)
+                sleep_seconds = max(0.25, next_window_wakeup - time.monotonic())
             elif station_groups:
                 next_timing = min((float(s.get("next_timing_refresh_at", now_mono + fallback_poll_seconds)) for s in station_state.values()), default=now_mono + fallback_poll_seconds)
                 sleep_seconds = min(fallback_poll_seconds, max(1.0, next_timing - now_mono), max(1.0, event_refresh_at - now_mono))
@@ -5178,6 +5477,80 @@ def weather_record_supervisor(config: dict[str, Any]) -> None:
 def start_weather_record_thread(config: dict[str, Any]) -> threading.Thread:
     """Start the weatherrecord polling supervisor in a daemon thread."""
     thread = threading.Thread(target=weather_record_supervisor, args=(config,), name="deterministic-weatherrecord", daemon=True)
+    thread.start()
+    return thread
+
+
+def twc_verification_group_key(trade: PaperTrade) -> str:
+    """Build a station/date key so TWC verification can be staggered by airport."""
+    station = (trade.forecast_station or "").upper()
+    if not station:
+        station = f"trade:{trade.trade_id}"
+    return f"{trade.city}:{station}:{trade.event_date}"
+
+
+def trade_needs_twc_verification(config: dict[str, Any], trade: PaperTrade) -> bool:
+    """Return whether an open trade should participate in staggered TWC verification."""
+    if trade.status not in {"OPEN", "HEDGED"} or trade.strategy != str(config["trading"]["strategy_name"]):
+        return False
+    source_text = (trade.forecast_source or "").lower()
+    return any(token in source_text for token in ("metar", "weatherrecord_api", "tgftp"))
+
+
+def twc_verification_supervisor(config: dict[str, Any]) -> None:
+    """Verify open positions with TWC on staggered per-airport schedules."""
+    settings = config.get("price_momentum", {})
+    interval = max(60, int(settings.get("twc_verify_interval_seconds", int(config["scheduler"].get("poll_interval_minutes", 15)) * 60)))
+    stagger_seconds = max(1, int(settings.get("twc_verify_stagger_seconds", min(300, interval))))
+    tick_seconds = max(1, int(settings.get("twc_verify_scheduler_tick_seconds", 10)))
+    LOGGER.info(
+        "twc verification supervisor started interval_seconds=%s stagger_seconds=%s tick_seconds=%s",
+        interval,
+        stagger_seconds,
+        tick_seconds,
+    )
+    while True:
+        try:
+            now_mono = time.monotonic()
+            trades = read_trades(config["outputs"]["trades_csv"])
+            groups: dict[str, PaperTrade] = {}
+            for trade in trades:
+                if not trade_needs_twc_verification(config, trade):
+                    continue
+                groups.setdefault(twc_verification_group_key(trade), trade)
+            for stale_key in set(TWC_VERIFY_NEXT_AT) - set(groups):
+                TWC_VERIFY_NEXT_AT.pop(stale_key, None)
+            for group_key, sample_trade in sorted(groups.items()):
+                if group_key not in TWC_VERIFY_NEXT_AT:
+                    TWC_VERIFY_NEXT_AT[group_key] = now_mono + stable_stagger_seconds(f"{group_key}:twc_verify", min(stagger_seconds, interval))
+                if now_mono < TWC_VERIFY_NEXT_AT[group_key]:
+                    continue
+                station = (sample_trade.forecast_station or "").upper()
+                LOGGER.info(
+                    "twc staggered verification due group=%s city=%s station=%s event_date=%s",
+                    group_key,
+                    sample_trade.city,
+                    station,
+                    sample_trade.event_date,
+                )
+                verify_open_positions_with_twc(
+                    config,
+                    {
+                        "source": "staggered_twc_position_verification",
+                        "city": sample_trade.city,
+                        "station": station,
+                        "event_date": sample_trade.event_date,
+                    },
+                )
+                TWC_VERIFY_NEXT_AT[group_key] = now_mono + interval
+        except Exception:
+            LOGGER.exception("twc verification supervisor loop failed")
+        time.sleep(tick_seconds)
+
+
+def start_twc_verification_thread(config: dict[str, Any]) -> threading.Thread:
+    """Start staggered TWC position verification in a daemon thread."""
+    thread = threading.Thread(target=twc_verification_supervisor, args=(config,), name="deterministic-twc-verify", daemon=True)
     thread.start()
     return thread
 
@@ -5262,19 +5635,15 @@ def run(config: dict[str, Any]) -> None:
     """
     cycle_num = 0
     max_cycles = int(config["scheduler"].get("max_cycles", 0))
-    last_twc_verify_ts = 0.0
     LOGGER.info("bot started config=%s", json.dumps(redacted_config(config), ensure_ascii=False, sort_keys=True))
     start_live_trader(config)
     sync_polymarket_positions_to_disk(config, reason="start")
     start_weather_record_thread(config)
+    start_twc_verification_thread(config)
     try:
         while True:
             cycle_num += 1
             if config["scheduler"].get("settle_after_each_cycle", True):
-                twc_interval = max(60, int(config.get("price_momentum", {}).get("twc_verify_interval_seconds", int(config["scheduler"].get("poll_interval_minutes", 15)) * 60)))
-                if time.time() - last_twc_verify_ts >= twc_interval:
-                    verify_open_positions_with_twc(config, {"source": "scheduled_twc_position_verification"})
-                    last_twc_verify_ts = time.time()
                 settle_open_trades(config)
                 summarize_settled(config)
             write_state(config, cycle_num)

@@ -76,7 +76,7 @@
                     "weather_record_timing_refresh_seconds":  60,
                     "weather_record_timing_stagger_seconds":  60,
                     "tgftp_window_start_delay_seconds":  120,
-                    "tgftp_window_poll_min_interval_seconds":  0.5,
+                    "tgftp_window_poll_min_interval_seconds":  0.05,
                     "allowed_cities":  [
                                            "Atlanta",
                                            "Austin",
@@ -97,7 +97,8 @@
                     "live_order_check_seconds":  1,
                     "depth_price_notional_multiplier":  2.0,
                     "depth_price_extra_levels":  1,
-                    "weather_record_pre_window_seconds":  120
+                    "weather_record_pre_window_seconds":  120,
+                    "tgftp_window_max_inflight_per_station":  10
                 },
     "scheduler":  {
                       "poll_interval_minutes":  15,
@@ -149,6 +150,10 @@
                                                        ],
                            "no_max_price":  0.99,
                            "yes_max_price":  0.99,
+                           "clob_poll_enabled":  true,
+                           "clob_poll_interval_seconds":  0.025,
+                           "clob_no_change_pct":  0.1,
+                           "clob_poll_max_inflight_per_market":  32,
                            "tgftp_verify_interval_seconds":  10,
                            "tgftp_verify_timeout_seconds":  180,
                            "twc_verify_interval_seconds":  900,
@@ -182,7 +187,7 @@
                                            "weather_record_timing_refresh_seconds":  60,
                                            "weather_record_timing_stagger_seconds":  60,
                                            "tgftp_window_start_delay_seconds":  120,
-                                           "tgftp_window_poll_min_interval_seconds":  0.5,
+                                           "tgftp_window_poll_min_interval_seconds":  0.05,
                                            "allowed_cities":  [
                                                                   "Atlanta",
                                                                   "Austin",
@@ -201,7 +206,8 @@
                                            "live_trading_dry_run":  false,
                                            "live_order_timeout_seconds":  20,
                                            "live_order_check_seconds":  1,
-                                           "weather_record_pre_window_seconds":  120
+                                           "weather_record_pre_window_seconds":  120,
+                                           "tgftp_window_max_inflight_per_station":  10
                                        }
                        }
                    ]

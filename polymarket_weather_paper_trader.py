@@ -71,6 +71,8 @@ WEBSOCKET_ASSET_REFRESH_THREADS: list[threading.Thread] = []
 WEATHER_RECORD_POINTS_BY_STATION_EVENT: dict[tuple[str, str], dict[str, tuple[datetime, float]]] = {}
 TWC_VERIFY_NEXT_AT: dict[str, float] = {}
 HTTP_EXECUTOR = concurrent.futures.ThreadPoolExecutor(max_workers=8, thread_name_prefix="weather-http")
+TGFTP_EXECUTOR = concurrent.futures.ThreadPoolExecutor(max_workers=32, thread_name_prefix="tgftp-http")
+CLOB_POLL_EXECUTOR = concurrent.futures.ThreadPoolExecutor(max_workers=32, thread_name_prefix="clob-poll")
 TWC_VERIFY_EXECUTOR = concurrent.futures.ThreadPoolExecutor(max_workers=3, thread_name_prefix="twc-verify")
 
 
@@ -306,7 +308,8 @@ def default_config() -> dict[str, Any]:
         "weather_record_timing_refresh_seconds": 60,
         "weather_record_timing_stagger_seconds": 60,
         "tgftp_window_start_delay_seconds": 120,
-        "tgftp_window_poll_min_interval_seconds": 0.5,
+        "tgftp_window_poll_min_interval_seconds": 0.05,
+        "tgftp_window_max_inflight_per_station": 10,
         "allowed_cities": allowed,
         "websocket_enabled": False,
         "live_trading_enabled": False,
@@ -372,6 +375,10 @@ def default_config() -> dict[str, Any]:
             "price_window_record_seconds": 300,
             "no_max_price": 0.99,
             "yes_max_price": 0.99,
+            "clob_poll_enabled": True,
+            "clob_poll_interval_seconds": 0.025,
+            "clob_no_change_pct": 0.10,
+            "clob_poll_max_inflight_per_market": 32,
             "tgftp_verify_interval_seconds": 10,
             "tgftp_verify_timeout_seconds": 180,
             "twc_verify_interval_seconds": 900,
@@ -602,6 +609,13 @@ def http_get_json(url: str, params: Optional[dict[str, Any]], timeout: int) -> A
     return r.json()
 
 
+def http_post_json(url: str, payload: Any, timeout: int) -> Any:
+    """Perform an HTTP POST request with JSON and parse the response body as JSON."""
+    r = requests.post(url, headers={**HEADERS, "Content-Type": "application/json"}, json=payload, timeout=timeout)
+    r.raise_for_status()
+    return r.json()
+
+
 def http_get_text(url: str, timeout: int) -> str:
     """Perform an HTTP GET request and return the response body as text.
     
@@ -683,6 +697,12 @@ def clob_get(config: dict[str, Any], path: str, params: Optional[dict[str, Any]]
     """
     base = str(config["api"].get("polymarket_clob_base") or "https://clob.polymarket.com").rstrip("/")
     return http_get_json(f"{base}{path}", params, int(config["api"]["request_timeout_seconds"]))
+
+
+def clob_post(config: dict[str, Any], path: str, payload: Any) -> Any:
+    """Call the Polymarket CLOB API with a JSON POST body."""
+    base = str(config["api"].get("polymarket_clob_base") or "https://clob.polymarket.com").rstrip("/")
+    return http_post_json(f"{base}{path}", payload, int(config["api"]["request_timeout_seconds"]))
 
 
 def configured_polymarket_user(config: dict[str, Any]) -> str:
@@ -1382,6 +1402,49 @@ def best_buy_price(config: dict[str, Any], market: TemperatureMarket, side: str)
         return None
 
 
+def clob_asset_buy_price(config: dict[str, Any], asset_id: str) -> Optional[float]:
+    """Return a direct executable buy price for one CLOB asset id."""
+    if not asset_id:
+        return None
+    try:
+        target_notional = depth_target_notional(config)
+        extra_levels = depth_extra_levels(config)
+        _, asks = clob_book_levels(config, asset_id)
+        depth_price = price_for_buy_notional(asks, target_notional, extra_levels)
+        if depth_price is not None:
+            return depth_price
+        ask_prices = [price for price, _ in asks]
+        return min(ask_prices) if ask_prices else None
+    except Exception:
+        LOGGER.exception("clob asset buy query failed asset=%s", asset_id)
+        return None
+
+
+def clob_asset_sell_prices(config: dict[str, Any], asset_ids: list[str]) -> dict[str, Optional[float]]:
+    """Batch query best ask prices for CLOB asset ids via /prices SELL."""
+    unique_assets = list(dict.fromkeys(str(asset_id or "") for asset_id in asset_ids if str(asset_id or "")))
+    if not unique_assets:
+        return {}
+    payload = [{"token_id": asset_id, "side": "SELL"} for asset_id in unique_assets]
+    try:
+        raw = clob_post(config, "/prices", payload)
+    except Exception:
+        LOGGER.exception("clob batch prices query failed assets=%s", len(unique_assets))
+        return {asset_id: None for asset_id in unique_assets}
+    if not isinstance(raw, dict):
+        return {asset_id: None for asset_id in unique_assets}
+    prices: dict[str, Optional[float]] = {}
+    for asset_id in unique_assets:
+        value = raw.get(asset_id)
+        if isinstance(value, dict):
+            value = value.get("SELL") or value.get("sell")
+        try:
+            prices[asset_id] = float(value) if value not in (None, "") else None
+        except (TypeError, ValueError):
+            prices[asset_id] = None
+    return prices
+
+
 def best_sell_price(config: dict[str, Any], market: TemperatureMarket, side: str) -> Optional[float]:
     """Return the best currently executable sell price for a YES/NO market side.
     
@@ -1453,6 +1516,75 @@ def deterministic_market_impossible(market: TemperatureMarket, kind: str, observ
     if kind == "Highest":
         return observed_high is not None and hi is not None and float(observed_high) > hi
     return observed_low is not None and lo is not None and float(observed_low) < lo
+
+
+def deterministic_impossible_markets_by_proximity(
+    markets: list[TemperatureMarket],
+    kind: str,
+    observed_high: Optional[float],
+    observed_low: Optional[float],
+    unit: str,
+) -> list[TemperatureMarket]:
+    """Return impossible markets ordered from nearest to the observed extreme outward."""
+    normalized_kind = kind.strip()
+    candidates: list[tuple[float, float, str, TemperatureMarket]] = []
+    for market in markets:
+        if market.closed or not deterministic_market_impossible(market, normalized_kind, observed_high, observed_low, unit):
+            continue
+        lo, hi, _ = comparable_rule_bounds(market, unit)
+        if normalized_kind == "Highest":
+            if observed_high is None or hi is None:
+                continue
+            distance = float(observed_high) - float(hi)
+            width = (float(hi) - float(lo)) if lo is not None else 9999.0
+        else:
+            if observed_low is None or lo is None:
+                continue
+            distance = float(lo) - float(observed_low)
+            width = (float(hi) - float(lo)) if hi is not None else 9999.0
+        candidates.append((distance, width, market.market_id, market))
+    return [market for _, _, _, market in sorted(candidates, key=lambda item: (item[0], item[1], item[2]))]
+
+
+def adjacent_no_momentum_market(
+    markets: list[TemperatureMarket],
+    kind: str,
+    observed_high: Optional[float],
+    observed_low: Optional[float],
+    unit: str,
+) -> Optional[TemperatureMarket]:
+    """Pick the nearest NO market to watch for active CLOB momentum."""
+    impossible = deterministic_impossible_markets_by_proximity(markets, kind, observed_high, observed_low, unit)
+    if impossible:
+        return impossible[0]
+    ordered = sorted_markets_for_unit(markets, unit)
+    if not ordered:
+        return None
+    normalized_kind = kind.strip()
+    candidates: list[tuple[float, float, str, TemperatureMarket]] = []
+    if normalized_kind == "Highest":
+        if observed_high is None:
+            return ordered[0]
+        for market in ordered:
+            lo, hi, _ = comparable_rule_bounds(market, unit)
+            if hi is None or float(hi) < float(observed_high):
+                continue
+            distance = float(hi) - float(observed_high)
+            width = (float(hi) - float(lo)) if lo is not None else 9999.0
+            candidates.append((distance, width, market.market_id, market))
+    else:
+        if observed_low is None:
+            return ordered[-1]
+        for market in ordered:
+            lo, hi, _ = comparable_rule_bounds(market, unit)
+            if lo is None or float(lo) > float(observed_low):
+                continue
+            distance = float(observed_low) - float(lo)
+            width = (float(hi) - float(lo)) if hi is not None else 9999.0
+            candidates.append((distance, width, market.market_id, market))
+    if not candidates:
+        return ordered[0] if normalized_kind == "Highest" else ordered[-1]
+    return sorted(candidates, key=lambda item: (item[0], item[1], item[2]))[0][3]
 
 
 def deterministic_no_possible_again(market: TemperatureMarket, kind: str, observed_high: Optional[float], observed_low: Optional[float], unit: str) -> bool:
@@ -3278,6 +3410,20 @@ def open_trade_exists(trades: list[PaperTrade], strategy_name: str, market_id: s
     return any(t.status in active_statuses and t.strategy == strategy_name and t.market_id == market_id and (t.position_side or "YES").upper() == side.upper() for t in trades)
 
 
+def open_no_trade_exists_for_event(trades: list[PaperTrade], strategy_name: str, city: str, kind: str, event_date: str) -> bool:
+    """Check whether an event already has an active NO trade."""
+    active_statuses = {"OPEN", "BUY_PENDING", "SELL_PENDING"}
+    return any(
+        t.status in active_statuses
+        and t.strategy == strategy_name
+        and t.city == city
+        and t.kind == kind
+        and t.event_date == event_date
+        and (t.position_side or "YES").upper() == "NO"
+        for t in trades
+    )
+
+
 def safe_float(value: Any, default: float = 0.0) -> float:
     """Parse a numeric value with a default fallback on invalid input.
     
@@ -3820,11 +3966,9 @@ def process_deterministic_harvest(config: dict[str, Any], trigger_context: dict[
             LOGGER.info("metar skip_buy_yes_price_too_high city=%s kind=%s market=%s yes_clob_buy_price=%s max=%s observed_high=%s observed_low=%s", city, kind, extreme_market.market_id, price, yes_max, observed_high, observed_low)
 
     if not extreme_reached:
-        for market in ordered:
-            if not deterministic_market_impossible(market, kind, observed_high, observed_low, event_unit):
-                continue
-            if open_trade_exists(trades + new_trades, strategy_name, market.market_id, "NO"):
-                continue
+        impossible_markets = deterministic_impossible_markets_by_proximity(markets, kind, observed_high, observed_low, event_unit)
+        market = next((candidate for candidate in impossible_markets if not open_trade_exists(trades + new_trades, strategy_name, candidate.market_id, "NO")), None)
+        if market:
             no_price = best_buy_price(config, market, "NO")
             if no_price is None or no_price <= 0:
                 LOGGER.info(
@@ -3836,8 +3980,7 @@ def process_deterministic_harvest(config: dict[str, Any], trigger_context: dict[
                     observed_low,
                     market.market_question,
                 )
-                continue
-            if no_price > no_max:
+            elif no_price > no_max:
                 LOGGER.info(
                     "metar skip_buy_no_price_too_high city=%s kind=%s market=%s no_clob_buy_price=%s max=%s observed_high=%s observed_low=%s question=%r",
                     city,
@@ -3849,20 +3992,21 @@ def process_deterministic_harvest(config: dict[str, Any], trigger_context: dict[
                     observed_low,
                     market.market_question,
                 )
-                continue
-            trade = (
-                live_trader.submit_buy_trade(config, cycle_id, market, wu_source, station, "NO", no_price, observed_high, observed_low, f"{signal_source}_impossible_no")
-                if live_trader
-                else make_trade(config, cycle_id, market, wu_source, station, "NO", no_price, observed_high, observed_low, f"{signal_source}_impossible_no")
-            )
-            if trade:
-                new_trades.append(trade)
-                changed = True
-                if not live_trader:
-                    notify_trade(config, trade, "BUY", "FILLED", f"{signal_source}_impossible_no")
-                    post_buy_validation_requests.append((trade.trade_id, station, validation_min_obs_utc))
-                LOGGER.info("metar buy_no city=%s kind=%s market=%s no_price=%s observed_high=%s observed_low=%s status=%s", city, kind, market.market_id, no_price, observed_high, observed_low, trade.status)
-            break
+            else:
+                trade = (
+                    live_trader.submit_buy_trade(config, cycle_id, market, wu_source, station, "NO", no_price, observed_high, observed_low, f"{signal_source}_impossible_no")
+                    if live_trader
+                    else make_trade(config, cycle_id, market, wu_source, station, "NO", no_price, observed_high, observed_low, f"{signal_source}_impossible_no")
+                )
+                if trade:
+                    new_trades.append(trade)
+                    changed = True
+                    if not live_trader:
+                        notify_trade(config, trade, "BUY", "FILLED", f"{signal_source}_impossible_no")
+                        post_buy_validation_requests.append((trade.trade_id, station, validation_min_obs_utc))
+                    LOGGER.info("metar buy_no city=%s kind=%s market=%s no_price=%s observed_high=%s observed_low=%s status=%s", city, kind, market.market_id, no_price, observed_high, observed_low, trade.status)
+        else:
+            LOGGER.info("metar skip_buy_no_no_impossible_candidate city=%s kind=%s observed_high=%s observed_low=%s", city, kind, observed_high, observed_low)
 
     if new_trades:
         trades.extend(new_trades)
@@ -3937,7 +4081,7 @@ def process_price_momentum_buy(config: dict[str, Any], context: dict[str, Any]) 
         }
         PRICE_MOMENTUM_WINDOWS[momentum_key] = window
     base_price = float(window.get("base_price") or previous_price)
-    move_fraction = float(settings.get("move_to_one_fraction", settings.get("yes_change_pct" if side == "YES" else "no_change_pct", 0.30)))
+    move_fraction = float(context.get("move_fraction", settings.get("move_to_one_fraction", settings.get("yes_change_pct" if side == "YES" else "no_change_pct", 0.30))))
     target_price = momentum_target_price(base_price, move_fraction)
     if price < target_price:
         LOGGER.info(
@@ -5298,27 +5442,40 @@ def weather_record_supervisor(config: dict[str, Any]) -> None:
     timing_refresh_seconds = max(10, int(config["trading"].get("weather_record_timing_refresh_seconds", 60)))
     timing_stagger_seconds = max(1, int(config["trading"].get("weather_record_timing_stagger_seconds", timing_refresh_seconds)))
     tgftp_start_delay_seconds = max(0, int(config["trading"].get("tgftp_window_start_delay_seconds", 90)))
-    tgftp_min_interval_seconds = max(0.5, float(config["trading"].get("tgftp_window_poll_min_interval_seconds", 0.5)))
+    tgftp_min_interval_seconds = max(0.01, float(config["trading"].get("tgftp_window_poll_min_interval_seconds", 0.05)))
+    tgftp_max_inflight = max(1, int(config["trading"].get("tgftp_window_max_inflight_per_station", 10)))
+    price_momentum_settings = config.get("price_momentum", {})
+    clob_poll_enabled = bool(price_momentum_settings.get("clob_poll_enabled", True))
+    clob_poll_interval_seconds = max(0.01, float(price_momentum_settings.get("clob_poll_interval_seconds", 0.025)))
+    clob_no_change_fraction = max(0.0, float(price_momentum_settings.get("clob_no_change_pct", 0.10)))
+    clob_max_inflight = max(1, int(price_momentum_settings.get("clob_poll_max_inflight_per_market", 32)))
     event_cache: list[dict[str, Any]] = []
     station_groups: dict[tuple[str, str], dict[str, Any]] = {}
     station_state: dict[tuple[str, str], dict[str, Any]] = {}
     awc_timing_pending: dict[tuple[str, str], dict[str, Any]] = {}
     tgftp_window_state: dict[str, dict[str, Any]] = {}
     tgftp_pending: dict[str, dict[str, Any]] = {}
+    clob_momentum_state: dict[str, dict[str, Any]] = {}
+    clob_momentum_pending: dict[str, dict[str, Any]] = {}
     event_state: dict[tuple[str, str, str], dict[str, Any]] = {}
     event_refresh_at = 0.0
     next_api_poll_at = 0.0
     weather_record_pending: Optional[dict[str, Any]] = None
     next_tgftp_poll_at = 0.0
-    tgftp_round_robin_index = 0
+    next_clob_poll_at = 0.0
     LOGGER.info(
-        "weatherrecord supervisor started api_poll_seconds=%s pre_window_seconds=%s timing_refresh_seconds=%s timing_stagger_seconds=%s tgftp_start_delay_seconds=%s tgftp_min_interval_seconds=%s fallback_poll_seconds=%s",
+        "weatherrecord supervisor started api_poll_seconds=%s pre_window_seconds=%s timing_refresh_seconds=%s timing_stagger_seconds=%s tgftp_start_delay_seconds=%s tgftp_min_interval_seconds=%s tgftp_max_inflight=%s clob_poll_enabled=%s clob_poll_interval_seconds=%s clob_no_change_fraction=%s clob_max_inflight=%s fallback_poll_seconds=%s",
         api_poll_seconds,
         pre_window_seconds,
         timing_refresh_seconds,
         timing_stagger_seconds,
         tgftp_start_delay_seconds,
         tgftp_min_interval_seconds,
+        tgftp_max_inflight,
+        clob_poll_enabled,
+        clob_poll_interval_seconds,
+        clob_no_change_fraction,
+        clob_max_inflight,
         fallback_poll_seconds,
     )
     while True:
@@ -5345,13 +5502,16 @@ def weather_record_supervisor(config: dict[str, Any]) -> None:
                 future = pending["future"]
                 if not future.done():
                     continue
+                window_key = str(pending["window_key"])
                 group = pending["group"]
                 station = str(group["station"])
-                state = tgftp_window_state.setdefault(done_key, {"done": False, "attempts": 0})
+                state = tgftp_window_state.setdefault(window_key, {"done": False, "attempts": 0, "next_poll_at": now_mono})
                 try:
                     obs = future.result()
                     expected_dt = pending["expected_dt"]
-                    if obs and isinstance(obs.get("obs_dt"), datetime):
+                    if state.get("done"):
+                        pass
+                    elif obs and isinstance(obs.get("obs_dt"), datetime):
                         obs_dt = obs["obs_dt"].astimezone(timezone.utc)
                         LOGGER.info(
                             "tgftp window poll completed city=%s station=%s expected_obs_utc=%s obs_utc=%s attempts=%s",
@@ -5369,6 +5529,105 @@ def weather_record_supervisor(config: dict[str, Any]) -> None:
                 except Exception:
                     LOGGER.exception("tgftp window poll task failed city=%s station=%s attempts=%s", group.get("city"), station, state.get("attempts"))
                 tgftp_pending.pop(done_key, None)
+            for done_key, pending in list(clob_momentum_pending.items()):
+                future = pending["future"]
+                if not future.done():
+                    continue
+                try:
+                    price_by_asset = future.result()
+                    if not isinstance(price_by_asset, dict):
+                        price_by_asset = {}
+                    trades = read_trades(config["outputs"]["trades_csv"])
+                    for item in pending.get("items", []):
+                        window_key = str(item["window_key"])
+                        state = clob_momentum_state.setdefault(window_key, {})
+                        city = str(item.get("city") or "")
+                        kind = str(item.get("kind") or "")
+                        event_date = str(item.get("event_date") or "")
+                        market = item.get("market")
+                        asset_id = str(item.get("asset_id") or "")
+                        price = price_by_asset.get(asset_id)
+                        if open_no_trade_exists_for_event(trades, str(config["trading"]["strategy_name"]), city, kind, event_date):
+                            state["done"] = True
+                        elif state.get("done"):
+                            pass
+                        elif price is None or float(price) <= 0:
+                            LOGGER.info("clob momentum poll no_price city=%s kind=%s station=%s market=%s attempts=%s", city, kind, item.get("station"), item.get("market_id"), state.get("attempts"))
+                        elif not state.get("base_price"):
+                            base_price = float(price)
+                            state["base_price"] = base_price
+                            state["target_price"] = momentum_target_price(base_price, clob_no_change_fraction)
+                            state["base_at_utc"] = datetime.now(timezone.utc).isoformat(timespec="milliseconds")
+                            LOGGER.info(
+                                "clob momentum baseline city=%s kind=%s station=%s market=%s base_price=%s target_price=%s delta=%s expected_obs_utc=%s question=%r",
+                                city,
+                                kind,
+                                item.get("station"),
+                                item.get("market_id"),
+                                base_price,
+                                state["target_price"],
+                                clob_no_change_fraction,
+                                item.get("expected_obs_utc"),
+                                market.market_question if isinstance(market, TemperatureMarket) else "",
+                            )
+                        else:
+                            base_price = float(state["base_price"])
+                            target_price = float(state.get("target_price") or momentum_target_price(base_price, clob_no_change_fraction))
+                            current_price = float(price)
+                            if current_price >= target_price:
+                                LOGGER.info(
+                                    "clob momentum trigger city=%s kind=%s station=%s market=%s base_price=%s price=%s target_price=%s delta=%s expected_obs_utc=%s",
+                                    city,
+                                    kind,
+                                    item.get("station"),
+                                    item.get("market_id"),
+                                    base_price,
+                                    current_price,
+                                    target_price,
+                                    clob_no_change_fraction,
+                                    item.get("expected_obs_utc"),
+                                )
+                                context = {
+                                    "role": "temperature_market",
+                                    "position_side": "NO",
+                                    "price": current_price,
+                                    "previous_price": base_price,
+                                    "price_field": "clob_no_buy_price",
+                                    "city": city,
+                                    "kind": kind,
+                                    "event_date": event_date,
+                                    "polymarket_url": item.get("polymarket_url"),
+                                    "station": item.get("station"),
+                                    "market_id": item.get("market_id"),
+                                    "asset_id": asset_id,
+                                    "momentum_key": f"clob:{window_key}",
+                                    "move_fraction": clob_no_change_fraction,
+                                }
+                                PRICE_MOMENTUM_WINDOWS[str(context["momentum_key"])] = {
+                                    "expected_next_obs_utc": item.get("expected_obs_utc"),
+                                    "base_price": base_price,
+                                    "created_at": state.get("base_at_utc") or datetime.now(timezone.utc).isoformat(timespec="milliseconds"),
+                                    "source": "active_clob_poll",
+                                    "price_field": "clob_no_buy_price",
+                                }
+                                trade = process_price_momentum_buy(config, context)
+                                if trade:
+                                    state["done"] = True
+                            else:
+                                LOGGER.info(
+                                    "clob momentum below_target city=%s kind=%s station=%s market=%s base_price=%s price=%s target_price=%s expected_obs_utc=%s",
+                                    city,
+                                    kind,
+                                    item.get("station"),
+                                    item.get("market_id"),
+                                    base_price,
+                                    current_price,
+                                    target_price,
+                                    item.get("expected_obs_utc"),
+                                )
+                except Exception:
+                    LOGGER.exception("clob momentum batch poll task failed items=%s", len(pending.get("items", [])))
+                clob_momentum_pending.pop(done_key, None)
             if now_mono >= event_refresh_at:
                 event_cache = []
                 for target in resolve_event_target_dates(config):
@@ -5440,7 +5699,94 @@ def weather_record_supervisor(config: dict[str, Any]) -> None:
                 eligible_tgftp_groups.append((window_key, group, timing, expected_dt))
             for stale_key in set(tgftp_window_state) - active_tgftp_keys:
                 tgftp_window_state.pop(stale_key, None)
-                tgftp_pending.pop(stale_key, None)
+                for request_key, pending in list(tgftp_pending.items()):
+                    if pending.get("window_key") == stale_key:
+                        tgftp_pending.pop(request_key, None)
+
+            active_clob_keys: set[str] = set()
+            eligible_clob_groups: list[tuple[str, dict[str, Any]]] = []
+            if clob_poll_enabled and window_groups:
+                trades_snapshot = read_trades(config["outputs"]["trades_csv"])
+                strategy_name = str(config["trading"]["strategy_name"])
+                for _, group, timing in window_groups:
+                    city = str(group["city"])
+                    station = str(group["station"])
+                    expected_obs_utc = str(timing.get("expected_next_obs_utc") or "")
+                    if not expected_obs_utc:
+                        continue
+                    for event in list(group["events"]):
+                        kind = str(event["_parsed_kind"])
+                        event_date = str(event["_parsed_event_date"])
+                        event_url = poly_url_from_event(event)
+                        window_key = f"{city}:{station}:{kind}:{event_date}:{expected_obs_utc}:clob_no"
+                        active_clob_keys.add(window_key)
+                        state = clob_momentum_state.setdefault(window_key, {"done": False, "attempts": 0, "next_poll_at": now_mono})
+                        if state.get("done"):
+                            continue
+                        if open_no_trade_exists_for_event(trades_snapshot, strategy_name, city, kind, event_date):
+                            state["done"] = True
+                            continue
+                        observed_state = event_state.get((event_date, city, kind), EXTREMES_BY_EVENT.get((event_date, city, kind), {}))
+                        observed_high = observed_state.get("observed_high", observed_state.get("aviation_high"))
+                        observed_low = observed_state.get("observed_low", observed_state.get("aviation_low"))
+                        observed_high = float(observed_high) if observed_high is not None else None
+                        observed_low = float(observed_low) if observed_low is not None else None
+                        observed_signature = f"{observed_high}:{observed_low}"
+                        if state.get("observed_signature") != observed_signature or not isinstance(state.get("market"), TemperatureMarket):
+                            try:
+                                markets = markets_for_event(config, event)
+                                event_unit = event_market_unit(markets)
+                                market = adjacent_no_momentum_market(markets, kind, observed_high, observed_low, event_unit)
+                            except Exception:
+                                LOGGER.exception("clob momentum candidate failed city=%s kind=%s station=%s event_date=%s", city, kind, station, event_date)
+                                continue
+                            if not market:
+                                state["done"] = True
+                                LOGGER.info("clob momentum skip no_candidate city=%s kind=%s station=%s event_date=%s", city, kind, station, event_date)
+                                continue
+                            asset_id = asset_id_for_market_side(market, "NO")
+                            if not asset_id:
+                                state["done"] = True
+                                LOGGER.info("clob momentum skip no_asset city=%s kind=%s station=%s market=%s", city, kind, station, market.market_id)
+                                continue
+                            state.update(
+                                {
+                                    "city": city,
+                                    "kind": kind,
+                                    "event_date": event_date,
+                                    "station": station,
+                                    "expected_obs_utc": expected_obs_utc,
+                                    "observed_signature": observed_signature,
+                                    "observed_high": observed_high,
+                                    "observed_low": observed_low,
+                                    "market": market,
+                                    "market_id": market.market_id,
+                                    "asset_id": asset_id,
+                                    "event_url": event_url,
+                                    "event_unit": event_unit,
+                                    "base_price": None,
+                                    "target_price": None,
+                                    "next_poll_at": now_mono,
+                                }
+                            )
+                            LOGGER.info(
+                                "clob momentum candidate city=%s kind=%s station=%s event_date=%s market=%s observed_high=%s observed_low=%s expected_obs_utc=%s question=%r",
+                                city,
+                                kind,
+                                station,
+                                event_date,
+                                market.market_id,
+                                observed_high,
+                                observed_low,
+                                expected_obs_utc,
+                                market.market_question,
+                            )
+                        eligible_clob_groups.append((window_key, state))
+            for stale_key in set(clob_momentum_state) - active_clob_keys:
+                clob_momentum_state.pop(stale_key, None)
+                for request_key, pending in list(clob_momentum_pending.items()):
+                    if stale_key in pending.get("window_keys", set()):
+                        clob_momentum_pending.pop(request_key, None)
 
             if weather_record_pending and weather_record_pending["future"].done():
                 pending_window_groups = weather_record_pending["window_groups"]
@@ -5519,31 +5865,126 @@ def weather_record_supervisor(config: dict[str, Any]) -> None:
                 LOGGER.info("weatherrecord poll queued active_windows=%s pre_window_seconds=%s", len(weather_record_groups), pre_window_seconds)
                 next_api_poll_at = now_mono + api_poll_seconds
 
-            if eligible_tgftp_groups and now_mono >= next_tgftp_poll_at:
-                idx = tgftp_round_robin_index % len(eligible_tgftp_groups)
-                window_key, group, timing, expected_dt = eligible_tgftp_groups[idx]
-                tgftp_round_robin_index += 1
-                if window_key in tgftp_pending:
-                    next_tgftp_poll_at = now_mono + tgftp_min_interval_seconds
-                    continue
-                station = str(group["station"])
-                state = tgftp_window_state.setdefault(window_key, {"done": False, "attempts": 0})
-                state["attempts"] = int(state.get("attempts", 0)) + 1
-                tgftp_pending[window_key] = {
-                    "future": HTTP_EXECUTOR.submit(tgftp_metar_observation, station),
-                    "group": group,
-                    "timing": timing,
-                    "expected_dt": expected_dt,
-                }
-                LOGGER.info("tgftp window poll queued city=%s station=%s expected_obs_utc=%s attempts=%s", group.get("city"), station, expected_dt.isoformat(), state["attempts"])
-                next_tgftp_poll_at = now_mono + tgftp_min_interval_seconds
+            next_tgftp_due = now_mono + fallback_poll_seconds
+            if eligible_tgftp_groups:
+                for window_key, group, timing, expected_dt in eligible_tgftp_groups:
+                    state = tgftp_window_state.setdefault(window_key, {"done": False, "attempts": 0, "next_poll_at": now_mono})
+                    if state.get("done"):
+                        continue
+                    window_next_poll_at = float(state.get("next_poll_at", now_mono))
+                    if now_mono < window_next_poll_at:
+                        next_tgftp_due = min(next_tgftp_due, window_next_poll_at)
+                        continue
+                    inflight = sum(1 for pending in tgftp_pending.values() if pending.get("window_key") == window_key)
+                    if inflight >= tgftp_max_inflight:
+                        state["next_poll_at"] = now_mono + tgftp_min_interval_seconds
+                        next_tgftp_due = min(next_tgftp_due, float(state["next_poll_at"]))
+                        continue
+                    station = str(group["station"])
+                    state["attempts"] = int(state.get("attempts", 0)) + 1
+                    request_key = f"{window_key}:{state['attempts']}:{time.time_ns()}"
+                    tgftp_pending[request_key] = {
+                        "window_key": window_key,
+                        "future": TGFTP_EXECUTOR.submit(tgftp_metar_observation, station),
+                        "group": group,
+                        "timing": timing,
+                        "expected_dt": expected_dt,
+                    }
+                    state["next_poll_at"] = now_mono + tgftp_min_interval_seconds
+                    next_tgftp_due = min(next_tgftp_due, float(state["next_poll_at"]))
+                    LOGGER.info(
+                        "tgftp window poll queued city=%s station=%s expected_obs_utc=%s attempts=%s inflight=%s interval_seconds=%s",
+                        group.get("city"),
+                        station,
+                        expected_dt.isoformat(),
+                        state["attempts"],
+                        inflight + 1,
+                        tgftp_min_interval_seconds,
+                    )
+                next_tgftp_poll_at = next_tgftp_due
+
+            next_clob_due = now_mono + fallback_poll_seconds
+            if eligible_clob_groups:
+                batch_items: list[dict[str, Any]] = []
+                batch_assets: list[str] = []
+                for window_key, state in eligible_clob_groups:
+                    if state.get("done"):
+                        continue
+                    window_next_poll_at = float(state.get("next_poll_at", now_mono))
+                    if now_mono < window_next_poll_at:
+                        next_clob_due = min(next_clob_due, window_next_poll_at)
+                        continue
+                    inflight = sum(1 for pending in clob_momentum_pending.values() if window_key in pending.get("window_keys", set()))
+                    if inflight >= clob_max_inflight:
+                        state["next_poll_at"] = now_mono + clob_poll_interval_seconds
+                        next_clob_due = min(next_clob_due, float(state["next_poll_at"]))
+                        continue
+                    market = state.get("market")
+                    if not isinstance(market, TemperatureMarket):
+                        state["done"] = True
+                        continue
+                    state["attempts"] = int(state.get("attempts", 0)) + 1
+                    asset_id = str(state.get("asset_id") or "")
+                    if not asset_id:
+                        state["done"] = True
+                        continue
+                    batch_items.append({
+                        "window_key": window_key,
+                        "city": state.get("city") or market.city,
+                        "kind": state.get("kind") or market.kind,
+                        "event_date": state.get("event_date") or market.event_date,
+                        "station": state.get("station"),
+                        "polymarket_url": state.get("event_url") or market.polymarket_url,
+                        "market": market,
+                        "market_id": market.market_id,
+                        "asset_id": asset_id,
+                        "expected_obs_utc": state.get("expected_obs_utc"),
+                    })
+                    batch_assets.append(asset_id)
+                    state["next_poll_at"] = now_mono + clob_poll_interval_seconds
+                    next_clob_due = min(next_clob_due, float(state["next_poll_at"]))
+                    LOGGER.info(
+                        "clob momentum poll staged city=%s kind=%s station=%s market=%s attempts=%s inflight=%s interval_seconds=%s base_price=%s target_price=%s",
+                        state.get("city") or market.city,
+                        state.get("kind") or market.kind,
+                        state.get("station"),
+                        market.market_id,
+                        state["attempts"],
+                        inflight + 1,
+                        clob_poll_interval_seconds,
+                        state.get("base_price"),
+                        state.get("target_price"),
+                    )
+                if batch_items:
+                    request_key = f"clob_batch:{len(batch_items)}:{time.time_ns()}"
+                    clob_momentum_pending[request_key] = {
+                        "future": CLOB_POLL_EXECUTOR.submit(clob_asset_sell_prices, config, batch_assets),
+                        "items": batch_items,
+                        "window_keys": {str(item["window_key"]) for item in batch_items},
+                    }
+                    LOGGER.info(
+                        "clob momentum batch poll queued items=%s unique_assets=%s interval_seconds=%s pending_batches=%s",
+                        len(batch_items),
+                        len(set(batch_assets)),
+                        clob_poll_interval_seconds,
+                        len(clob_momentum_pending),
+                    )
+                next_clob_poll_at = next_clob_due
 
             sleep_seconds = fallback_poll_seconds
             if window_groups or weather_record_groups:
-                next_window_wakeup = next_api_poll_at
+                wakeup_candidates = []
+                if weather_record_groups:
+                    wakeup_candidates.append(next_api_poll_at)
                 if eligible_tgftp_groups:
-                    next_window_wakeup = min(next_window_wakeup, next_tgftp_poll_at)
-                sleep_seconds = max(0.25, next_window_wakeup - time.monotonic())
+                    wakeup_candidates.append(next_tgftp_poll_at)
+                if eligible_clob_groups:
+                    wakeup_candidates.append(next_clob_poll_at)
+                if wakeup_candidates:
+                    min_sleep_seconds = 0.005 if eligible_clob_groups else 0.01 if eligible_tgftp_groups else 0.25
+                    sleep_seconds = max(min_sleep_seconds, min(wakeup_candidates) - time.monotonic())
+                else:
+                    sleep_seconds = 0.25
             elif station_groups:
                 next_timing = min((float(s.get("next_timing_refresh_at", now_mono + fallback_poll_seconds)) for s in station_state.values()), default=now_mono + fallback_poll_seconds)
                 sleep_seconds = min(fallback_poll_seconds, max(1.0, next_timing - now_mono), max(1.0, event_refresh_at - now_mono))

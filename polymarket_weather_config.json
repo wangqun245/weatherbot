@@ -47,7 +47,7 @@
                    "city_stations":  {
                                          "Atlanta":  "KATL",
                                          "Austin":  "KAUS",
-                                         "Chicago":  "KMDW",
+                                         "Chicago":  "KORD",
                                          "Dallas":  "KDAL",
                                          "Denver":  "KDEN",
                                          "Houston":  "KHOU",
@@ -96,7 +96,8 @@
                     "live_order_timeout_seconds":  20,
                     "live_order_check_seconds":  1,
                     "depth_price_notional_multiplier":  2.0,
-                    "depth_price_extra_levels":  1
+                    "depth_price_extra_levels":  1,
+                    "weather_record_pre_window_seconds":  120
                 },
     "scheduler":  {
                       "poll_interval_minutes":  15,
@@ -199,7 +200,8 @@
                                            "live_trading_enabled":  true,
                                            "live_trading_dry_run":  false,
                                            "live_order_timeout_seconds":  20,
-                                           "live_order_check_seconds":  1
+                                           "live_order_check_seconds":  1,
+                                           "weather_record_pre_window_seconds":  120
                                        }
                        }
                    ]

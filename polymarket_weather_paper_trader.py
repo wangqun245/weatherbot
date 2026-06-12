@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import argparse
 import atexit
+import concurrent.futures
 import csv
 import json
 import logging
@@ -69,6 +70,8 @@ WEBSOCKET_ASSET_REFRESH_LOCK = threading.RLock()
 WEBSOCKET_ASSET_REFRESH_THREADS: list[threading.Thread] = []
 WEATHER_RECORD_POINTS_BY_STATION_EVENT: dict[tuple[str, str], dict[str, tuple[datetime, float]]] = {}
 TWC_VERIFY_NEXT_AT: dict[str, float] = {}
+HTTP_EXECUTOR = concurrent.futures.ThreadPoolExecutor(max_workers=8, thread_name_prefix="weather-http")
+TWC_VERIFY_EXECUTOR = concurrent.futures.ThreadPoolExecutor(max_workers=3, thread_name_prefix="twc-verify")
 
 
 @dataclass
@@ -299,6 +302,7 @@ def default_config() -> dict[str, Any]:
         "aviation_poll_interval_seconds": 60,
         "aviation_refresh_probe_seconds": 180,
         "weather_record_poll_interval_seconds": 2,
+        "weather_record_pre_window_seconds": 120,
         "weather_record_timing_refresh_seconds": 60,
         "weather_record_timing_stagger_seconds": 60,
         "tgftp_window_start_delay_seconds": 120,
@@ -2126,6 +2130,22 @@ def in_station_report_window(config: dict[str, Any], city: str, station: str, no
     now_value = (now_utc or datetime.now(timezone.utc)).astimezone(timezone.utc)
     window_seconds = max(1, int(config.get("price_momentum", {}).get("report_window_seconds", 210)))
     return expected <= now_value < expected + timedelta(seconds=window_seconds), state
+
+
+def in_station_weather_record_window(config: dict[str, Any], city: str, station: str, now_utc: Optional[datetime] = None) -> tuple[bool, dict[str, Any]]:
+    """Return whether current time is inside the weatherrecord pre/report window."""
+    state = STATION_REPORT_TIMING.get((city, station), {})
+    expected_raw = state.get("expected_next_obs_utc")
+    if not expected_raw:
+        return False, state
+    try:
+        expected = datetime.fromisoformat(str(expected_raw).replace("Z", "+00:00")).astimezone(timezone.utc)
+    except ValueError:
+        return False, state
+    now_value = (now_utc or datetime.now(timezone.utc)).astimezone(timezone.utc)
+    pre_seconds = max(0, int(config.get("trading", {}).get("weather_record_pre_window_seconds", 120)))
+    window_seconds = max(1, int(config.get("price_momentum", {}).get("report_window_seconds", 210)))
+    return expected - timedelta(seconds=pre_seconds) <= now_value < expected + timedelta(seconds=window_seconds), state
 
 
 def momentum_target_price(base_price: float, fraction: float) -> float:
@@ -5274,6 +5294,7 @@ def weather_record_supervisor(config: dict[str, Any]) -> None:
     """Poll weatherrecord API every two seconds inside airport report windows."""
     fallback_poll_seconds = max(10, int(config["trading"].get("aviation_poll_interval_seconds", 60)))
     api_poll_seconds = max(1, int(config["trading"].get("weather_record_poll_interval_seconds", 2)))
+    pre_window_seconds = max(0, int(config["trading"].get("weather_record_pre_window_seconds", 120)))
     timing_refresh_seconds = max(10, int(config["trading"].get("weather_record_timing_refresh_seconds", 60)))
     timing_stagger_seconds = max(1, int(config["trading"].get("weather_record_timing_stagger_seconds", timing_refresh_seconds)))
     tgftp_start_delay_seconds = max(0, int(config["trading"].get("tgftp_window_start_delay_seconds", 90)))
@@ -5281,15 +5302,19 @@ def weather_record_supervisor(config: dict[str, Any]) -> None:
     event_cache: list[dict[str, Any]] = []
     station_groups: dict[tuple[str, str], dict[str, Any]] = {}
     station_state: dict[tuple[str, str], dict[str, Any]] = {}
+    awc_timing_pending: dict[tuple[str, str], dict[str, Any]] = {}
     tgftp_window_state: dict[str, dict[str, Any]] = {}
+    tgftp_pending: dict[str, dict[str, Any]] = {}
     event_state: dict[tuple[str, str, str], dict[str, Any]] = {}
     event_refresh_at = 0.0
     next_api_poll_at = 0.0
+    weather_record_pending: Optional[dict[str, Any]] = None
     next_tgftp_poll_at = 0.0
     tgftp_round_robin_index = 0
     LOGGER.info(
-        "weatherrecord supervisor started api_poll_seconds=%s timing_refresh_seconds=%s timing_stagger_seconds=%s tgftp_start_delay_seconds=%s tgftp_min_interval_seconds=%s fallback_poll_seconds=%s",
+        "weatherrecord supervisor started api_poll_seconds=%s pre_window_seconds=%s timing_refresh_seconds=%s timing_stagger_seconds=%s tgftp_start_delay_seconds=%s tgftp_min_interval_seconds=%s fallback_poll_seconds=%s",
         api_poll_seconds,
+        pre_window_seconds,
         timing_refresh_seconds,
         timing_stagger_seconds,
         tgftp_start_delay_seconds,
@@ -5299,6 +5324,51 @@ def weather_record_supervisor(config: dict[str, Any]) -> None:
     while True:
         try:
             now_mono = time.monotonic()
+            for done_key, pending in list(awc_timing_pending.items()):
+                future = pending["future"]
+                if not future.done():
+                    continue
+                city = str(pending["city"])
+                station = str(pending["station"])
+                state = station_state.setdefault(done_key, {"next_timing_refresh_at": now_mono})
+                try:
+                    latest_dt, interval_seconds, report_count, scheduled_minutes, expected_next_dt = future.result()
+                    if latest_dt is None:
+                        LOGGER.info("weatherrecord timing unavailable city=%s station=%s", city, station)
+                    else:
+                        update_station_report_timing(city, station, latest_dt, interval_seconds, report_count, scheduled_minutes, expected_next_dt)
+                except Exception:
+                    LOGGER.exception("weatherrecord timing refresh task failed city=%s station=%s", city, station)
+                finally:
+                    awc_timing_pending.pop(done_key, None)
+            for done_key, pending in list(tgftp_pending.items()):
+                future = pending["future"]
+                if not future.done():
+                    continue
+                group = pending["group"]
+                station = str(group["station"])
+                state = tgftp_window_state.setdefault(done_key, {"done": False, "attempts": 0})
+                try:
+                    obs = future.result()
+                    expected_dt = pending["expected_dt"]
+                    if obs and isinstance(obs.get("obs_dt"), datetime):
+                        obs_dt = obs["obs_dt"].astimezone(timezone.utc)
+                        LOGGER.info(
+                            "tgftp window poll completed city=%s station=%s expected_obs_utc=%s obs_utc=%s attempts=%s",
+                            group.get("city"),
+                            station,
+                            expected_dt.isoformat(),
+                            obs_dt.isoformat(),
+                            state.get("attempts"),
+                        )
+                        if obs_dt >= expected_dt:
+                            process_tgftp_window_observation(config, group, pending["timing"], obs)
+                            state["done"] = True
+                    else:
+                        LOGGER.info("tgftp window poll completed no observation city=%s station=%s attempts=%s", group.get("city"), station, state.get("attempts"))
+                except Exception:
+                    LOGGER.exception("tgftp window poll task failed city=%s station=%s attempts=%s", group.get("city"), station, state.get("attempts"))
+                tgftp_pending.pop(done_key, None)
             if now_mono >= event_refresh_at:
                 event_cache = []
                 for target in resolve_event_target_dates(config):
@@ -5324,6 +5394,7 @@ def weather_record_supervisor(config: dict[str, Any]) -> None:
                         }
                 for stale_key in set(station_state) - set(station_groups):
                     station_state.pop(stale_key, None)
+                    awc_timing_pending.pop(stale_key, None)
                 event_refresh_at = now_mono + 300
                 LOGGER.info("weatherrecord event cache refreshed events=%s station_groups=%s", len(event_cache), len(station_groups))
 
@@ -5331,21 +5402,24 @@ def weather_record_supervisor(config: dict[str, Any]) -> None:
                 state = station_state.setdefault(group_key, {"next_timing_refresh_at": now_mono})
                 if now_mono < float(state.get("next_timing_refresh_at", 0.0)):
                     continue
+                if group_key in awc_timing_pending:
+                    continue
                 city = str(group["city"])
                 station = str(group["station"])
-                try:
-                    latest_dt, interval_seconds, report_count, scheduled_minutes, expected_next_dt = aviation_report_timing(station, 24, config)
-                    state["next_timing_refresh_at"] = now_mono + timing_refresh_seconds
-                    if latest_dt is None:
-                        LOGGER.info("weatherrecord timing unavailable city=%s station=%s", city, station)
-                        continue
-                    update_station_report_timing(city, station, latest_dt, interval_seconds, report_count, scheduled_minutes, expected_next_dt)
-                except Exception:
-                    state["next_timing_refresh_at"] = now_mono + fallback_poll_seconds
-                    LOGGER.exception("weatherrecord timing refresh failed city=%s station=%s", city, station)
+                state["next_timing_refresh_at"] = now_mono + timing_refresh_seconds
+                awc_timing_pending[group_key] = {
+                    "future": HTTP_EXECUTOR.submit(aviation_report_timing, station, 24, config),
+                    "city": city,
+                    "station": station,
+                }
+                LOGGER.info("weatherrecord timing refresh queued city=%s station=%s", city, station)
 
             window_groups = []
+            weather_record_groups = []
             for group_key, group in station_groups.items():
+                in_weather_record_window, weather_timing = in_station_weather_record_window(config, str(group["city"]), str(group["station"]))
+                if in_weather_record_window:
+                    weather_record_groups.append((group_key, group, weather_timing))
                 in_window, timing = in_station_report_window(config, str(group["city"]), str(group["station"]))
                 if in_window:
                     window_groups.append((group_key, group, timing))
@@ -5366,12 +5440,18 @@ def weather_record_supervisor(config: dict[str, Any]) -> None:
                 eligible_tgftp_groups.append((window_key, group, timing, expected_dt))
             for stale_key in set(tgftp_window_state) - active_tgftp_keys:
                 tgftp_window_state.pop(stale_key, None)
+                tgftp_pending.pop(stale_key, None)
 
-            if window_groups and now_mono >= next_api_poll_at:
-                rows = weather_record_rows(config)
+            if weather_record_pending and weather_record_pending["future"].done():
+                pending_window_groups = weather_record_pending["window_groups"]
+                try:
+                    rows = weather_record_pending["future"].result()
+                except Exception:
+                    LOGGER.exception("weatherrecord poll task failed")
+                    rows = []
                 append_weather_record_history(config, rows, "weatherrecord_window_poll")
-                LOGGER.info("weatherrecord poll rows=%s active_windows=%s", len(rows), len(window_groups))
-                for _, group, _ in window_groups:
+                LOGGER.info("weatherrecord poll completed rows=%s active_windows=%s", len(rows), len(pending_window_groups))
+                for _, group, _ in pending_window_groups:
                     city = str(group["city"])
                     station = str(group["station"])
                     for event in list(group["events"]):
@@ -5429,38 +5509,37 @@ def weather_record_supervisor(config: dict[str, Any]) -> None:
                             )
                         except Exception:
                             LOGGER.exception("weatherrecord event failed city=%s kind=%s station=%s", city, kind, station)
+                weather_record_pending = None
+
+            if weather_record_groups and now_mono >= next_api_poll_at and weather_record_pending is None:
+                weather_record_pending = {
+                    "future": HTTP_EXECUTOR.submit(weather_record_rows, config),
+                    "window_groups": list(weather_record_groups),
+                }
+                LOGGER.info("weatherrecord poll queued active_windows=%s pre_window_seconds=%s", len(weather_record_groups), pre_window_seconds)
                 next_api_poll_at = now_mono + api_poll_seconds
 
             if eligible_tgftp_groups and now_mono >= next_tgftp_poll_at:
                 idx = tgftp_round_robin_index % len(eligible_tgftp_groups)
                 window_key, group, timing, expected_dt = eligible_tgftp_groups[idx]
                 tgftp_round_robin_index += 1
+                if window_key in tgftp_pending:
+                    next_tgftp_poll_at = now_mono + tgftp_min_interval_seconds
+                    continue
                 station = str(group["station"])
                 state = tgftp_window_state.setdefault(window_key, {"done": False, "attempts": 0})
                 state["attempts"] = int(state.get("attempts", 0)) + 1
-                try:
-                    obs = tgftp_metar_observation(station)
-                    if obs and isinstance(obs.get("obs_dt"), datetime):
-                        obs_dt = obs["obs_dt"].astimezone(timezone.utc)
-                        LOGGER.info(
-                            "tgftp window poll city=%s station=%s expected_obs_utc=%s obs_utc=%s attempts=%s",
-                            group.get("city"),
-                            station,
-                            expected_dt.isoformat(),
-                            obs_dt.isoformat(),
-                            state["attempts"],
-                        )
-                        if obs_dt >= expected_dt:
-                            process_tgftp_window_observation(config, group, timing, obs)
-                            state["done"] = True
-                    else:
-                        LOGGER.info("tgftp window poll no observation city=%s station=%s attempts=%s", group.get("city"), station, state["attempts"])
-                except Exception:
-                    LOGGER.exception("tgftp window poll failed city=%s station=%s attempts=%s", group.get("city"), station, state.get("attempts"))
+                tgftp_pending[window_key] = {
+                    "future": HTTP_EXECUTOR.submit(tgftp_metar_observation, station),
+                    "group": group,
+                    "timing": timing,
+                    "expected_dt": expected_dt,
+                }
+                LOGGER.info("tgftp window poll queued city=%s station=%s expected_obs_utc=%s attempts=%s", group.get("city"), station, expected_dt.isoformat(), state["attempts"])
                 next_tgftp_poll_at = now_mono + tgftp_min_interval_seconds
 
             sleep_seconds = fallback_poll_seconds
-            if window_groups:
+            if window_groups or weather_record_groups:
                 next_window_wakeup = next_api_poll_at
                 if eligible_tgftp_groups:
                     next_window_wakeup = min(next_window_wakeup, next_tgftp_poll_at)
@@ -5509,9 +5588,18 @@ def twc_verification_supervisor(config: dict[str, Any]) -> None:
         stagger_seconds,
         tick_seconds,
     )
+    pending: dict[str, concurrent.futures.Future[Any]] = {}
     while True:
         try:
             now_mono = time.monotonic()
+            for done_key, future in list(pending.items()):
+                if not future.done():
+                    continue
+                try:
+                    future.result()
+                except Exception:
+                    LOGGER.exception("twc verification task failed group=%s", done_key)
+                pending.pop(done_key, None)
             trades = read_trades(config["outputs"]["trades_csv"])
             groups: dict[str, PaperTrade] = {}
             for trade in trades:
@@ -5525,15 +5613,18 @@ def twc_verification_supervisor(config: dict[str, Any]) -> None:
                     TWC_VERIFY_NEXT_AT[group_key] = now_mono + stable_stagger_seconds(f"{group_key}:twc_verify", min(stagger_seconds, interval))
                 if now_mono < TWC_VERIFY_NEXT_AT[group_key]:
                     continue
+                if group_key in pending:
+                    continue
                 station = (sample_trade.forecast_station or "").upper()
                 LOGGER.info(
-                    "twc staggered verification due group=%s city=%s station=%s event_date=%s",
+                    "twc staggered verification queued group=%s city=%s station=%s event_date=%s",
                     group_key,
                     sample_trade.city,
                     station,
                     sample_trade.event_date,
                 )
-                verify_open_positions_with_twc(
+                pending[group_key] = TWC_VERIFY_EXECUTOR.submit(
+                    verify_open_positions_with_twc,
                     config,
                     {
                         "source": "staggered_twc_position_verification",

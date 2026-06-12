@@ -2703,6 +2703,13 @@ class LiveTradingManager:
         with self._lock:
             self._pending.pop(pending.order_id, None)
         notify_trade(self.config, trade, pending.kind, "FILLED", source=source)
+        if pending.kind == "BUY" and trade.status == "OPEN":
+            start_tgftp_validation_thread(
+                self.config,
+                trade.trade_id,
+                trade.forecast_station,
+                trade.forecast_observed_at,
+            )
 
     def _apply_buy_result_to_trade(self, trade: PaperTrade, result: Any, pending: bool) -> None:
         """Copy live buy order result fields onto a trade row.
@@ -2882,6 +2889,10 @@ def close_trade(config: dict[str, Any], trade: PaperTrade, market: TemperatureMa
     """
     side = (trade.position_side or "YES").upper()
     exit_price = float(best_sell_price(config, market, side) or 0.0)
+    hedge_yes_price = float(best_buy_price(config, market, "YES") or 0.0) if side == "NO" else 0.0
+    hedge_effective_exit = (1.0 - hedge_yes_price) if hedge_yes_price > 0 else 0.0
+    if side == "NO" and hedge_effective_exit > exit_price:
+        return hedge_no_trade_with_yes(config, trade, market, reason, hedge_yes_price)
     if exit_price <= 0:
         trade.error = f"no CLOB sell price for {side}"
         LOGGER.info("skip sell no_clob_sell_price trade=%s side=%s market=%s", trade.trade_id, side, market.market_id)
@@ -2905,6 +2916,57 @@ def close_trade(config: dict[str, Any], trade: PaperTrade, market: TemperatureMa
     trade.payout_usdc = trade.exit_proceeds_usdc
     trade.pnl_usdc = round(proceeds - trade.total_cost_usdc, 8)
     notify_trade(config, trade, "SELL", "CLOSED", reason)
+    return True
+
+
+def hedge_no_trade_with_yes(config: dict[str, Any], trade: PaperTrade, market: TemperatureMarket, reason: str, hedge_price: float) -> bool:
+    """Close risk on a NO position by buying matching YES exposure when cheaper than selling NO."""
+    if hedge_price <= 0 or (trade.position_side or "YES").upper() != "NO":
+        return False
+    token_id = asset_id_for_market_side(market, "YES")
+    if not token_id:
+        trade.error = "no YES token id for hedge"
+        return False
+    fee_rate = float(trade.taker_fee_rate)
+    fee_enabled = bool(config["trading"].get("fee_enabled", True))
+    live_trader = get_live_trader() if live_trading_enabled(config) else None
+    hedge_shares = float(trade.shares)
+    hedge_notional = hedge_shares * hedge_price
+    if live_trader and live_trader.executor:
+        result = live_trader.executor.buy(token_id, hedge_notional, price=hedge_price)
+        if not _result_value(result, "success", False):
+            trade.error = f"YES hedge buy failed: {_result_value(result, 'error', '')}"
+            LOGGER.info("skip hedge buy_yes_failed trade=%s market=%s error=%s", trade.trade_id, market.market_id, trade.error)
+            return False
+        hedge_price = float(_result_value(result, "price", hedge_price) or hedge_price)
+        hedge_shares = float(_result_value(result, "shares", hedge_shares) or hedge_shares)
+        hedge_notional = float(_result_value(result, "amount_usd", hedge_shares * hedge_price) or hedge_shares * hedge_price)
+        trade.live_sell_order_id = str(_result_value(result, "order_id", trade.live_sell_order_id))
+        trade.live_order_status = str(_result_value(result, "status", "FILLED"))
+        trade.live_order_error = str(_result_value(result, "error", "") or "")
+    fee = taker_fee_usdc(hedge_shares, hedge_price, fee_rate, fee_enabled)
+    hedge_cost = hedge_notional + fee
+    locked_payout = min(float(trade.shares), hedge_shares)
+    trade.status = "HEDGED"
+    trade.exit_action = "buy_yes_hedge"
+    trade.exit_at = datetime.now().isoformat(timespec="seconds")
+    trade.exit_reason = reason
+    trade.exit_yes_price = hedge_price
+    trade.exit_fee_usdc = round(fee, 8)
+    trade.exit_hedge_cost_usdc = round(hedge_cost, 8)
+    trade.payout_usdc = round(locked_payout, 8)
+    trade.pnl_usdc = round(locked_payout - trade.total_cost_usdc - hedge_cost, 8)
+    notify_trade(config, trade, "BUY", "HEDGED", reason)
+    LOGGER.info(
+        "hedge buy_yes trade=%s market=%s yes_price=%s hedge_shares=%s locked_payout=%s hedge_cost=%s reason=%s",
+        trade.trade_id,
+        market.market_id,
+        hedge_price,
+        hedge_shares,
+        locked_payout,
+        hedge_cost,
+        reason,
+    )
     return True
 
 
@@ -3439,7 +3501,8 @@ def verify_open_positions_with_twc(config: dict[str, Any], trigger_context: Opti
     for trade in trades:
         if trade.status != "OPEN" or trade.strategy != strategy_name:
             continue
-        if "metar" not in (trade.forecast_source or "").lower():
+        source_text = (trade.forecast_source or "").lower()
+        if not any(token in source_text for token in ("metar", "weatherrecord_api", "tgftp")):
             continue
         try:
             event = fetch_event_by_url(config, trade.polymarket_url, trade.city, trade.kind, trade.event_date)
@@ -3537,6 +3600,7 @@ def process_deterministic_harvest(config: dict[str, Any], trigger_context: dict[
     signal_source = str(trigger_context.get("source") or "aviation_metar")
     observed_high = trigger_context.get("aviation_high")
     observed_low = trigger_context.get("aviation_low")
+    validation_min_obs_utc = str(trigger_context.get("observed_at_utc") or "")
     if observed_high is None and observed_low is None:
         observed_high, observed_low, _, _ = aviation_observed_extremes(config, station, city, event_date, event_unit)
     observed_high = float(observed_high) if observed_high is not None else None
@@ -3562,6 +3626,7 @@ def process_deterministic_harvest(config: dict[str, Any], trigger_context: dict[
     markets_by_id = {m.market_id: m for m in markets}
     changed = False
     new_trades: list[PaperTrade] = []
+    post_buy_validation_requests: list[tuple[str, str, str]] = []
 
     for trade in trades:
         if trade.status != "OPEN" or trade.strategy != strategy_name or trade.city != city or trade.kind != kind or trade.event_date != event_date:
@@ -3605,6 +3670,7 @@ def process_deterministic_harvest(config: dict[str, Any], trigger_context: dict[
                 changed = True
                 if not live_trader:
                     notify_trade(config, trade, "BUY", "FILLED", f"{signal_source}_extreme_yes_reached")
+                    post_buy_validation_requests.append((trade.trade_id, station, validation_min_obs_utc))
                 LOGGER.info("metar buy_yes city=%s kind=%s market=%s price=%s observed_high=%s observed_low=%s status=%s", city, kind, extreme_market.market_id, price, observed_high, observed_low, trade.status)
         else:
             LOGGER.info("metar skip_buy_yes_price_too_high city=%s kind=%s market=%s yes_clob_buy_price=%s max=%s observed_high=%s observed_low=%s", city, kind, extreme_market.market_id, price, yes_max, observed_high, observed_low)
@@ -3650,6 +3716,7 @@ def process_deterministic_harvest(config: dict[str, Any], trigger_context: dict[
                 changed = True
                 if not live_trader:
                     notify_trade(config, trade, "BUY", "FILLED", f"{signal_source}_impossible_no")
+                    post_buy_validation_requests.append((trade.trade_id, station, validation_min_obs_utc))
                 LOGGER.info("metar buy_no city=%s kind=%s market=%s no_price=%s observed_high=%s observed_low=%s status=%s", city, kind, market.market_id, no_price, observed_high, observed_low, trade.status)
             break
 
@@ -3659,6 +3726,8 @@ def process_deterministic_harvest(config: dict[str, Any], trigger_context: dict[
         write_csv(config["outputs"]["trades_csv"], trades)
         write_csv(config["outputs"]["settled_trades_csv"], trades)
         write_performance_reports(config, trades)
+    for trade_id, validation_station, min_obs_utc in post_buy_validation_requests:
+        start_tgftp_validation_thread(config, trade_id, validation_station, min_obs_utc)
     return trades
 
 
@@ -3843,12 +3912,29 @@ def start_tgftp_validation_thread(config: dict[str, Any], trade_id: str, station
     thread.start()
 
 
+def parse_optional_utc_datetime(value: Any) -> Optional[datetime]:
+    """Parse an optional datetime string/value into UTC."""
+    if not value:
+        return None
+    if isinstance(value, datetime):
+        parsed = value
+    else:
+        try:
+            parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        except ValueError:
+            return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
 def tgftp_validation_worker(config: dict[str, Any], trade_id: str, station: str, min_obs_utc: str) -> None:
     """Poll TGFTP until a new station report validates or rejects a price momentum trade."""
     settings = config.get("price_momentum", {})
     interval = max(1, int(settings.get("tgftp_verify_interval_seconds", 10)))
     timeout = max(interval, int(settings.get("tgftp_verify_timeout_seconds", 180)))
     station_key = station.upper()
+    min_obs_dt = parse_optional_utc_datetime(min_obs_utc)
     deadline = time.monotonic() + timeout
     try:
         while time.monotonic() <= deadline:
@@ -3863,6 +3949,19 @@ def tgftp_validation_worker(config: dict[str, Any], trade_id: str, station: str,
                 continue
             previous = cached_tgftp_observation(station_key)
             if previous is None:
+                obs_dt = obs["obs_dt"].astimezone(timezone.utc)
+                if min_obs_dt is None or obs_dt >= min_obs_dt:
+                    update_cached_tgftp_observation(station_key, obs)
+                    LOGGER.info(
+                        "tgftp validation first usable observation trade=%s station=%s obs_utc=%s temp_c=%s min_obs_utc=%s",
+                        trade_id,
+                        station_key,
+                        obs_dt.isoformat(),
+                        obs["temp_c"],
+                        min_obs_dt.isoformat() if min_obs_dt else "",
+                    )
+                    validate_trade_with_tgftp_observation(config, trade_id, station, obs)
+                    return
                 update_cached_tgftp_observation(station_key, obs)
                 LOGGER.info(
                     "tgftp validation baseline initialized trade=%s station=%s obs_utc=%s temp_c=%s",
@@ -3950,7 +4049,7 @@ def validate_trade_with_tgftp_observation(config: dict[str, Any], trade_id: str,
         trade.error = ""
         LOGGER.info("tgftp validation hold trade=%s station=%s obs_utc=%s temp=%s high=%s low=%s raw=%r", trade_id, station, obs["obs_dt"].isoformat(), rounded_temp, observed_high, observed_low, obs["raw_ob"])
     else:
-        if close_trade(config, trade, market, "tgftp_invalidated_price_momentum"):
+        if close_trade(config, trade, market, "tgftp_invalidated_post_buy_validation"):
             LOGGER.info("tgftp validation sell trade=%s station=%s obs_utc=%s temp=%s high=%s low=%s raw=%r", trade_id, station, obs["obs_dt"].isoformat(), rounded_temp, observed_high, observed_low, obs["raw_ob"])
     write_csv(config["outputs"]["trades_csv"], trades)
     write_csv(config["outputs"]["settled_trades_csv"], trades)
@@ -5057,6 +5156,7 @@ def weather_record_supervisor(config: dict[str, Any]) -> None:
                                     "polymarket_url": event_url,
                                     "aviation_high": observed_high,
                                     "aviation_low": observed_low,
+                                    "observed_at_utc": latest_dt.astimezone(timezone.utc).isoformat(),
                                 },
                             )
                         except Exception:

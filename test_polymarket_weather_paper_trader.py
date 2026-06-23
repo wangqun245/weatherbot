@@ -1,0 +1,671 @@
+import unittest
+import tempfile
+from pathlib import Path
+
+import polymarket_weather_paper_trader as bot
+
+
+class ClobPricingTest(unittest.TestCase):
+    def setUp(self):
+        self.config = bot.default_config()
+        self.market = bot.TemperatureMarket(
+            event_id="event-1",
+            market_id="market-1",
+            condition_id="condition-1",
+            city="Austin",
+            kind="Highest",
+            event_date="2026-06-07",
+            event_title="Highest temperature in Austin on June 7",
+            market_question="Will the highest temperature in Austin be between 90-91F on June 7?",
+            polymarket_url="https://polymarket.com/event/example",
+            yes_price=0.2,
+            rule_min=90.0,
+            rule_max=91.0,
+            unit="F",
+            raw_market_json='{"outcomes":["Yes","No"],"clobTokenIds":["yes-token","no-token"]}',
+        )
+        self.original_clob_get = bot.clob_get
+        self.original_clob_post = bot.clob_post
+
+    def tearDown(self):
+        bot.clob_get = self.original_clob_get
+        bot.clob_post = self.original_clob_post
+
+    def test_best_buy_price_requires_executable_no_liquidity(self):
+        def fake_clob_get(config, path, params=None):
+            return {"bids": [], "asks": []}
+
+        bot.clob_get = fake_clob_get
+
+        self.assertIsNone(bot.best_buy_price(self.config, self.market, "NO"))
+
+    def test_best_buy_price_uses_no_ask_when_available(self):
+        def fake_clob_get(config, path, params=None):
+            token_id = params["token_id"]
+            if token_id == "no-token":
+                return {"bids": [], "asks": [{"price": "0.42", "size": "100"}]}
+            return {"bids": [], "asks": []}
+
+        bot.clob_get = fake_clob_get
+
+        self.assertEqual(0.42, bot.best_buy_price(self.config, self.market, "NO"))
+
+    def test_best_buy_price_can_use_opposite_bid_complement(self):
+        def fake_clob_get(config, path, params=None):
+            token_id = params["token_id"]
+            if token_id == "yes-token":
+                return {"bids": [{"price": "0.63", "size": "100"}], "asks": []}
+            return {"bids": [], "asks": []}
+
+        bot.clob_get = fake_clob_get
+
+        self.assertEqual(0.37, round(bot.best_buy_price(self.config, self.market, "NO"), 2))
+
+    def test_best_buy_price_uses_depth_multiplier_and_extra_level(self):
+        self.config["trading"]["buy_notional_usdc"] = 5.0
+        self.config["trading"]["depth_price_notional_multiplier"] = 2.0
+        self.config["trading"]["depth_price_extra_levels"] = 1
+
+        def fake_clob_get(config, path, params=None):
+            token_id = params["token_id"]
+            if token_id == "no-token":
+                return {
+                    "bids": [],
+                    "asks": [
+                        {"price": "0.40", "size": "10"},   # $4 cumulative
+                        {"price": "0.45", "size": "14"},   # $10.30 cumulative, then step one level higher
+                        {"price": "0.47", "size": "100"},
+                    ],
+                }
+            return {"bids": [], "asks": []}
+
+        bot.clob_get = fake_clob_get
+
+        self.assertEqual(0.47, bot.best_buy_price(self.config, self.market, "NO"))
+
+    def test_clob_asset_sell_prices_batches_prices(self):
+        captured = {}
+
+        def fake_clob_post(config, path, payload):
+            captured["path"] = path
+            captured["payload"] = payload
+            return {
+                "asset-a": {"SELL": 0.42},
+                "asset-b": {"SELL": "0.53"},
+            }
+
+        bot.clob_post = fake_clob_post
+
+        prices = bot.clob_asset_sell_prices(self.config, ["asset-a", "asset-b", "asset-a"])
+
+        self.assertEqual("/prices", captured["path"])
+        self.assertEqual([{"token_id": "asset-a", "side": "SELL"}, {"token_id": "asset-b", "side": "SELL"}], captured["payload"])
+        self.assertEqual({"asset-a": 0.42, "asset-b": 0.53}, prices)
+
+
+class MetarMomentumTest(unittest.TestCase):
+    def test_websocket_message_prices_extracts_nested_changes(self):
+        rows = bot.websocket_message_prices({
+            "event_type": "price_change",
+            "changes": [
+                {"asset_id": "asset-1", "price": "0.42"},
+                {"asset_id": "asset-2", "best_bid": "0.31", "best_ask": "0.33"},
+            ],
+        })
+
+        self.assertNotIn(("asset-1", 0.42, "price"), rows)
+        self.assertIn(("asset-2", 0.31, "best_bid"), rows)
+        self.assertIn(("asset-2", 0.33, "best_ask"), rows)
+
+    def test_momentum_target_price_moves_fraction_of_remaining_path_to_one(self):
+        self.assertEqual(0.86, round(bot.momentum_target_price(0.8, 0.3), 2))
+        self.assertEqual(0.37, round(bot.momentum_target_price(0.1, 0.3), 2))
+
+    def test_directional_price_change_fraction_uses_remaining_upside_for_rises(self):
+        self.assertEqual(0.03, round(bot.directional_price_change_fraction(0.8, 0.806), 2))
+        self.assertLess(bot.directional_price_change_fraction(0.8, 0.805), 0.03)
+
+    def test_directional_price_change_fraction_uses_self_price_for_drops(self):
+        self.assertEqual(0.03, round(bot.directional_price_change_fraction(0.8, 0.776), 2))
+        self.assertLess(bot.directional_price_change_fraction(0.8, 0.777), 0.03)
+
+    def test_station_for_event_uses_configured_city_station_without_network(self):
+        config = bot.default_config()
+        config["events"].setdefault("city_stations", {})["Shanghai"] = "ZSPD"
+        original = bot.extract_wunderground_source
+
+        def fail_if_called(config, event_url):
+            raise AssertionError("network should not be called")
+
+        bot.extract_wunderground_source = fail_if_called
+        try:
+            self.assertEqual("ZSPD", bot.station_for_event(config, "Shanghai", "https://polymarket.com/event/example"))
+        finally:
+            bot.extract_wunderground_source = original
+
+    def test_station_for_event_handles_page_timeout(self):
+        config = bot.default_config()
+        config["events"]["city_stations"] = {}
+        original = bot.extract_wunderground_source
+
+        def timeout(config, event_url):
+            raise bot.requests.exceptions.ReadTimeout("timed out")
+
+        bot.extract_wunderground_source = timeout
+        try:
+            self.assertEqual("", bot.station_for_event(config, "Shanghai", "https://polymarket.com/event/example"))
+        finally:
+            bot.extract_wunderground_source = original
+
+    def test_outer_boundary_market_uses_highest_high_and_lowest_low(self):
+        markets = [
+            bot.TemperatureMarket("event-1", "low", "", "Austin", "Highest", "2026-06-08", "", "low", "", 0.1, None, 79.0, "F", False, "{}"),
+            bot.TemperatureMarket("event-1", "mid", "", "Austin", "Highest", "2026-06-08", "", "mid", "", 0.1, 80.0, 81.0, "F", False, "{}"),
+            bot.TemperatureMarket("event-1", "high", "", "Austin", "Highest", "2026-06-08", "", "high", "", 0.1, 82.0, None, "F", False, "{}"),
+        ]
+
+        self.assertEqual("high", bot.outer_boundary_market(markets, "F", "Highest").market_id)
+        self.assertEqual("low", bot.outer_boundary_market(markets, "F", "Lowest").market_id)
+
+    def test_websocket_relevant_markets_keep_highest_current_and_above(self):
+        markets = [
+            bot.TemperatureMarket("event-1", "below", "", "Austin", "Highest", "2026-06-08", "", "below", "", 0.1, 84.0, 85.0, "F", False, "{}"),
+            bot.TemperatureMarket("event-1", "current", "", "Austin", "Highest", "2026-06-08", "", "current", "", 0.1, 86.0, 87.0, "F", False, "{}"),
+            bot.TemperatureMarket("event-1", "above", "", "Austin", "Highest", "2026-06-08", "", "above", "", 0.1, 88.0, 89.0, "F", False, "{}"),
+        ]
+
+        relevant = bot.websocket_relevant_markets_for_observed_extreme(markets, "Highest", "F", 86.0, 78.0)
+
+        self.assertEqual(["current", "above"], [m.market_id for m in relevant])
+
+    def test_websocket_relevant_markets_keep_lowest_current_and_below(self):
+        markets = [
+            bot.TemperatureMarket("event-1", "below", "", "Austin", "Lowest", "2026-06-08", "", "below", "", 0.1, 74.0, 75.0, "F", False, "{}"),
+            bot.TemperatureMarket("event-1", "current", "", "Austin", "Lowest", "2026-06-08", "", "current", "", 0.1, 76.0, 77.0, "F", False, "{}"),
+            bot.TemperatureMarket("event-1", "above", "", "Austin", "Lowest", "2026-06-08", "", "above", "", 0.1, 78.0, 79.0, "F", False, "{}"),
+        ]
+
+        relevant = bot.websocket_relevant_markets_for_observed_extreme(markets, "Lowest", "F", 90.0, 77.0)
+
+        self.assertEqual(["below", "current"], [m.market_id for m in relevant])
+
+    def test_websocket_relevant_markets_fallback_all_without_observation(self):
+        markets = [
+            bot.TemperatureMarket("event-1", "one", "", "Austin", "Highest", "2026-06-08", "", "one", "", 0.1, 84.0, 85.0, "F", False, "{}"),
+            bot.TemperatureMarket("event-1", "two", "", "Austin", "Highest", "2026-06-08", "", "two", "", 0.1, 86.0, 87.0, "F", False, "{}"),
+        ]
+
+        relevant = bot.websocket_relevant_markets_for_observed_extreme(markets, "Highest", "F", None, None)
+
+        self.assertEqual(["one", "two"], [m.market_id for m in relevant])
+
+    def test_impossible_markets_for_highest_prioritize_nearest_below_observed_high(self):
+        markets = [
+            bot.TemperatureMarket("event-1", "far", "", "Austin", "Highest", "2026-06-08", "", "far", "", 0.1, None, 81.0, "F", False, "{}"),
+            bot.TemperatureMarket("event-1", "middle", "", "Austin", "Highest", "2026-06-08", "", "middle", "", 0.1, 88.0, 89.0, "F", False, "{}"),
+            bot.TemperatureMarket("event-1", "nearest", "", "Austin", "Highest", "2026-06-08", "", "nearest", "", 0.1, 92.0, 93.0, "F", False, "{}"),
+            bot.TemperatureMarket("event-1", "possible", "", "Austin", "Highest", "2026-06-08", "", "possible", "", 0.1, 94.0, 95.0, "F", False, "{}"),
+        ]
+
+        ordered = bot.deterministic_impossible_markets_by_proximity(markets, "Highest", 94.0, None, "F")
+
+        self.assertEqual(["nearest", "middle", "far"], [m.market_id for m in ordered])
+
+    def test_impossible_markets_for_lowest_prioritize_nearest_above_observed_low(self):
+        markets = [
+            bot.TemperatureMarket("event-1", "possible", "", "Austin", "Lowest", "2026-06-08", "", "possible", "", 0.1, 68.0, 69.0, "F", False, "{}"),
+            bot.TemperatureMarket("event-1", "nearest", "", "Austin", "Lowest", "2026-06-08", "", "nearest", "", 0.1, 71.0, 72.0, "F", False, "{}"),
+            bot.TemperatureMarket("event-1", "middle", "", "Austin", "Lowest", "2026-06-08", "", "middle", "", 0.1, 73.0, 74.0, "F", False, "{}"),
+            bot.TemperatureMarket("event-1", "far", "", "Austin", "Lowest", "2026-06-08", "", "far", "", 0.1, 80.0, None, "F", False, "{}"),
+        ]
+
+        ordered = bot.deterministic_impossible_markets_by_proximity(markets, "Lowest", None, 70.0, "F")
+
+        self.assertEqual(["nearest", "middle", "far"], [m.market_id for m in ordered])
+
+    def test_adjacent_no_momentum_market_uses_nearest_not_yet_impossible_bucket(self):
+        high_markets = [
+            bot.TemperatureMarket("event-1", "below", "", "Austin", "Highest", "2026-06-08", "", "below", "", 0.1, 78.0, 79.0, "F", False, "{}"),
+            bot.TemperatureMarket("event-1", "current", "", "Austin", "Highest", "2026-06-08", "", "current", "", 0.1, 80.0, 81.0, "F", False, "{}"),
+            bot.TemperatureMarket("event-1", "above", "", "Austin", "Highest", "2026-06-08", "", "above", "", 0.1, 82.0, 83.0, "F", False, "{}"),
+        ]
+        low_markets = [
+            bot.TemperatureMarket("event-1", "below", "", "Austin", "Lowest", "2026-06-08", "", "below", "", 0.1, 68.0, 69.0, "F", False, "{}"),
+            bot.TemperatureMarket("event-1", "current", "", "Austin", "Lowest", "2026-06-08", "", "current", "", 0.1, 70.0, 71.0, "F", False, "{}"),
+            bot.TemperatureMarket("event-1", "above", "", "Austin", "Lowest", "2026-06-08", "", "above", "", 0.1, 72.0, 73.0, "F", False, "{}"),
+        ]
+
+        high_candidate = bot.adjacent_no_momentum_market(high_markets, "Highest", 79.0, None, "F")
+        low_candidate = bot.adjacent_no_momentum_market(low_markets, "Lowest", None, 72.0, "F")
+
+        self.assertEqual("below", high_candidate.market_id)
+        self.assertEqual("above", low_candidate.market_id)
+
+    def test_parse_tgftp_metar_uses_observation_line_and_exact_temperature(self):
+        row = bot.parse_tgftp_metar(
+            "2026/06/08 17:53\n"
+            "KAUS 081753Z 16015G25KT 10SM SCT017 SCT037 31/24 A2994 RMK AO2 T03110239"
+        )
+
+        self.assertIsNotNone(row)
+        self.assertEqual("2026-06-08T17:53:00+00:00", row["obs_dt"].isoformat())
+        self.assertEqual(31.1, row["temp_c"])
+
+    def test_tgftp_observation_changed_uses_timestamp_and_temperature(self):
+        previous = {
+            "obs_dt": bot.datetime(2026, 6, 8, 17, 53, tzinfo=bot.timezone.utc),
+            "temp_c": 31.1,
+            "raw_ob": "old",
+        }
+        same = {
+            "obs_dt": bot.datetime(2026, 6, 8, 17, 53, tzinfo=bot.timezone.utc),
+            "temp_c": 31.1,
+            "raw_ob": "same",
+        }
+        newer_time = {
+            "obs_dt": bot.datetime(2026, 6, 8, 18, 53, tzinfo=bot.timezone.utc),
+            "temp_c": 31.1,
+            "raw_ob": "new-time",
+        }
+        newer_temp = {
+            "obs_dt": bot.datetime(2026, 6, 8, 17, 53, tzinfo=bot.timezone.utc),
+            "temp_c": 32.0,
+            "raw_ob": "new-temp",
+        }
+
+        self.assertFalse(bot.tgftp_observation_changed(previous, same))
+        self.assertTrue(bot.tgftp_observation_changed(previous, newer_time))
+        self.assertTrue(bot.tgftp_observation_changed(previous, newer_temp))
+
+    def test_station_report_window_uses_expected_next_obs_time(self):
+        config = bot.default_config()
+        bot.STATION_REPORT_TIMING.clear()
+        latest = bot.datetime(2026, 6, 8, 16, 53, tzinfo=bot.timezone.utc)
+        state = bot.update_station_report_timing("Austin", "KAUS", latest, 3600, 24)
+
+        inside, _ = bot.in_station_report_window(config, "Austin", "KAUS", bot.datetime(2026, 6, 8, 17, 56, 29, tzinfo=bot.timezone.utc))
+        outside, _ = bot.in_station_report_window(config, "Austin", "KAUS", bot.datetime(2026, 6, 8, 17, 56, 30, tzinfo=bot.timezone.utc))
+
+        self.assertEqual("2026-06-08T17:53:00+00:00", state["expected_next_obs_utc"])
+        self.assertTrue(inside)
+        self.assertFalse(outside)
+
+    def test_weather_record_window_stays_active_for_five_minutes(self):
+        config = bot.default_config()
+        bot.STATION_REPORT_TIMING.clear()
+        bot.WEATHER_RECORD_ACTIVE_WINDOWS.clear()
+        latest = bot.datetime(2026, 6, 8, 16, 53, tzinfo=bot.timezone.utc)
+        bot.update_station_report_timing("Austin", "KAUS", latest, 3600, 24)
+
+        at_start, _ = bot.in_station_weather_record_window(
+            config, "Austin", "KAUS", bot.datetime(2026, 6, 8, 17, 53, tzinfo=bot.timezone.utc)
+        )
+        before_end, _ = bot.in_station_weather_record_window(
+            config, "Austin", "KAUS", bot.datetime(2026, 6, 8, 17, 57, 59, tzinfo=bot.timezone.utc)
+        )
+        at_end, _ = bot.in_station_weather_record_window(
+            config, "Austin", "KAUS", bot.datetime(2026, 6, 8, 17, 58, tzinfo=bot.timezone.utc)
+        )
+
+        self.assertTrue(at_start)
+        self.assertTrue(before_end)
+        self.assertFalse(at_end)
+
+    def test_weather_record_window_survives_next_observation_time_refresh(self):
+        config = bot.default_config()
+        bot.STATION_REPORT_TIMING.clear()
+        bot.WEATHER_RECORD_ACTIVE_WINDOWS.clear()
+        expected = bot.datetime(2026, 6, 8, 17, 53, tzinfo=bot.timezone.utc)
+        bot.update_station_report_timing(
+            "Austin", "KAUS", bot.datetime(2026, 6, 8, 16, 53, tzinfo=bot.timezone.utc), 3600, 24
+        )
+        bot.in_station_weather_record_window(config, "Austin", "KAUS", expected)
+        bot.update_station_report_timing("Austin", "KAUS", expected, 3600, 24)
+
+        still_active, _ = bot.in_station_weather_record_window(
+            config, "Austin", "KAUS", expected + bot.timedelta(seconds=299)
+        )
+
+        self.assertTrue(still_active)
+
+    def test_price_record_payload_includes_millisecond_timestamp(self):
+        payload = bot.price_record_payload(
+            "websocket_tick",
+            {"city": "Austin", "station": "KAUS", "market_id": "m1", "position_side": "NO"},
+            "asset-1",
+            0.42,
+            0.40,
+            "price",
+            {"expected_next_obs_utc": "2026-06-08T17:53:00+00:00"},
+        )
+
+        self.assertEqual("websocket_tick", payload["event_type"])
+        self.assertEqual("asset-1", payload["asset_id"])
+        self.assertIsInstance(payload["captured_at_epoch_ms"], int)
+        self.assertIn(".", payload["captured_at_utc"])
+
+    def test_window_snapshot_seeds_momentum_base_from_previous_price_for_trigger_asset(self):
+        config = bot.default_config()
+        bot.STATION_REPORT_TIMING.clear()
+        bot.PRICE_RECORDING_WINDOWS.clear()
+        bot.PRICE_MOMENTUM_WINDOWS.clear()
+        latest = bot.datetime.now(bot.timezone.utc) - bot.timedelta(hours=1, seconds=1)
+        bot.update_station_report_timing("Austin", "KAUS", latest, 3600, 24)
+        with tempfile.TemporaryDirectory() as tmp:
+            config["outputs"]["price_window_ticks_jsonl"] = str(Path(tmp) / "ticks.jsonl")
+            assets = {
+                "trigger-asset": {"city": "Austin", "station": "KAUS", "market_id": "m1", "position_side": "NO", "last_price": 0.99},
+                "other-asset": {"city": "Austin", "station": "KAUS", "market_id": "m2", "position_side": "YES", "last_price": 0.40},
+            }
+
+            bot.record_price_window_tick(config, assets, assets["trigger-asset"], "trigger-asset", 0.99, 0.30, "price")
+
+        self.assertNotIn("trigger-asset:price", bot.PRICE_MOMENTUM_WINDOWS)
+        self.assertEqual(0.40, bot.PRICE_MOMENTUM_WINDOWS["other-asset:last_price"]["base_price"])
+
+    def test_best_bid_has_independent_momentum_window_baseline(self):
+        config = bot.default_config()
+        bot.STATION_REPORT_TIMING.clear()
+        bot.PRICE_RECORDING_WINDOWS.clear()
+        bot.PRICE_MOMENTUM_WINDOWS.clear()
+        latest = bot.datetime.now(bot.timezone.utc) - bot.timedelta(hours=1, seconds=1)
+        bot.update_station_report_timing("Houston", "KHOU", latest, 3600, 24)
+        with tempfile.TemporaryDirectory() as tmp:
+            config["outputs"]["price_window_ticks_jsonl"] = str(Path(tmp) / "ticks.jsonl")
+            assets = {
+                "asset-1": {
+                    "city": "Houston",
+                    "station": "KHOU",
+                    "market_id": "m1",
+                    "position_side": "NO",
+                    "last_price": 0.53,
+                    "last_prices_by_field": {"price": 0.53, "best_bid": 0.56},
+                },
+            }
+
+            bot.record_price_window_tick(config, assets, assets["asset-1"], "asset-1", 0.67, 0.56, "best_bid")
+
+        self.assertEqual(0.56, bot.PRICE_MOMENTUM_WINDOWS["asset-1:best_bid"]["base_price"])
+        self.assertNotIn("asset-1:price", bot.PRICE_MOMENTUM_WINDOWS)
+
+    def test_websocket_message_prices_extracts_best_bid_ask_event(self):
+        rows = bot.websocket_message_prices({
+            "event_type": "best_bid_ask",
+            "asset_id": "asset-1",
+            "best_bid": "0.67",
+            "best_ask": "0.73",
+            "timestamp": "1781100000000",
+        })
+
+        self.assertIn(("asset-1", 0.67, "best_bid"), rows)
+        self.assertIn(("asset-1", 0.73, "best_ask"), rows)
+
+    def test_websocket_message_prices_maps_last_trade_price(self):
+        rows = bot.websocket_message_prices({
+            "event_type": "last_trade_price",
+            "asset_id": "asset-1",
+            "price": "0.52",
+        })
+
+        self.assertEqual([("asset-1", 0.52, "last_price")], rows)
+
+    def test_websocket_message_prices_extracts_book_top_of_book(self):
+        rows = bot.websocket_message_prices({
+            "event_type": "book",
+            "asset_id": "asset-1",
+            "bids": [{"price": "0.60", "size": "4"}, {"price": "0.62", "size": "1"}],
+            "asks": [{"price": "0.72", "size": "2"}, {"price": "0.70", "size": "8"}],
+        })
+
+        self.assertIn(("asset-1", 0.62, "best_bid"), rows)
+        self.assertIn(("asset-1", 0.70, "best_ask"), rows)
+
+
+class WeatherRecordTest(unittest.TestCase):
+    def tearDown(self):
+        bot.WEATHER_RECORD_POINTS_BY_STATION_EVENT.clear()
+        while not bot.WEATHER_RECORD_UPDATES.empty():
+            bot.WEATHER_RECORD_UPDATES.get_nowait()
+
+    def test_parse_weather_record_timestamp_accepts_epoch_milliseconds(self):
+        parsed = bot.parse_weather_record_timestamp(1781278848236)
+
+        self.assertIsNotNone(parsed)
+        self.assertEqual("2026-06-12T15:40:48.236000+00:00", parsed.isoformat())
+
+    def test_normalize_weather_record_websocket_payload_matches_api_shape(self):
+        rows = bot.normalize_weather_record_payload({
+            "value": [{
+                "StationCode": "kaus",
+                "TimeStamp": 1781278848236,
+                "Temperature": 31.0,
+            }]
+        })
+
+        self.assertEqual(1, len(rows))
+        self.assertEqual("KAUS", rows[0]["station"])
+        self.assertEqual(31.0, rows[0]["temp_f"])
+        self.assertEqual("F", rows[0]["source_unit"])
+        self.assertEqual("2026-06-12T15:40:48.236000+00:00", rows[0]["obs_dt"].isoformat())
+
+    def test_normalize_weather_record_websocket_accepts_single_row(self):
+        rows = bot.normalize_weather_record_payload({
+            "stationCode": "khou",
+            "timestamp": "2026-06-12T16:00:00Z",
+            "temperature": 32,
+        })
+
+        self.assertEqual(1, len(rows))
+        self.assertEqual("KHOU", rows[0]["station"])
+        self.assertEqual(32.0, rows[0]["temp_f"])
+
+    def test_normalize_weather_record_converts_explicit_celsius_to_fahrenheit(self):
+        rows = bot.normalize_weather_record_payload({
+            "StationCode": "KAUS",
+            "TimeStamp": "2026-06-12T16:00:00Z",
+            "Temperature": 31,
+            "TemperatureUnit": "C",
+        })
+
+        self.assertEqual(1, len(rows))
+        self.assertAlmostEqual(87.8, rows[0]["temp_f"])
+        self.assertEqual("C", rows[0]["source_unit"])
+
+    def test_normalize_weather_record_does_not_reconvert_fahrenheit(self):
+        rows = bot.normalize_weather_record_payload({
+            "StationCode": "KAUS",
+            "TimeStamp": "2026-06-12T16:00:00Z",
+            "Temperature": "88°F",
+        })
+
+        self.assertEqual(88.0, rows[0]["temp_f"])
+        self.assertEqual("F", rows[0]["source_unit"])
+
+    def test_weather_record_observed_extremes_accumulates_station_event_day_points(self):
+        config = bot.default_config()
+        rows = [
+            {
+                "station": "KAUS",
+                "obs_dt": bot.datetime(2026, 6, 12, 13, 0, tzinfo=bot.timezone.utc),
+                "temp_c": 29.0,
+                "raw": {},
+            },
+            {
+                "station": "KAUS",
+                "obs_dt": bot.datetime(2026, 6, 12, 14, 0, tzinfo=bot.timezone.utc),
+                "temp_c": 31.0,
+                "raw": {},
+            },
+        ]
+
+        high, low, latest_dt, points = bot.weather_record_observed_extremes(
+            config, "KAUS", "Austin", "2026-06-12", "F", rows
+        )
+
+        self.assertEqual(88, high)
+        self.assertEqual(84, low)
+        self.assertEqual("2026-06-12T09:00:00-05:00", latest_dt.isoformat())
+        self.assertEqual(2, len(points))
+
+    def test_weather_record_observed_extremes_uses_websocket_fahrenheit_directly(self):
+        config = bot.default_config()
+        rows = bot.normalize_weather_record_payload({
+            "StationCode": "KAUS",
+            "TimeStamp": "2026-06-12T14:00:00Z",
+            "Temperature": 88,
+        })
+
+        high, low, _, _ = bot.weather_record_observed_extremes(
+            config, "KAUS", "Austin", "2026-06-12", "F", rows
+        )
+
+        self.assertEqual(88, high)
+        self.assertEqual(88, low)
+
+    def test_raw_websocket_record_does_not_require_parsed_price_rows(self):
+        config = bot.default_config()
+        bot.PRICE_RECORDING_WINDOWS.clear()
+        with tempfile.TemporaryDirectory() as tmp:
+            raw_path = Path(tmp) / "raw.jsonl"
+            config["outputs"]["price_window_raw_jsonl"] = str(raw_path)
+            bot.PRICE_RECORDING_WINDOWS["Austin:KAUS:2026-06-08T17:53:00+00:00"] = {
+                "record_until_monotonic": bot.time.monotonic() + 60,
+                "started_at_utc": "2026-06-08T17:53:00.000+00:00",
+                "record_seconds": 300,
+            }
+
+            bot.record_raw_price_window_message(config, {}, '{"event_type":"heartbeat"}', [], 1780941180.123)
+
+            rows = raw_path.read_text(encoding="utf-8").splitlines()
+        self.assertEqual(1, len(rows))
+        self.assertEqual('{"event_type":"heartbeat"}', rows[0])
+
+    def test_report_schedule_ignores_special_short_interval_minutes(self):
+        times = [
+            bot.datetime(2026, 6, 8, hour, 53, tzinfo=bot.timezone.utc)
+            for hour in range(3, 24)
+        ] + [
+            bot.datetime(2026, 6, 9, hour, 53, tzinfo=bot.timezone.utc)
+            for hour in range(0, 3)
+        ] + [
+            bot.datetime(2026, 6, 9, 2, 56, tzinfo=bot.timezone.utc)
+        ]
+
+        latest, interval, count, minutes, expected = bot.infer_report_schedule_from_times(times, 24)
+
+        self.assertEqual("2026-06-09T02:56:00+00:00", latest.isoformat())
+        self.assertEqual(3600, interval)
+        self.assertEqual(25, count)
+        self.assertEqual([53], minutes)
+        self.assertEqual("2026-06-09T03:53:00+00:00", expected.isoformat())
+
+    def test_report_schedule_supports_twice_hourly_minutes(self):
+        times = []
+        for hour in range(24):
+            times.append(bot.datetime(2026, 6, 8, hour, 23, tzinfo=bot.timezone.utc))
+            times.append(bot.datetime(2026, 6, 8, hour, 53, tzinfo=bot.timezone.utc))
+        times.append(bot.datetime(2026, 6, 8, 12, 31, tzinfo=bot.timezone.utc))
+
+        latest, interval, count, minutes, expected = bot.infer_report_schedule_from_times(times, 24)
+
+        self.assertEqual(1800, interval)
+        self.assertEqual(49, count)
+        self.assertEqual([23, 53], minutes)
+        self.assertEqual("2026-06-09T00:23:00+00:00", expected.isoformat())
+
+
+class TelegramNotificationTest(unittest.TestCase):
+    def setUp(self):
+        self.config = bot.default_config()
+        self.market = bot.TemperatureMarket(
+            event_id="event-1",
+            market_id="market-1",
+            condition_id="condition-1",
+            city="Austin",
+            kind="Highest",
+            event_date="2026-06-08",
+            event_title="Highest temperature in Austin on June 8",
+            market_question="Will the highest temperature in Austin be between 90-91F on June 8?",
+            polymarket_url="https://polymarket.com/event/example",
+            yes_price=0.4,
+            rule_min=90.0,
+            rule_max=91.0,
+            unit="F",
+            raw_market_json='{"outcomes":["Yes","No"],"clobTokenIds":["yes-token","no-token"]}',
+        )
+        self.messages = []
+        self.original_get_telegram_notifier = bot.get_telegram_notifier
+        self.original_best_sell_price = bot.best_sell_price
+        self.original_best_buy_price = bot.best_buy_price
+
+        class FakeNotifier:
+            enabled = True
+
+            def __init__(self, messages):
+                self.messages = messages
+
+            def send(self, message, silent=False):
+                self.messages.append(message)
+
+        fake = FakeNotifier(self.messages)
+        bot.get_telegram_notifier = lambda config: fake
+        bot.best_sell_price = lambda config, market, side: 0.55
+        bot.best_buy_price = lambda config, market, side: 0.90
+
+    def tearDown(self):
+        bot.get_telegram_notifier = self.original_get_telegram_notifier
+        bot.best_sell_price = self.original_best_sell_price
+        bot.best_buy_price = self.original_best_buy_price
+
+    def test_paper_buy_and_sell_send_telegram_notifications(self):
+        trade = bot.make_trade(self.config, "cycle-1", self.market, "", "KAUS", "YES", 0.4, 91.0, 78.0, "unit_test_buy")
+
+        bot.notify_trade(self.config, trade, "BUY", "FILLED", "unit_test_buy")
+        self.assertEqual(1, len(self.messages))
+        self.assertIn("*PAPER BUY FILLED*", self.messages[0])
+        self.assertIn("Austin Highest 2026-06-08", self.messages[0])
+
+        self.assertTrue(bot.close_trade(self.config, trade, self.market, "unit_test_sell"))
+        self.assertEqual(2, len(self.messages))
+        self.assertIn("*PAPER SELL CLOSED*", self.messages[1])
+        self.assertIn("P&L:", self.messages[1])
+
+    def test_no_exit_buys_yes_hedge_when_better_than_selling_no(self):
+        trade = bot.make_trade(self.config, "cycle-1", self.market, "", "KAUS", "NO", 0.4, 92.0, 78.0, "unit_test_buy")
+        bot.best_sell_price = lambda config, market, side: 0.30
+        bot.best_buy_price = lambda config, market, side: 0.60
+
+        self.assertTrue(bot.close_trade(self.config, trade, self.market, "unit_test_invalidated"))
+
+        self.assertEqual("HEDGED", trade.status)
+        self.assertEqual("buy_yes_hedge", trade.exit_action)
+        self.assertEqual(0.60, trade.exit_yes_price)
+        self.assertGreater(trade.exit_hedge_cost_usdc, 0)
+
+    def test_hedged_no_unwinds_yes_when_no_becomes_impossible_again(self):
+        trade = bot.make_trade(self.config, "cycle-1", self.market, "", "KAUS", "NO", 0.4, 92.0, 78.0, "unit_test_buy")
+        trade.status = "HEDGED"
+        trade.exit_action = "buy_yes_hedge"
+        trade.exit_hedge_cost_usdc = 7.5
+        bot.best_sell_price = lambda config, market, side: 0.70 if side == "YES" else 0.30
+
+        self.assertTrue(
+            bot.unwind_yes_hedge_if_no_impossible(
+                self.config,
+                trade,
+                self.market,
+                92.0,
+                78.0,
+                "F",
+                "unit_test_unwind",
+            )
+        )
+
+        self.assertEqual("OPEN", trade.status)
+        self.assertEqual("sell_yes_hedge", trade.exit_action)
+        self.assertEqual(0.70, trade.exit_yes_price)
+        self.assertEqual("yes_hedge_unwound_no_impossible", trade.settlement_source)
+
+
+if __name__ == "__main__":
+    unittest.main()

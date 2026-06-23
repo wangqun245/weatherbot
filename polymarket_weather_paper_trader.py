@@ -3,7 +3,7 @@
 Deterministic Polymarket weather trader.
 
 Only keeps the current strategy:
-- Poll Jack AI Solutions airport weather records during each airport report window.
+- Receive Jack AI Solutions airport weather records by websocket.
 - Use returned observation time and temperature records as the trigger signal.
 - Verify changed observed extremes with TWC historical observations.
 - Buy NO when an option is already impossible, buy YES when the extreme bucket is reached.
@@ -23,6 +23,7 @@ import concurrent.futures
 import csv
 import json
 import logging
+from logging.handlers import RotatingFileHandler
 import os
 import queue
 import re
@@ -36,6 +37,7 @@ from urllib.parse import urljoin
 from zoneinfo import ZoneInfo
 
 import requests
+import websocket
 
 BASE_POLY = "https://polymarket.com"
 DEFAULT_CONFIG_PATH = "polymarket_weather_config.json"
@@ -69,6 +71,8 @@ WEBSOCKET_ASSET_REFRESH_DEDUP: set[tuple[str, str, str]] = set()
 WEBSOCKET_ASSET_REFRESH_LOCK = threading.RLock()
 WEBSOCKET_ASSET_REFRESH_THREADS: list[threading.Thread] = []
 WEATHER_RECORD_POINTS_BY_STATION_EVENT: dict[tuple[str, str], dict[str, tuple[datetime, float]]] = {}
+WEATHER_RECORD_UPDATES: "queue.Queue[list[dict[str, Any]]]" = queue.Queue(maxsize=1000)
+WEATHER_RECORD_ACTIVE_WINDOWS: dict[tuple[str, str], dict[str, Any]] = {}
 TWC_VERIFY_NEXT_AT: dict[str, float] = {}
 HTTP_EXECUTOR = concurrent.futures.ThreadPoolExecutor(max_workers=8, thread_name_prefix="weather-http")
 TGFTP_EXECUTOR = concurrent.futures.ThreadPoolExecutor(max_workers=32, thread_name_prefix="tgftp-http")
@@ -303,8 +307,11 @@ def default_config() -> dict[str, Any]:
         "aviation_poll_after_observation_minutes": 15,
         "aviation_poll_interval_seconds": 60,
         "aviation_refresh_probe_seconds": 180,
-        "weather_record_poll_interval_seconds": 2,
+        "weather_record_websocket_reconnect_seconds": 5,
+        "weather_record_websocket_heartbeat_seconds": 20,
+        "weather_record_websocket_read_timeout_seconds": 5,
         "weather_record_pre_window_seconds": 120,
+        "weather_record_receive_window_seconds": 300,
         "weather_record_timing_refresh_seconds": 60,
         "weather_record_timing_stagger_seconds": 60,
         "tgftp_window_start_delay_seconds": 120,
@@ -324,7 +331,7 @@ def default_config() -> dict[str, Any]:
         "polymarket_gamma_base": "https://gamma-api.polymarket.com",
         "polymarket_data_base": "https://data-api.polymarket.com",
         "polymarket_clob_base": "https://clob.polymarket.com",
-        "weather_record_url": "https://jackaisolutions.us/api/weatherrecord",
+        "weather_record_websocket_url": "wss://jackaisolutions.us/ws/weatherrecord",
         "weather_company_base": "https://api.weather.com",
             "twc_api_key_env": "TWC_API_KEY",
             "twc_api_key": "",
@@ -348,6 +355,8 @@ def default_config() -> dict[str, Any]:
             "log_file": "bot.log",
             "log_level": "INFO",
             "console_log_enabled": False,
+            "log_max_mb": 150,
+            "log_file_count": 3,
         },
         "account": {
             "polymarket_user_address": "",
@@ -466,7 +475,16 @@ def setup_logging(config: dict[str, Any]) -> None:
     """
     outputs = config["outputs"]
     level = getattr(logging, str(outputs.get("log_level", "INFO")).upper(), logging.INFO)
-    handlers: list[logging.Handler] = [logging.FileHandler(outputs["log_file"], encoding="utf-8")]
+    max_bytes = max(1, int(outputs.get("log_max_mb", 150))) * 1024 * 1024
+    file_count = max(1, int(outputs.get("log_file_count", 3)))
+    handlers: list[logging.Handler] = [
+        RotatingFileHandler(
+            outputs["log_file"],
+            maxBytes=max_bytes,
+            backupCount=file_count - 1,
+            encoding="utf-8",
+        )
+    ]
     if outputs.get("console_log_enabled", False):
         handlers.append(logging.StreamHandler())
     logging.basicConfig(level=level, format="%(asctime)s %(levelname)s %(message)s", handlers=handlers, force=True)
@@ -1957,14 +1975,11 @@ def parse_weather_record_timestamp(value: Any) -> Optional[datetime]:
     return datetime.fromtimestamp(raw, timezone.utc)
 
 
-def weather_record_rows(config: dict[str, Any]) -> list[dict[str, Any]]:
-    """Fetch the latest airport temperature records from Jack AI Solutions."""
-    url = str(config.get("api", {}).get("weather_record_url") or "https://jackaisolutions.us/api/weatherrecord")
-    timeout = int(config.get("api", {}).get("request_timeout_seconds", 30))
-    r = requests.get(url, headers=HEADERS, timeout=timeout)
-    r.raise_for_status()
-    payload = r.json()
-    rows = payload.get("value") if isinstance(payload, dict) else payload
+def normalize_weather_record_payload(payload: Any) -> list[dict[str, Any]]:
+    """Normalize one Jack AI weatherrecord websocket message to Fahrenheit."""
+    rows = payload.get("value") if isinstance(payload, dict) and "value" in payload else payload
+    if isinstance(rows, dict):
+        rows = [rows]
     if not isinstance(rows, list):
         return []
     normalized: list[dict[str, Any]] = []
@@ -1976,12 +1991,99 @@ def weather_record_rows(config: dict[str, Any]) -> list[dict[str, Any]]:
         temp_raw = row.get("Temperature") if row.get("Temperature") is not None else row.get("temperature")
         if not station or obs_dt is None or temp_raw is None:
             continue
-        try:
-            temp_c = float(temp_raw)
-        except (TypeError, ValueError):
+        unit_raw = (
+            row.get("TemperatureUnit")
+            or row.get("temperatureUnit")
+            or row.get("TempUnit")
+            or row.get("tempUnit")
+            or row.get("Unit")
+            or row.get("unit")
+            or ""
+        )
+        temp_text = str(temp_raw).strip()
+        match = re.search(r"-?\d+(?:\.\d+)?", temp_text)
+        if not match:
             continue
-        normalized.append({"station": station, "obs_dt": obs_dt, "temp_c": temp_c, "raw": row})
+        temp_value = float(match.group(0))
+        unit_text = f"{unit_raw} {temp_text}".upper()
+        source_unit = "C" if "CELSIUS" in unit_text or re.search(r"°?C\b", unit_text) else "F"
+        temp_f = convert_temperature(temp_value, source_unit, "F")
+        if temp_f is None:
+            continue
+        normalized.append({
+            "station": station,
+            "obs_dt": obs_dt,
+            "temp_f": float(temp_f),
+            "source_unit": source_unit,
+            "raw": row,
+        })
     return normalized
+
+
+def enqueue_weather_record_update(rows: list[dict[str, Any]]) -> None:
+    """Queue a websocket update without letting a slow consumer block the feed."""
+    if not rows:
+        return
+    try:
+        WEATHER_RECORD_UPDATES.put_nowait(rows)
+    except queue.Full:
+        try:
+            WEATHER_RECORD_UPDATES.get_nowait()
+        except queue.Empty:
+            pass
+        WEATHER_RECORD_UPDATES.put_nowait(rows)
+
+
+def weather_record_websocket_listener(config: dict[str, Any]) -> None:
+    """Receive Jack AI weather records continuously and reconnect after failures."""
+    url = str(
+        config.get("api", {}).get("weather_record_websocket_url")
+        or "wss://jackaisolutions.us/ws/weatherrecord"
+    )
+    reconnect_seconds = max(1.0, float(config["trading"].get("weather_record_websocket_reconnect_seconds", 5)))
+    heartbeat_seconds = max(5.0, float(config["trading"].get("weather_record_websocket_heartbeat_seconds", 20)))
+    read_timeout_seconds = max(1.0, float(config["trading"].get("weather_record_websocket_read_timeout_seconds", 5)))
+    while True:
+        ws = None
+        try:
+            LOGGER.info("weatherrecord websocket connecting url=%s", url)
+            ws = websocket.create_connection(url, timeout=30)
+            ws.settimeout(read_timeout_seconds)
+            next_ping_at = time.monotonic() + heartbeat_seconds
+            LOGGER.info(
+                "weatherrecord websocket connected url=%s heartbeat_seconds=%s read_timeout_seconds=%s",
+                url,
+                heartbeat_seconds,
+                read_timeout_seconds,
+            )
+            while True:
+                message = None
+                try:
+                    message = ws.recv()
+                except websocket.WebSocketTimeoutException:
+                    pass
+                if message is not None:
+                    if message == "":
+                        raise ConnectionError("weatherrecord websocket closed")
+                    if isinstance(message, bytes):
+                        message = message.decode("utf-8")
+                    rows = normalize_weather_record_payload(json.loads(message))
+                    enqueue_weather_record_update(rows)
+                    LOGGER.info("weatherrecord websocket received rows=%s", len(rows))
+                now_mono = time.monotonic()
+                if now_mono >= next_ping_at:
+                    ws.ping()
+                    LOGGER.debug("weatherrecord websocket ping sent")
+                    next_ping_at = now_mono + heartbeat_seconds
+        except Exception:
+            LOGGER.exception("weatherrecord websocket disconnected; reconnecting in %ss", reconnect_seconds)
+        finally:
+            if ws is not None:
+                try:
+                    ws.close()
+                except Exception:
+                    pass
+        time.sleep(reconnect_seconds)
 
 
 def append_weather_record_history(config: dict[str, Any], rows: list[dict[str, Any]], reason: str) -> None:
@@ -1997,7 +2099,7 @@ def weather_record_observed_extremes(
     unit: str,
     rows: list[dict[str, Any]],
 ) -> tuple[Optional[float], Optional[float], Optional[datetime], list[tuple[datetime, float]]]:
-    """Update in-memory event-day extremes from weatherrecord API rows for one station."""
+    """Update in-memory event-day extremes from weatherrecord websocket rows for one station."""
     station_key = station.strip().upper()
     city_tz = city_timezone(config, city)
     points_by_time = WEATHER_RECORD_POINTS_BY_STATION_EVENT.setdefault((station_key, event_date), {})
@@ -2010,7 +2112,13 @@ def weather_record_observed_extremes(
         local_dt = obs_dt.astimezone(city_tz)
         if local_dt.date().isoformat() != event_date:
             continue
-        temp_f = convert_temperature(float(row["temp_c"]), "C", "F")
+        if row.get("temp_f") is not None:
+            temp_f = float(row["temp_f"])
+        elif row.get("temp_c") is not None:
+            # Compatibility with records normalized by older API-based versions.
+            temp_f = convert_temperature(float(row["temp_c"]), "C", "F")
+        else:
+            continue
         temp = convert_temperature(temp_f, "F", unit) if unit.upper() != "F" else temp_f
         if temp is None:
             continue
@@ -2265,8 +2373,16 @@ def in_station_report_window(config: dict[str, Any], city: str, station: str, no
 
 
 def in_station_weather_record_window(config: dict[str, Any], city: str, station: str, now_utc: Optional[datetime] = None) -> tuple[bool, dict[str, Any]]:
-    """Return whether current time is inside the weatherrecord pre/report window."""
+    """Keep a station's weatherrecord window active through five post-observation minutes."""
     state = STATION_REPORT_TIMING.get((city, station), {})
+    now_value = (now_utc or datetime.now(timezone.utc)).astimezone(timezone.utc)
+    window_key = (city, station)
+    active = WEATHER_RECORD_ACTIVE_WINDOWS.get(window_key)
+    if active:
+        active_until = active.get("active_until_utc")
+        if isinstance(active_until, datetime) and now_value < active_until:
+            return True, state
+        WEATHER_RECORD_ACTIVE_WINDOWS.pop(window_key, None)
     expected_raw = state.get("expected_next_obs_utc")
     if not expected_raw:
         return False, state
@@ -2274,10 +2390,23 @@ def in_station_weather_record_window(config: dict[str, Any], city: str, station:
         expected = datetime.fromisoformat(str(expected_raw).replace("Z", "+00:00")).astimezone(timezone.utc)
     except ValueError:
         return False, state
-    now_value = (now_utc or datetime.now(timezone.utc)).astimezone(timezone.utc)
     pre_seconds = max(0, int(config.get("trading", {}).get("weather_record_pre_window_seconds", 120)))
-    window_seconds = max(1, int(config.get("price_momentum", {}).get("report_window_seconds", 210)))
-    return expected - timedelta(seconds=pre_seconds) <= now_value < expected + timedelta(seconds=window_seconds), state
+    receive_seconds = max(300, int(config.get("trading", {}).get("weather_record_receive_window_seconds", 300)))
+    active_until = expected + timedelta(seconds=receive_seconds)
+    inside = expected - timedelta(seconds=pre_seconds) <= now_value < active_until
+    if inside:
+        WEATHER_RECORD_ACTIVE_WINDOWS[window_key] = {
+            "expected_obs_utc": expected,
+            "active_until_utc": active_until,
+        }
+        LOGGER.info(
+            "weatherrecord station window active city=%s station=%s expected_obs_utc=%s active_until_utc=%s",
+            city,
+            station,
+            expected.isoformat(),
+            active_until.isoformat(),
+        )
+    return inside, state
 
 
 def momentum_target_price(base_price: float, fraction: float) -> float:
@@ -3758,7 +3887,7 @@ def verify_open_positions_with_twc(config: dict[str, Any], trigger_context: Opti
         if trigger_city and trade.city != trigger_city:
             continue
         source_text = (trade.forecast_source or "").lower()
-        if not any(token in source_text for token in ("metar", "weatherrecord_api", "tgftp")):
+        if not any(token in source_text for token in ("metar", "weatherrecord", "tgftp")):
             continue
         try:
             event = fetch_event_by_url(config, trade.polymarket_url, trade.city, trade.kind, trade.event_date)
@@ -3820,7 +3949,7 @@ def verify_open_positions_with_twc(config: dict[str, Any], trigger_context: Opti
 
             triggered_by_position_price = bool(trigger_market_id and trigger_market_id == trade.market_id)
             price_momentum_trade = "price_momentum" in (trade.forecast_source or "").lower()
-            post_buy_validation_trade = any(token in source_text for token in ("weatherrecord_api", "tgftp", "metar"))
+            post_buy_validation_trade = any(token in source_text for token in ("weatherrecord", "tgftp", "metar"))
             staggered_validation = str(trigger_context.get("source") or "") == "staggered_twc_position_verification"
             expired = trade_age_seconds(trade) >= verify_seconds
             if triggered_by_position_price or expired or price_momentum_trade or (staggered_validation and post_buy_validation_trade):
@@ -5435,10 +5564,10 @@ def start_aviation_thread(config: dict[str, Any]) -> threading.Thread:
 
 
 def weather_record_supervisor(config: dict[str, Any]) -> None:
-    """Poll weatherrecord API every two seconds inside airport report windows."""
+    """Process pushed weatherrecord observations inside airport report windows."""
     fallback_poll_seconds = max(10, int(config["trading"].get("aviation_poll_interval_seconds", 60)))
-    api_poll_seconds = max(1, int(config["trading"].get("weather_record_poll_interval_seconds", 2)))
     pre_window_seconds = max(0, int(config["trading"].get("weather_record_pre_window_seconds", 120)))
+    receive_window_seconds = max(300, int(config["trading"].get("weather_record_receive_window_seconds", 300)))
     timing_refresh_seconds = max(10, int(config["trading"].get("weather_record_timing_refresh_seconds", 60)))
     timing_stagger_seconds = max(1, int(config["trading"].get("weather_record_timing_stagger_seconds", timing_refresh_seconds)))
     tgftp_start_delay_seconds = max(0, int(config["trading"].get("tgftp_window_start_delay_seconds", 90)))
@@ -5459,14 +5588,12 @@ def weather_record_supervisor(config: dict[str, Any]) -> None:
     clob_momentum_pending: dict[str, dict[str, Any]] = {}
     event_state: dict[tuple[str, str, str], dict[str, Any]] = {}
     event_refresh_at = 0.0
-    next_api_poll_at = 0.0
-    weather_record_pending: Optional[dict[str, Any]] = None
     next_tgftp_poll_at = 0.0
     next_clob_poll_at = 0.0
     LOGGER.info(
-        "weatherrecord supervisor started api_poll_seconds=%s pre_window_seconds=%s timing_refresh_seconds=%s timing_stagger_seconds=%s tgftp_start_delay_seconds=%s tgftp_min_interval_seconds=%s tgftp_max_inflight=%s clob_poll_enabled=%s clob_poll_interval_seconds=%s clob_no_change_fraction=%s clob_max_inflight=%s fallback_poll_seconds=%s",
-        api_poll_seconds,
+        "weatherrecord supervisor started source=websocket pre_window_seconds=%s receive_window_seconds=%s timing_refresh_seconds=%s timing_stagger_seconds=%s tgftp_start_delay_seconds=%s tgftp_min_interval_seconds=%s tgftp_max_inflight=%s clob_poll_enabled=%s clob_poll_interval_seconds=%s clob_no_change_fraction=%s clob_max_inflight=%s fallback_poll_seconds=%s",
         pre_window_seconds,
+        receive_window_seconds,
         timing_refresh_seconds,
         timing_stagger_seconds,
         tgftp_start_delay_seconds,
@@ -5788,16 +5915,14 @@ def weather_record_supervisor(config: dict[str, Any]) -> None:
                     if stale_key in pending.get("window_keys", set()):
                         clob_momentum_pending.pop(request_key, None)
 
-            if weather_record_pending and weather_record_pending["future"].done():
-                pending_window_groups = weather_record_pending["window_groups"]
+            while weather_record_groups:
                 try:
-                    rows = weather_record_pending["future"].result()
-                except Exception:
-                    LOGGER.exception("weatherrecord poll task failed")
-                    rows = []
-                append_weather_record_history(config, rows, "weatherrecord_window_poll")
-                LOGGER.info("weatherrecord poll completed rows=%s active_windows=%s", len(rows), len(pending_window_groups))
-                for _, group, _ in pending_window_groups:
+                    rows = WEATHER_RECORD_UPDATES.get_nowait()
+                except queue.Empty:
+                    break
+                append_weather_record_history(config, rows, "weatherrecord_websocket")
+                LOGGER.info("weatherrecord websocket processing rows=%s active_windows=%s", len(rows), len(weather_record_groups))
+                for _, group, _ in weather_record_groups:
                     city = str(group["city"])
                     station = str(group["station"])
                     for event in list(group["events"]):
@@ -5843,7 +5968,7 @@ def weather_record_supervisor(config: dict[str, Any]) -> None:
                             process_deterministic_harvest(
                                 config,
                                 {
-                                    "source": "weatherrecord_api",
+                                    "source": "weatherrecord_websocket",
                                     "city": city,
                                     "kind": kind,
                                     "event_date": event_date,
@@ -5855,16 +5980,6 @@ def weather_record_supervisor(config: dict[str, Any]) -> None:
                             )
                         except Exception:
                             LOGGER.exception("weatherrecord event failed city=%s kind=%s station=%s", city, kind, station)
-                weather_record_pending = None
-
-            if weather_record_groups and now_mono >= next_api_poll_at and weather_record_pending is None:
-                weather_record_pending = {
-                    "future": HTTP_EXECUTOR.submit(weather_record_rows, config),
-                    "window_groups": list(weather_record_groups),
-                }
-                LOGGER.info("weatherrecord poll queued active_windows=%s pre_window_seconds=%s", len(weather_record_groups), pre_window_seconds)
-                next_api_poll_at = now_mono + api_poll_seconds
-
             next_tgftp_due = now_mono + fallback_poll_seconds
             if eligible_tgftp_groups:
                 for window_key, group, timing, expected_dt in eligible_tgftp_groups:
@@ -5974,8 +6089,6 @@ def weather_record_supervisor(config: dict[str, Any]) -> None:
             sleep_seconds = fallback_poll_seconds
             if window_groups or weather_record_groups:
                 wakeup_candidates = []
-                if weather_record_groups:
-                    wakeup_candidates.append(next_api_poll_at)
                 if eligible_tgftp_groups:
                     wakeup_candidates.append(next_tgftp_poll_at)
                 if eligible_clob_groups:
@@ -5995,7 +6108,14 @@ def weather_record_supervisor(config: dict[str, Any]) -> None:
 
 
 def start_weather_record_thread(config: dict[str, Any]) -> threading.Thread:
-    """Start the weatherrecord polling supervisor in a daemon thread."""
+    """Start the weatherrecord websocket listener and processing supervisor."""
+    listener = threading.Thread(
+        target=weather_record_websocket_listener,
+        args=(config,),
+        name="weatherrecord-websocket",
+        daemon=True,
+    )
+    listener.start()
     thread = threading.Thread(target=weather_record_supervisor, args=(config,), name="deterministic-weatherrecord", daemon=True)
     thread.start()
     return thread
@@ -6014,7 +6134,7 @@ def trade_needs_twc_verification(config: dict[str, Any], trade: PaperTrade) -> b
     if trade.status not in {"OPEN", "HEDGED"} or trade.strategy != str(config["trading"]["strategy_name"]):
         return False
     source_text = (trade.forecast_source or "").lower()
-    return any(token in source_text for token in ("metar", "weatherrecord_api", "tgftp"))
+    return any(token in source_text for token in ("metar", "weatherrecord", "tgftp"))
 
 
 def twc_verification_supervisor(config: dict[str, Any]) -> None:

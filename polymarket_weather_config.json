@@ -3,7 +3,7 @@
                 "polymarket_gamma_base":  "https://gamma-api.polymarket.com",
                 "polymarket_data_base":  "https://data-api.polymarket.com",
                 "polymarket_clob_base":  "https://clob.polymarket.com",
-                "weather_record_url":  "https://jackaisolutions.us/api/weatherrecord",
+                "weather_record_websocket_url":  "wss://jackaisolutions.us/ws/weatherrecord",
                 "weather_company_base":  "https://api.weather.com",
                 "twc_api_key_env":  "TWC_API_KEY",
                 "twc_api_key":  "e1f10a1e78da46f5b10a1e78da96f525",
@@ -59,8 +59,8 @@
                                      }
                },
     "trading":  {
-                    "strategy_name":  "deterministic_harvest",
-                    "strategy_mode":  "deterministic_harvest",
+                    "strategy_name":  "model_awc_high",
+                    "strategy_mode":  "model_awc_high",
                     "buy_notional_usdc":  5,
                     "fee_rate":  0.05,
                     "fee_enabled":  true,
@@ -72,7 +72,9 @@
                     "aviation_poll_after_observation_minutes":  15,
                     "aviation_poll_interval_seconds":  60,
                     "aviation_refresh_probe_seconds":  180,
-                    "weather_record_poll_interval_seconds":  2,
+                    "weather_record_websocket_reconnect_seconds":  5,
+                    "weather_record_websocket_heartbeat_seconds":  20,
+                    "weather_record_websocket_read_timeout_seconds":  5,
                     "weather_record_timing_refresh_seconds":  60,
                     "weather_record_timing_stagger_seconds":  60,
                     "tgftp_window_start_delay_seconds":  120,
@@ -98,7 +100,33 @@
                     "depth_price_notional_multiplier":  2.0,
                     "depth_price_extra_levels":  1,
                     "weather_record_pre_window_seconds":  120,
+                    "weather_record_receive_window_seconds":  300,
                     "tgftp_window_max_inflight_per_station":  10
+                    ,"model_awc_enabled": true
+                    ,"model_awc_model_path": "models\\lightgbm_rolling_6y_holdout_24h_lag6_20260623_205608\\lightgbm_metar_high_rolling_6y_best.pkl"
+                    ,"model_awc_live_station": "KAUS"
+                    ,"model_awc_buy_start_hour": 12
+                    ,"model_awc_buy_end_hour": 18
+                    ,"model_awc_metar_lookback_hours": 7
+                    ,"model_awc_observation_minute": 53
+                    ,"model_awc_station_observation_minutes": {
+                        "KORD": 53,
+                        "KATL": 54,
+                        "KLGA": 54,
+                        "KSFO": 59,
+                        "KBKF": 0,
+                        "KAUS": 56,
+                        "KDAL": 56,
+                        "KHOU": 56,
+                        "KSEA": 56,
+                        "KDEN": 56,
+                        "KMIA": 56
+                    }
+                    ,"model_awc_station_poll_stagger_seconds": 5
+                    ,"model_awc_lag_tolerance_minutes": 30
+                    ,"model_awc_poll_delay_seconds": 180
+                    ,"model_awc_poll_interval_seconds": 60
+                    ,"model_awc_poll_attempts": 5
                 },
     "scheduler":  {
                       "poll_interval_minutes":  15,
@@ -118,7 +146,9 @@
                     "price_window_raw_jsonl":  "price_window_raw.jsonl",
                     "log_file":  "bot.log",
                     "log_level":  "INFO",
-                    "console_log_enabled":  false
+                    "console_log_enabled":  false,
+                    "log_max_mb":  150,
+                    "log_file_count":  3
                 },
     "account":  {
                     "polymarket_user_address":  "",
@@ -137,7 +167,7 @@
                           "telegram_notify_order_filled":  true
                       },
     "price_momentum":  {
-                           "enabled":  true,
+                           "enabled":  false,
                            "awc_extreme_harvest_enabled":  false,
                            "move_to_one_fraction":  0.3,
                            "no_change_pct":  0.3,
@@ -162,7 +192,7 @@
                        },
     "strategies":  [
                        {
-                           "name":  "deterministic_harvest",
+                           "name":  "model_awc_high",
                            "enabled":  true,
                            "events":  {
                                           "target_dates":  [
@@ -170,8 +200,8 @@
                                                            ]
                                       },
                            "trading":  {
-                                           "strategy_name":  "deterministic_harvest",
-                                           "strategy_mode":  "deterministic_harvest",
+                                           "strategy_name":  "model_awc_high",
+                                           "strategy_mode":  "model_awc_high",
                                            "buy_notional_usdc":  5,
                                            "fee_rate":  0.05,
                                            "fee_enabled":  true,
@@ -183,7 +213,9 @@
                                            "aviation_poll_after_observation_minutes":  15,
                                            "aviation_poll_interval_seconds":  60,
                                            "aviation_refresh_probe_seconds":  180,
-                                           "weather_record_poll_interval_seconds":  2,
+                                           "weather_record_websocket_reconnect_seconds":  5,
+                                           "weather_record_websocket_heartbeat_seconds":  20,
+                                           "weather_record_websocket_read_timeout_seconds":  5,
                                            "weather_record_timing_refresh_seconds":  60,
                                            "weather_record_timing_stagger_seconds":  60,
                                            "tgftp_window_start_delay_seconds":  120,
@@ -207,7 +239,33 @@
                                            "live_order_timeout_seconds":  20,
                                            "live_order_check_seconds":  1,
                                            "weather_record_pre_window_seconds":  120,
+                                           "weather_record_receive_window_seconds":  300,
                                            "tgftp_window_max_inflight_per_station":  10
+                                           ,"model_awc_enabled": true
+                                           ,"model_awc_model_path": "models\\lightgbm_rolling_6y_holdout_24h_lag6_20260623_205608\\lightgbm_metar_high_rolling_6y_best.pkl"
+                                           ,"model_awc_live_station": "KAUS"
+                                           ,"model_awc_buy_start_hour": 12
+                                           ,"model_awc_buy_end_hour": 18
+                                           ,"model_awc_metar_lookback_hours": 7
+                                           ,"model_awc_observation_minute": 53
+                                           ,"model_awc_station_observation_minutes": {
+                                               "KORD": 53,
+                                               "KATL": 54,
+                                               "KLGA": 54,
+                                               "KSFO": 59,
+                                               "KBKF": 0,
+                                               "KAUS": 56,
+                                               "KDAL": 56,
+                                               "KHOU": 56,
+                                               "KSEA": 56,
+                                               "KDEN": 56,
+                                               "KMIA": 56
+                                           }
+                                           ,"model_awc_station_poll_stagger_seconds": 5
+                                           ,"model_awc_lag_tolerance_minutes": 30
+                                           ,"model_awc_poll_delay_seconds": 180
+                                           ,"model_awc_poll_interval_seconds": 60
+                                           ,"model_awc_poll_attempts": 5
                                        }
                        }
                    ]

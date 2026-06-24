@@ -105,6 +105,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--input-dir", type=Path, default=DEFAULT_INPUT_DIR)
     parser.add_argument("--lag-tolerance-minutes", type=int, default=30)
+    parser.add_argument("--max-lag-hours", type=int, default=3)
     parser.add_argument("--combined-file", type=Path)
     parser.add_argument("--overwrite", action="store_true")
     return parser.parse_args()
@@ -352,7 +353,7 @@ def decode_metar(row: MetarRow, station_icao: str, tz: ZoneInfo) -> dict[str, ob
     return features
 
 
-FEATURE_COLUMNS = [
+BASE_FEATURE_COLUMNS = [
     "station_id",
     "valid_utc_epoch",
     "local_year",
@@ -394,15 +395,21 @@ FEATURE_COLUMNS = [
     "lowest_ceiling_ft",
     "wx_token_count",
     *[f"wx_{code.lower()}" for code in WX_CODES],
-    "temp_f_lag_1h",
-    "temp_f_lag_2h",
-    "temp_f_lag_3h",
-    "temp_f_change_1h",
-    "temp_f_change_2h",
-    "temp_f_change_3h",
 ]
 
-OUTPUT_COLUMNS = ["daily_high_f", "station", "valid", "metar", *FEATURE_COLUMNS]
+
+def feature_columns(max_lag_hours: int) -> list[str]:
+    lag_columns = [f"temp_f_lag_{hours}h" for hours in range(1, max_lag_hours + 1)]
+    change_columns = [f"temp_f_change_{hours}h" for hours in range(1, max_lag_hours + 1)]
+    return [*BASE_FEATURE_COLUMNS, *lag_columns, *change_columns]
+
+
+def output_columns(max_lag_hours: int) -> list[str]:
+    return ["daily_high_f", "station", "valid", "metar", *feature_columns(max_lag_hours)]
+
+
+FEATURE_COLUMNS = feature_columns(3)
+OUTPUT_COLUMNS = output_columns(3)
 
 
 def read_rows(path: Path) -> list[MetarRow]:
@@ -470,6 +477,9 @@ def write_station_features(
     output_file: Path,
     combined_writer: csv.DictWriter,
     tolerance: timedelta,
+    max_lag_hours: int,
+    columns: list[str],
+    fieldnames: list[str],
 ) -> Counter:
     rows = read_rows(input_file)
     station_icao = station_icao_from_path(input_file, rows)
@@ -486,12 +496,12 @@ def write_station_features(
 
     stats: Counter = Counter(input_rows=len(rows), output_rows=0)
     with output_file.open("w", encoding="utf-8", newline="") as handle:
-        writer = csv.DictWriter(handle, fieldnames=OUTPUT_COLUMNS, lineterminator="\n")
+        writer = csv.DictWriter(handle, fieldnames=fieldnames, lineterminator="\n")
         writer.writeheader()
 
         for row, features in zip(rows, decoded):
             temp_f = features.get("temp_f")
-            for hours in (1, 2, 3):
+            for hours in range(1, max_lag_hours + 1):
                 lag_value = nearest_lag_value(
                     row.valid_utc - timedelta(hours=hours),
                     valid_times,
@@ -509,11 +519,11 @@ def write_station_features(
                 "valid": row.valid_text,
                 "metar": row.metar,
             }
-            output_row.update({column: blank(features.get(column)) for column in FEATURE_COLUMNS})
+            output_row.update({column: blank(features.get(column)) for column in columns})
             writer.writerow(output_row)
             combined_writer.writerow(output_row)
             stats["output_rows"] += 1
-            for hours in (1, 2, 3):
+            for hours in range(1, max_lag_hours + 1):
                 if features.get(f"temp_f_lag_{hours}h") is None:
                     stats[f"missing_temp_lag_{hours}h"] += 1
 
@@ -523,7 +533,7 @@ def write_station_features(
 def input_feature_sources(input_dir: Path) -> list[Path]:
     return [
         path
-        for path in sorted(input_dir.glob("K*_local_0900_1900_daily_high.csv"))
+        for path in sorted(input_dir.glob("K*_local_*_daily_high.csv"))
         if not path.name.endswith("_features.csv")
     ]
 
@@ -532,6 +542,8 @@ def main() -> int:
     args = parse_args()
     if not args.input_dir.exists():
         raise SystemExit(f"Input directory does not exist: {args.input_dir}")
+    if args.max_lag_hours < 1:
+        raise SystemExit("--max-lag-hours must be >= 1")
     if args.combined_file is None:
         args.combined_file = args.input_dir / DEFAULT_COMBINED_NAME
     sources = input_feature_sources(args.input_dir)
@@ -550,14 +562,24 @@ def main() -> int:
     summary: dict[str, dict[str, int | str]] = {}
     totals: Counter = Counter()
     tolerance = timedelta(minutes=args.lag_tolerance_minutes)
+    columns = feature_columns(args.max_lag_hours)
+    fieldnames = output_columns(args.max_lag_hours)
 
     with args.combined_file.open("w", encoding="utf-8", newline="") as combined_handle:
-        combined_writer = csv.DictWriter(combined_handle, fieldnames=OUTPUT_COLUMNS, lineterminator="\n")
+        combined_writer = csv.DictWriter(combined_handle, fieldnames=fieldnames, lineterminator="\n")
         combined_writer.writeheader()
 
         for source in sources:
             output_file = feature_file_for(source)
-            stats = write_station_features(source, output_file, combined_writer, tolerance)
+            stats = write_station_features(
+                source,
+                output_file,
+                combined_writer,
+                tolerance,
+                args.max_lag_hours,
+                columns,
+                fieldnames,
+            )
             stats["output_file"] = str(output_file)
             summary[source.name] = dict(stats)
             totals.update({key: value for key, value in stats.items() if isinstance(value, int)})
@@ -569,6 +591,7 @@ def main() -> int:
     summary["_totals"] = dict(totals)
     summary["_config"] = {
         "lag_tolerance_minutes": args.lag_tolerance_minutes,
+        "max_lag_hours": args.max_lag_hours,
         "combined_file": str(args.combined_file),
     }
     summary_file = args.input_dir / "feature_summary.json"

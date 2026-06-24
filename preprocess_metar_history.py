@@ -42,13 +42,18 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
             "Drop AUTO METARs, compute city-local daily highs from RMK T groups, "
-            "and export 09:00-19:00 local-time training rows per station."
+            "and export local-time training rows per station."
         )
     )
     parser.add_argument("--input-dir", type=Path, default=DEFAULT_INPUT_DIR)
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
     parser.add_argument("--start-hour", type=int, default=9)
     parser.add_argument("--end-hour", type=int, default=19)
+    parser.add_argument(
+        "--full-day",
+        action="store_true",
+        help="Export all local-time rows for each local day instead of applying the hour window.",
+    )
     parser.add_argument(
         "--overwrite",
         action="store_true",
@@ -130,6 +135,7 @@ def write_training_rows(
     daily_highs_c: dict[str, float],
     start_hour: int,
     end_hour: int,
+    full_day: bool,
     stats: Counter,
 ) -> None:
     with output_file.open("w", encoding="utf-8", newline="") as out_handle:
@@ -145,12 +151,13 @@ def write_training_rows(
                         continue
 
                     local_dt = row.valid_utc.astimezone(tz)
-                    if local_dt.hour < start_hour or local_dt.hour > end_hour:
-                        stats["non_auto_rows_outside_local_window"] += 1
-                        continue
-                    if local_dt.hour == end_hour and (local_dt.minute, local_dt.second, local_dt.microsecond) > (0, 0, 0):
-                        stats["non_auto_rows_outside_local_window"] += 1
-                        continue
+                    if not full_day:
+                        if local_dt.hour < start_hour or local_dt.hour > end_hour:
+                            stats["non_auto_rows_outside_local_window"] += 1
+                            continue
+                        if local_dt.hour == end_hour and (local_dt.minute, local_dt.second, local_dt.microsecond) > (0, 0, 0):
+                            stats["non_auto_rows_outside_local_window"] += 1
+                            continue
 
                     local_date = local_dt.date().isoformat()
                     high_c = daily_highs_c.get(local_date)
@@ -163,6 +170,12 @@ def write_training_rows(
                     stats["output_rows"] += 1
 
 
+def output_window_label(start_hour: int, end_hour: int, full_day: bool) -> str:
+    if full_day:
+        return "0000_2359"
+    return f"{start_hour:02d}00_{end_hour:02d}00"
+
+
 def main() -> int:
     args = parse_args()
     if not args.input_dir.exists():
@@ -172,6 +185,7 @@ def main() -> int:
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
     station_dirs = [p for p in sorted(args.input_dir.iterdir()) if p.is_dir()]
+    window_label = output_window_label(args.start_hour, args.end_hour, args.full_day)
 
     summary: dict[str, dict[str, int | str]] = {}
     totals: Counter = Counter()
@@ -184,7 +198,7 @@ def main() -> int:
             missing_timezone.append(station)
             continue
 
-        output_file = args.output_dir / f"{station}_local_0900_1900_daily_high.csv"
+        output_file = args.output_dir / f"{station}_local_{window_label}_daily_high.csv"
         if output_file.exists() and not args.overwrite:
             raise SystemExit(f"Output exists; rerun with --overwrite to replace it: {output_file}")
 
@@ -198,10 +212,13 @@ def main() -> int:
             daily_highs_c=daily_highs_c,
             start_hour=args.start_hour,
             end_hour=args.end_hour,
+            full_day=args.full_day,
             stats=stats,
         )
         stats["source_files"] = len(station_files(station_dir))
         stats["timezone"] = tz_name
+        stats["local_window"] = window_label
+        stats["full_day"] = int(args.full_day)
         stats["output_file"] = str(output_file)
         summary[station] = dict(stats)
         totals.update({key: value for key, value in stats.items() if isinstance(value, int)})

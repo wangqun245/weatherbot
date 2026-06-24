@@ -29,6 +29,7 @@ import queue
 import re
 import threading
 import time
+import warnings
 from collections import Counter
 from dataclasses import MISSING, asdict, dataclass, fields
 from datetime import date, datetime, timedelta, timezone
@@ -36,8 +37,15 @@ from typing import Any, Iterable, Optional
 from urllib.parse import urljoin
 from zoneinfo import ZoneInfo
 
+import joblib
 import requests
 import websocket
+from featurize_metar_history import (
+    MetarRow as FeatureMetarRow,
+    STATION_IDS as FEATURE_STATION_IDS,
+    decode_metar,
+    nearest_lag_value,
+)
 
 BASE_POLY = "https://polymarket.com"
 DEFAULT_CONFIG_PATH = "polymarket_weather_config.json"
@@ -74,6 +82,8 @@ WEATHER_RECORD_POINTS_BY_STATION_EVENT: dict[tuple[str, str], dict[str, tuple[da
 WEATHER_RECORD_UPDATES: "queue.Queue[list[dict[str, Any]]]" = queue.Queue(maxsize=1000)
 WEATHER_RECORD_ACTIVE_WINDOWS: dict[tuple[str, str], dict[str, Any]] = {}
 TWC_VERIFY_NEXT_AT: dict[str, float] = {}
+MODEL_AWC_MODEL: Any = None
+MODEL_AWC_MODEL_PATH: str = ""
 HTTP_EXECUTOR = concurrent.futures.ThreadPoolExecutor(max_workers=8, thread_name_prefix="weather-http")
 TGFTP_EXECUTOR = concurrent.futures.ThreadPoolExecutor(max_workers=32, thread_name_prefix="tgftp-http")
 CLOB_POLL_EXECUTOR = concurrent.futures.ThreadPoolExecutor(max_workers=32, thread_name_prefix="clob-poll")
@@ -325,6 +335,31 @@ def default_config() -> dict[str, Any]:
         "live_order_check_seconds": 1,
         "depth_price_notional_multiplier": 2.0,
         "depth_price_extra_levels": 1,
+        "model_awc_enabled": True,
+        "model_awc_model_path": r"models\lightgbm_rolling_6y_holdout_24h_lag6_20260623_205608\lightgbm_metar_high_rolling_6y_best.pkl",
+        "model_awc_live_station": "KAUS",
+        "model_awc_buy_start_hour": 12,
+        "model_awc_buy_end_hour": 18,
+        "model_awc_metar_lookback_hours": 7,
+        "model_awc_observation_minute": 53,
+        "model_awc_station_observation_minutes": {
+            "KORD": 53,
+            "KATL": 54,
+            "KLGA": 54,
+            "KSFO": 59,
+            "KBKF": 0,
+            "KAUS": 56,
+            "KDAL": 56,
+            "KHOU": 56,
+            "KSEA": 56,
+            "KDEN": 56,
+            "KMIA": 56,
+        },
+        "model_awc_station_poll_stagger_seconds": 5,
+        "model_awc_lag_tolerance_minutes": 30,
+        "model_awc_poll_delay_seconds": 180,
+        "model_awc_poll_interval_seconds": 60,
+        "model_awc_poll_attempts": 5,
     }
     return {
     "api": {
@@ -408,11 +443,12 @@ def active_config(config: dict[str, Any]) -> dict[str, Any]:
         dict[str, Any]: Configuration scoped to the enabled deterministic strategy.
     """
     strategies = [s for s in config.get("strategies", []) if s.get("enabled", True)]
-    deterministic = [s for s in strategies if s.get("trading", {}).get("strategy_mode") == "deterministic_harvest"]
+    supported_modes = {"deterministic_harvest", "model_awc_high"}
+    deterministic = [s for s in strategies if s.get("trading", {}).get("strategy_mode") in supported_modes]
     if not deterministic:
-        if config.get("trading", {}).get("strategy_mode") == "deterministic_harvest":
+        if config.get("trading", {}).get("strategy_mode") in supported_modes:
             return config
-        raise RuntimeError("No enabled deterministic_harvest strategy found in config.")
+        raise RuntimeError("No enabled weather strategy found in config.")
     selected = deterministic[0]
     merged = deep_merge(config, selected)
     merged["strategies"] = [selected]
@@ -1956,6 +1992,269 @@ def aviation_observed_extremes(config: dict[str, Any], station: str, city: str, 
     return high, low, latest_dt, points
 
 
+def model_awc_enabled(config: dict[str, Any]) -> bool:
+    """Return whether the AWC METAR model strategy should run."""
+    return bool(config.get("trading", {}).get("model_awc_enabled", True))
+
+
+def model_awc_live_station(config: dict[str, Any]) -> str:
+    """Return the one station allowed to place real live orders."""
+    return str(config.get("trading", {}).get("model_awc_live_station", "KAUS")).upper()
+
+
+def model_awc_load_model(config: dict[str, Any]) -> Any:
+    """Load and cache the latest trained LightGBM model."""
+    global MODEL_AWC_MODEL, MODEL_AWC_MODEL_PATH
+    path = str(config.get("trading", {}).get("model_awc_model_path") or "").strip()
+    if not path:
+        raise RuntimeError("trading.model_awc_model_path is required")
+    abs_path = os.path.abspath(path)
+    if MODEL_AWC_MODEL is None or MODEL_AWC_MODEL_PATH != abs_path:
+        MODEL_AWC_MODEL = joblib.load(abs_path)
+        MODEL_AWC_MODEL_PATH = abs_path
+        LOGGER.info("model awc loaded path=%s features=%s", abs_path, len(getattr(MODEL_AWC_MODEL, "feature_name_", [])))
+    return MODEL_AWC_MODEL
+
+
+def model_awc_required_lag_hours(config: dict[str, Any]) -> int:
+    """Return the largest hourly temperature lag required by the loaded model."""
+    model = model_awc_load_model(config)
+    feature_names = list(getattr(model, "feature_name_", []))
+    lag_hours = [
+        int(match.group(1))
+        for name in feature_names
+        for match in [re.fullmatch(r"temp_f_lag_(\d+)h", str(name))]
+        if match
+    ]
+    return max(lag_hours, default=3)
+
+
+def model_awc_parse_row(row: dict[str, Any], station: str) -> Optional[FeatureMetarRow]:
+    """Convert one AviationWeather JSON row into the feature pipeline row shape."""
+    raw_metar = str(row.get("rawOb") or row.get("raw") or row.get("metar") or "").strip()
+    if not raw_metar or " AUTO " in f" {raw_metar} ":
+        return None
+    obs_dt = parse_aviation_obs_time(row.get("obsTime") or row.get("reportTime") or row.get("receiptTime"))
+    if obs_dt is None:
+        return None
+    short_station = station[1:] if station.upper().startswith("K") else station.upper()
+    return FeatureMetarRow(
+        daily_high_f="",
+        station=short_station,
+        valid_utc=obs_dt,
+        valid_text=obs_dt.strftime("%Y-%m-%d %H:%M"),
+        metar=raw_metar,
+    )
+
+
+def model_awc_station_observation_minute(config: dict[str, Any], station: str) -> int:
+    """Return the configured hourly METAR observation minute for a station."""
+    station = station.upper()
+    fallback = int(config["trading"].get("model_awc_observation_minute", 53))
+    station_minutes = config["trading"].get("model_awc_station_observation_minutes", {})
+    if isinstance(station_minutes, dict):
+        try:
+            return min(59, max(0, int(station_minutes.get(station, fallback))))
+        except (TypeError, ValueError):
+            return min(59, max(0, fallback))
+    return min(59, max(0, fallback))
+
+
+def model_awc_station_stagger_seconds(config: dict[str, Any], station: str) -> int:
+    """Stagger stations sharing the same observation minute to reduce API bursts."""
+    station = station.upper()
+    station_minutes = config["trading"].get("model_awc_station_observation_minutes", {})
+    if not isinstance(station_minutes, dict) or station not in station_minutes:
+        return 0
+    try:
+        minute = int(station_minutes[station])
+    except (TypeError, ValueError):
+        return 0
+    same_minute = []
+    for candidate, candidate_minute in station_minutes.items():
+        try:
+            if int(candidate_minute) == minute:
+                same_minute.append(str(candidate).upper())
+        except (TypeError, ValueError):
+            continue
+    if station not in same_minute:
+        return 0
+    stagger = max(0, int(config["trading"].get("model_awc_station_poll_stagger_seconds", 5)))
+    return same_minute.index(station) * stagger
+
+
+def model_awc_feature_row(
+    config: dict[str, Any],
+    city: str,
+    station: str,
+    rows: list[dict[str, Any]],
+    event_date: str,
+) -> Optional[tuple[dict[str, Any], FeatureMetarRow, datetime]]:
+    """Build one current model feature row from recent AWC METAR rows."""
+    station = station.upper()
+    tz = city_timezone(config, city)
+    parsed = []
+    for row in rows:
+        item = model_awc_parse_row(row, station)
+        if item is None:
+            continue
+        local_dt = item.valid_utc.astimezone(tz)
+        if local_dt.date().isoformat() != event_date:
+            continue
+        parsed.append(item)
+    parsed.sort(key=lambda item: item.valid_utc)
+    if not parsed:
+        return None
+
+    latest = parsed[-1]
+    latest_local = latest.valid_utc.astimezone(tz)
+    start_hour = int(config["trading"].get("model_awc_buy_start_hour", 12))
+    end_hour = int(config["trading"].get("model_awc_buy_end_hour", 18))
+    if latest_local.hour < start_hour or latest_local.hour > end_hour:
+        return None
+
+    features = decode_metar(latest, station, tz)
+    features["station_id"] = FEATURE_STATION_IDS.get(station)
+    iso = latest_local.isocalendar()
+    features["local_week_of_year"] = float(iso.week)
+    valid_times = [item.valid_utc for item in parsed]
+    temp_values = [decode_metar(item, station, tz).get("temp_f") for item in parsed]
+    tolerance = timedelta(minutes=int(config["trading"].get("model_awc_lag_tolerance_minutes", 30)))
+    current_temp = features.get("temp_f")
+    for hours in range(1, model_awc_required_lag_hours(config) + 1):
+        lag_value = nearest_lag_value(latest.valid_utc - timedelta(hours=hours), valid_times, temp_values, tolerance)
+        features[f"temp_f_lag_{hours}h"] = lag_value
+        features[f"temp_f_change_{hours}h"] = (
+            None if current_temp is None or lag_value is None else float(current_temp) - float(lag_value)
+        )
+    return features, latest, latest_local
+
+
+def model_awc_predict_high(config: dict[str, Any], features: dict[str, Any]) -> float:
+    """Run the loaded LightGBM model and return predicted daily high in Fahrenheit."""
+    model = model_awc_load_model(config)
+    feature_names = list(getattr(model, "feature_name_", []))
+    if not feature_names:
+        raise RuntimeError("Loaded model does not expose feature_name_")
+    row = []
+    for name in feature_names:
+        value = features.get(name)
+        if value in (None, ""):
+            row.append(float("nan"))
+        else:
+            try:
+                row.append(float(value))
+            except (TypeError, ValueError):
+                row.append(float("nan"))
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", UserWarning)
+        prediction = model.predict([row], num_iteration=getattr(model, "best_iteration_", None))
+    return float(prediction[0])
+
+
+def model_awc_trade_exists_for_window(trades: list[PaperTrade], strategy_name: str, city: str, station: str, event_date: str, local_hour: int) -> bool:
+    """Prevent duplicate entries for the same city/station/date/hour prediction window."""
+    marker = f"model_awc_high:{city}:{station}:{event_date}:hour_{local_hour:02d}"
+    active_statuses = {"OPEN", "BUY_PENDING", "SELL_PENDING"}
+    return any(t.strategy == strategy_name and t.status in active_statuses and marker in t.cycle_id for t in trades)
+
+
+def model_awc_market_candidate(
+    config: dict[str, Any],
+    market: TemperatureMarket,
+    predicted_high_f: float,
+    event_unit: str,
+) -> Optional[dict[str, Any]]:
+    """Return the YES/NO side and executable price implied by one market range."""
+    predicted = convert_temperature(predicted_high_f, "F", event_unit)
+    if predicted is None:
+        return None
+    side = "YES" if market_contains_temperature(market, float(predicted), event_unit) else "NO"
+    price = best_buy_price(config, market, side)
+    if price is None or price <= 0:
+        return None
+    return {"market": market, "side": side, "price": float(price)}
+
+
+def process_model_awc_prediction(
+    config: dict[str, Any],
+    event: dict[str, Any],
+    city: str,
+    station: str,
+    predicted_high_f: float,
+    latest_row: FeatureMetarRow,
+    latest_local: datetime,
+) -> Optional[PaperTrade]:
+    """Choose the cheapest model-implied YES/NO asset and persist/submit one buy."""
+    if str(event.get("_parsed_kind") or "") != "Highest":
+        return None
+    event_date = str(event.get("_parsed_event_date") or "")
+    event_url = poly_url_from_event(event)
+    if not event_date or latest_local.date().isoformat() != event_date:
+        return None
+
+    trades = read_trades(config["outputs"]["trades_csv"])
+    strategy_name = str(config["trading"]["strategy_name"])
+    local_hour = int(latest_local.hour)
+    if model_awc_trade_exists_for_window(trades, strategy_name, city, station, event_date, local_hour):
+        LOGGER.info("model awc skip duplicate city=%s station=%s event_date=%s local_hour=%s", city, station, event_date, local_hour)
+        return None
+
+    markets = [m for m in markets_for_event(config, event) if not m.closed and m.kind == "Highest"]
+    if not markets:
+        LOGGER.info("model awc skip no highest markets city=%s station=%s event_date=%s", city, station, event_date)
+        return None
+    event_unit = event_market_unit(markets)
+    candidates = []
+    for market in markets:
+        candidate = model_awc_market_candidate(config, market, predicted_high_f, event_unit)
+        if candidate:
+            candidates.append(candidate)
+    if not candidates:
+        LOGGER.info("model awc skip no priced candidates city=%s station=%s predicted_high_f=%.2f", city, station, predicted_high_f)
+        return None
+    candidates.sort(key=lambda item: (float(item["price"]), str(item["market"].market_id), str(item["side"])))
+    selected = candidates[0]
+    market = selected["market"]
+    side = str(selected["side"])
+    price = float(selected["price"])
+    cycle_id = f"{datetime.now().strftime('%Y%m%dT%H%M%S')}:model_awc_high:{city}:{station}:{event_date}:hour_{local_hour:02d}"
+    reason = f"model_awc_high_predicted_{predicted_high_f:.2f}_local_hour_{local_hour:02d}"
+    live_trader = get_live_trader() if live_trading_enabled(config) and station.upper() == model_awc_live_station(config) else None
+    trade = (
+        live_trader.submit_buy_trade(config, cycle_id, market, "", station, side, price, predicted_high_f, None, reason)
+        if live_trader
+        else make_trade(config, cycle_id, market, "", station, side, price, predicted_high_f, None, reason)
+    )
+    if not trade:
+        return None
+    trade.forecast_source = f"model_awc_high_lightgbm:{MODEL_AWC_MODEL_PATH or config['trading'].get('model_awc_model_path', '')}"
+    trade.forecast_observed_at = latest_row.valid_utc.astimezone(timezone.utc).isoformat(timespec="seconds")
+    trade.forecast_first_valid_time_local = latest_local.isoformat(timespec="seconds")
+    trade.forecast_last_valid_time_local = latest_local.isoformat(timespec="seconds")
+    if not live_trader:
+        trade.execution_mode = "DRY_RUN"
+        notify_trade(config, trade, "BUY", "FILLED", reason)
+    trades.append(trade)
+    write_csv(config["outputs"]["trades_csv"], trades)
+    write_csv(config["outputs"]["settled_trades_csv"], trades)
+    write_performance_reports(config, trades)
+    LOGGER.info(
+        "model awc buy city=%s station=%s event_date=%s local_hour=%s predicted_high_f=%.2f side=%s market=%s price=%s live=%s question=%r",
+        city,
+        station,
+        event_date,
+        local_hour,
+        predicted_high_f,
+        side,
+        market.market_id,
+        price,
+        bool(live_trader),
+        market.market_question,
+    )
+    return trade
+
+
 def parse_weather_record_timestamp(value: Any) -> Optional[datetime]:
     """Parse Jack AI weather record timestamps into UTC datetimes."""
     if value is None:
@@ -3001,13 +3300,6 @@ class LiveTradingManager:
         with self._lock:
             self._pending.pop(pending.order_id, None)
         notify_trade(self.config, trade, pending.kind, "FILLED", source=source)
-        if pending.kind == "BUY" and trade.status == "OPEN":
-            start_tgftp_validation_thread(
-                self.config,
-                trade.trade_id,
-                trade.forecast_station,
-                trade.forecast_observed_at,
-            )
 
     def _apply_buy_result_to_trade(self, trade: PaperTrade, result: Any, pending: bool) -> None:
         """Copy live buy order result fields onto a trade row.
@@ -5563,6 +5855,175 @@ def start_aviation_thread(config: dict[str, Any]) -> threading.Thread:
     return thread
 
 
+def model_awc_supervisor(config: dict[str, Any]) -> None:
+    """Poll AWC METAR after expected observation windows and trade model predictions."""
+    if not model_awc_enabled(config):
+        LOGGER.info("model awc supervisor disabled")
+        return
+    model_awc_load_model(config)
+    fallback_poll_seconds = max(10, int(config["trading"].get("aviation_poll_interval_seconds", 60)))
+    poll_delay_seconds = max(0, int(config["trading"].get("model_awc_poll_delay_seconds", 180)))
+    poll_interval_seconds = max(10, int(config["trading"].get("model_awc_poll_interval_seconds", 60)))
+    poll_attempts = max(1, int(config["trading"].get("model_awc_poll_attempts", 5)))
+    lookback_hours = max(7, int(config["trading"].get("model_awc_metar_lookback_hours", 7)))
+    start_hour = int(config["trading"].get("model_awc_buy_start_hour", 12))
+    end_hour = int(config["trading"].get("model_awc_buy_end_hour", 18))
+    event_cache: list[dict[str, Any]] = []
+    station_groups: dict[tuple[str, str], dict[str, Any]] = {}
+    window_state: dict[str, dict[str, Any]] = {}
+    event_refresh_at = 0.0
+    LOGGER.info(
+        "model awc supervisor started live_station=%s local_hours=%s-%s poll_delay_seconds=%s poll_interval_seconds=%s poll_attempts_per_window=%s lookback_hours=%s station_observation_minutes=%s station_stagger_seconds=%s",
+        model_awc_live_station(config),
+        start_hour,
+        end_hour,
+        poll_delay_seconds,
+        poll_interval_seconds,
+        poll_attempts,
+        lookback_hours,
+        config["trading"].get("model_awc_station_observation_minutes", {}),
+        config["trading"].get("model_awc_station_poll_stagger_seconds", 5),
+    )
+    while True:
+        try:
+            now_mono = time.monotonic()
+            now_utc = datetime.now(timezone.utc)
+            if now_mono >= event_refresh_at:
+                event_cache = []
+                for target in resolve_event_target_dates(config):
+                    event_cache.extend(
+                        event for event in discover_temperature_events(config, target)
+                        if str(event.get("_parsed_kind") or "") == "Highest"
+                    )
+                station_groups = {}
+                for event in event_cache:
+                    city = str(event["_parsed_city"])
+                    event_url = poly_url_from_event(event)
+                    try:
+                        station = station_for_event(config, city, event_url).upper()
+                    except Exception:
+                        LOGGER.exception("model awc station discovery failed city=%s url=%s", city, event_url)
+                        continue
+                    if not station:
+                        continue
+                    group_key = (city, station)
+                    group = station_groups.setdefault(group_key, {"city": city, "station": station, "events": []})
+                    group["events"].append(event)
+                event_refresh_at = now_mono + 300
+                LOGGER.info("model awc event cache refreshed highest_events=%s station_groups=%s", len(event_cache), len(station_groups))
+
+            for group_key, group in station_groups.items():
+                city = str(group["city"])
+                station = str(group["station"])
+                tz = city_timezone(config, city)
+                now_local = now_utc.astimezone(tz)
+                observation_minute = model_awc_station_observation_minute(config, station)
+                station_stagger_seconds = model_awc_station_stagger_seconds(config, station)
+                events_by_date: dict[str, list[dict[str, Any]]] = {}
+                for event in list(group["events"]):
+                    event_date = str(event.get("_parsed_event_date") or "")
+                    if event_date:
+                        events_by_date.setdefault(event_date, []).append(event)
+
+                for event_date, events_for_date in events_by_date.items():
+                    try:
+                        target_date = date.fromisoformat(event_date)
+                    except ValueError:
+                        continue
+                    if now_local.date() != target_date:
+                        continue
+                    for local_hour in range(start_hour, end_hour + 1):
+                        expected_local = datetime(
+                            target_date.year,
+                            target_date.month,
+                            target_date.day,
+                            local_hour,
+                            observation_minute,
+                            tzinfo=tz,
+                        )
+                        expected_utc = expected_local.astimezone(timezone.utc)
+                        poll_start_utc = expected_utc + timedelta(seconds=poll_delay_seconds + station_stagger_seconds)
+                        poll_end_utc = poll_start_utc + timedelta(seconds=poll_interval_seconds * poll_attempts)
+                        if now_utc < poll_start_utc:
+                            continue
+                        window_key = f"{city}:{station}:{event_date}:hour_{local_hour:02d}:model_awc"
+                        state = window_state.setdefault(
+                            window_key,
+                            {
+                                "attempts": 0,
+                                "next_poll_at": poll_start_utc.timestamp(),
+                                "done": False,
+                                "expected_obs_utc": expected_utc.isoformat(),
+                            },
+                        )
+                        if state.get("done"):
+                            continue
+                        if int(state.get("attempts", 0)) >= poll_attempts or now_utc > poll_end_utc:
+                            state["done"] = True
+                            continue
+                        next_poll_dt = datetime.fromtimestamp(float(state.get("next_poll_at", 0.0)), timezone.utc)
+                        if now_utc < next_poll_dt:
+                            continue
+
+                        state["attempts"] = int(state.get("attempts", 0)) + 1
+                        state["next_poll_at"] = (now_utc + timedelta(seconds=poll_interval_seconds)).timestamp()
+                        try:
+                            rows = aviation_metar_observations(station, lookback_hours)
+                            append_aviation_metar_history(config, station, rows, "model_awc_prediction")
+                            got_latest_metar = False
+                            for event in events_for_date:
+                                built = model_awc_feature_row(config, city, station, rows, event_date)
+                                if built is None:
+                                    continue
+                                features, latest_row, latest_local = built
+                                if latest_local.hour != local_hour or latest_row.valid_utc < expected_utc - timedelta(minutes=10):
+                                    LOGGER.info(
+                                        "model awc latest metar not current window city=%s station=%s latest=%s latest_local=%s expected=%s attempt=%s",
+                                        city,
+                                        station,
+                                        latest_row.valid_utc.isoformat(),
+                                        latest_local.isoformat(),
+                                        expected_utc.isoformat(),
+                                        state["attempts"],
+                                    )
+                                    continue
+                                got_latest_metar = True
+                                predicted_high_f = model_awc_predict_high(config, features)
+                                process_model_awc_prediction(config, event, city, station, predicted_high_f, latest_row, latest_local)
+                            if got_latest_metar:
+                                state["done"] = True
+                            LOGGER.info(
+                                "model awc poll city=%s station=%s event_date=%s local_hour=%s expected=%s attempts=%s done=%s got_latest_metar=%s rows=%s",
+                                city,
+                                station,
+                                event_date,
+                                local_hour,
+                                expected_utc.isoformat(),
+                                state["attempts"],
+                                state.get("done"),
+                                got_latest_metar,
+                                len(rows),
+                            )
+                        except Exception:
+                            LOGGER.exception("model awc poll failed city=%s station=%s event_date=%s local_hour=%s", city, station, event_date, local_hour)
+
+            active_prefixes = {f"{group['city']}:{group['station']}:" for group in station_groups.values()}
+            for key in list(window_state):
+                if not any(key.startswith(prefix) for prefix in active_prefixes):
+                    window_state.pop(key, None)
+            time.sleep(min(30.0, fallback_poll_seconds))
+        except Exception:
+            LOGGER.exception("model awc supervisor loop failed")
+            time.sleep(min(30.0, fallback_poll_seconds))
+
+
+def start_model_awc_thread(config: dict[str, Any]) -> threading.Thread:
+    """Start the AWC METAR model strategy in a daemon thread."""
+    thread = threading.Thread(target=model_awc_supervisor, args=(config,), name="model-awc-high", daemon=True)
+    thread.start()
+    return thread
+
+
 def weather_record_supervisor(config: dict[str, Any]) -> None:
     """Process pushed weatherrecord observations inside airport report windows."""
     fallback_poll_seconds = max(10, int(config["trading"].get("aviation_poll_interval_seconds", 60)))
@@ -6290,8 +6751,7 @@ def run(config: dict[str, Any]) -> None:
     LOGGER.info("bot started config=%s", json.dumps(redacted_config(config), ensure_ascii=False, sort_keys=True))
     start_live_trader(config)
     sync_polymarket_positions_to_disk(config, reason="start")
-    start_weather_record_thread(config)
-    start_twc_verification_thread(config)
+    start_model_awc_thread(config)
     try:
         while True:
             cycle_num += 1

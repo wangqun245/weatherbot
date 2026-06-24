@@ -336,7 +336,7 @@ def default_config() -> dict[str, Any]:
         "depth_price_notional_multiplier": 2.0,
         "depth_price_extra_levels": 1,
         "model_awc_enabled": True,
-        "model_awc_model_path": r"models\lightgbm_rolling_6y_holdout_24h_lag6_20260623_205608\lightgbm_metar_high_rolling_6y_best.pkl",
+        "model_awc_model_path": "models/lightgbm_rolling_6y_holdout_24h_lag6_20260623_205608/lightgbm_metar_high_rolling_6y_best.pkl",
         "model_awc_live_station": "KAUS",
         "model_awc_buy_start_hour": 12,
         "model_awc_buy_end_hour": 18,
@@ -2008,6 +2008,8 @@ def model_awc_load_model(config: dict[str, Any]) -> Any:
     path = str(config.get("trading", {}).get("model_awc_model_path") or "").strip()
     if not path:
         raise RuntimeError("trading.model_awc_model_path is required")
+    if os.sep == "/" and "\\" in path:
+        path = path.replace("\\", "/")
     abs_path = os.path.abspath(path)
     if MODEL_AWC_MODEL is None or MODEL_AWC_MODEL_PATH != abs_path:
         MODEL_AWC_MODEL = joblib.load(abs_path)
@@ -5857,10 +5859,15 @@ def start_aviation_thread(config: dict[str, Any]) -> threading.Thread:
 
 def model_awc_supervisor(config: dict[str, Any]) -> None:
     """Poll AWC METAR after expected observation windows and trade model predictions."""
-    if not model_awc_enabled(config):
-        LOGGER.info("model awc supervisor disabled")
+    try:
+        if not model_awc_enabled(config):
+            LOGGER.info("model awc supervisor disabled")
+            return
+        model_awc_load_model(config)
+    except Exception:
+        LOGGER.exception("model awc supervisor failed during startup")
         return
-    model_awc_load_model(config)
+
     fallback_poll_seconds = max(10, int(config["trading"].get("aviation_poll_interval_seconds", 60)))
     poll_delay_seconds = max(0, int(config["trading"].get("model_awc_poll_delay_seconds", 180)))
     poll_interval_seconds = max(10, int(config["trading"].get("model_awc_poll_interval_seconds", 60)))
@@ -6019,6 +6026,7 @@ def model_awc_supervisor(config: dict[str, Any]) -> None:
 
 def start_model_awc_thread(config: dict[str, Any]) -> threading.Thread:
     """Start the AWC METAR model strategy in a daemon thread."""
+    LOGGER.info("model awc thread starting")
     thread = threading.Thread(target=model_awc_supervisor, args=(config,), name="model-awc-high", daemon=True)
     thread.start()
     return thread

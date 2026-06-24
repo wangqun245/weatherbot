@@ -103,7 +103,7 @@
                     "weather_record_receive_window_seconds":  300,
                     "tgftp_window_max_inflight_per_station":  10
                     ,"model_awc_enabled": true
-                    ,"model_awc_model_path": "models\\lightgbm_rolling_6y_holdout_24h_lag6_20260623_205608\\lightgbm_metar_high_rolling_6y_best.pkl"
+                    ,"model_awc_model_path": "models/lightgbm_rolling_6y_holdout_24h_lag6_20260623_205608/lightgbm_metar_high_rolling_6y_best.pkl"
                     ,"model_awc_live_station": "KAUS"
                     ,"model_awc_buy_start_hour": 12
                     ,"model_awc_buy_end_hour": 18
@@ -242,7 +242,7 @@
                                            "weather_record_receive_window_seconds":  300,
                                            "tgftp_window_max_inflight_per_station":  10
                                            ,"model_awc_enabled": true
-                                           ,"model_awc_model_path": "models\\lightgbm_rolling_6y_holdout_24h_lag6_20260623_205608\\lightgbm_metar_high_rolling_6y_best.pkl"
+                                           ,"model_awc_model_path": "models/lightgbm_rolling_6y_holdout_24h_lag6_20260623_205608/lightgbm_metar_high_rolling_6y_best.pkl"
                                            ,"model_awc_live_station": "KAUS"
                                            ,"model_awc_buy_start_hour": 12
                                            ,"model_awc_buy_end_hour": 18

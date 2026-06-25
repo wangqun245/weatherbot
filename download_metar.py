@@ -4,17 +4,17 @@ import time
 from datetime import datetime
 
 AIRPORTS = {
-    "Atlanta": "KATL",
-    "Austin": "KAUS",
-    "Chicago": "KORD",
-    "Dallas": "KDAL",
-    "Denver": "KDEN",
-    "Houston": "KHOU",
-    "Los Angeles": "KLAX",
-    "Miami": "KMIA",
-    "NYC": "KLGA",
-    "San Francisco": "KSFO",
-    "Seattle": "KSEA",
+  ##  "Atlanta": "KATL",
+    ## "Austin": "KAUS",
+    ## "Chicago": "KORD",
+    ##    "Dallas": "KDAL",
+    "Denver": "KBKF",
+    ## "Houston": "KHOU",
+    ##  "Los Angeles": "KLAX",
+    ##   "Miami": "KMIA",
+    ##   "NYC": "KLGA",
+    ##  "San Francisco": "KSFO",
+    ##  "Seattle": "KSEA",
 }
 
 CURRENT_YEAR = datetime.now().year

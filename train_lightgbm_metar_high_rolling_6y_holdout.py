@@ -56,6 +56,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-dir", type=Path)
     parser.add_argument("--anchor-validation-year", type=int, default=2026)
     parser.add_argument("--train-years-before-validation", type=int, default=6)
+    parser.add_argument(
+        "--single-validation-block",
+        action="store_true",
+        help="Use only the anchor validation year and its prior N train years instead of rolling backward.",
+    )
     parser.add_argument("--n-estimators", type=int, default=6000)
     parser.add_argument("--early-stopping-rounds", type=int, default=200)
     parser.add_argument("--learning-rate", type=float, default=0.035)
@@ -127,6 +132,7 @@ def split_by_rolling_blocks(
     df: pd.DataFrame,
     anchor_validation_year: int,
     train_years_before_validation: int,
+    single_validation_block: bool = False,
 ) -> tuple[np.ndarray, np.ndarray, list[dict[str, object]], set[int], set[int]]:
     available_years = sorted(df["local_year"].dropna().astype(int).unique().tolist())
     blocks, train_years, validation_years = rolling_year_blocks(
@@ -134,6 +140,10 @@ def split_by_rolling_blocks(
         anchor_validation_year=anchor_validation_year,
         train_years_before_validation=train_years_before_validation,
     )
+    if single_validation_block and blocks:
+        blocks = [blocks[0]]
+        validation_years = {int(blocks[0]["validation_year"])}
+        train_years = {int(year) for year in blocks[0]["train_years"]}
     if not blocks:
         raise ValueError("No rolling year blocks could be constructed from the data")
     train_mask = df["local_year"].isin(train_years).to_numpy()
@@ -283,6 +293,7 @@ def main() -> int:
         df=df,
         anchor_validation_year=args.anchor_validation_year,
         train_years_before_validation=args.train_years_before_validation,
+        single_validation_block=args.single_validation_block,
     )
     print(f"Split blocks: {blocks}")
     print(
@@ -334,6 +345,7 @@ def main() -> int:
             "type": "rolling_6_train_years_then_1_validation_year",
             "anchor_validation_year": args.anchor_validation_year,
             "train_years_before_validation": args.train_years_before_validation,
+            "single_validation_block": bool(args.single_validation_block),
             "blocks": blocks,
             "train_years": sorted(train_years),
             "validation_years": sorted(validation_years),

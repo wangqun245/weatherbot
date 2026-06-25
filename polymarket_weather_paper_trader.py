@@ -73,6 +73,8 @@ TGFTP_OBS_BY_STATION: dict[str, dict[str, Any]] = {}
 PRICE_MOMENTUM_WINDOWS: dict[str, dict[str, Any]] = {}
 PRICE_RECORDING_WINDOWS: dict[str, dict[str, Any]] = {}
 STATION_BY_EVENT_URL: dict[str, str] = {}
+SOURCE_STATION_DISABLED_CITIES_BY_DATE: dict[str, set[str]] = {}
+SOURCE_STATION_GUARD_LOCK = threading.RLock()
 WEBSOCKET_ASSET_REFRESH_REQUESTS: "queue.Queue[dict[str, Any]]" = queue.Queue()
 WEBSOCKET_ASSET_UPDATES: "queue.Queue[dict[str, Any]]" = queue.Queue()
 WEBSOCKET_ASSET_REFRESH_DEDUP: set[tuple[str, str, str]] = set()
@@ -300,7 +302,7 @@ def default_config() -> dict[str, Any]:
     }
     city_stations = {
         "Atlanta": "KATL", "Austin": "KAUS", "Chicago": "KMDW", "Dallas": "KDAL",
-        "Denver": "KDEN", "Houston": "KHOU", "Los Angeles": "KLAX", "Miami": "KMIA",
+        "Denver": "KBKF", "Houston": "KHOU", "Los Angeles": "KLAX", "Miami": "KMIA",
         "NYC": "KLGA", "San Francisco": "KSFO", "Seattle": "KSEA",
     }
     trading = {
@@ -333,11 +335,15 @@ def default_config() -> dict[str, Any]:
         "live_trading_dry_run": False,
         "live_order_timeout_seconds": 20,
         "live_order_check_seconds": 1,
+        "max_buy_price": 0.85,
+        "source_station_check_enabled": True,
+        "source_station_check_hour_ct": 3,
+        "source_station_check_timezone": "America/Chicago",
         "depth_price_notional_multiplier": 2.0,
         "depth_price_extra_levels": 1,
         "model_awc_enabled": True,
-        "model_awc_model_path": "models/lightgbm_rolling_6y_holdout_24h_lag6_20260623_205608/lightgbm_metar_high_rolling_6y_best.pkl",
-        "model_awc_live_station": "KAUS",
+        "model_awc_model_path": "models/lightgbm_rolling_6y_holdout_24h_lag6_kbkf_denver/lightgbm_metar_high_rolling_6y_best.pkl",
+        "model_awc_live_stations": ["KMIA", "KLAX", "KSFO", "KSEA", "KHOU", "KAUS", "KATL"],
         "model_awc_buy_start_hour": 12,
         "model_awc_buy_end_hour": 18,
         "model_awc_metar_lookback_hours": 7,
@@ -352,7 +358,6 @@ def default_config() -> dict[str, Any]:
             "KDAL": 56,
             "KHOU": 56,
             "KSEA": 56,
-            "KDEN": 56,
             "KMIA": 56,
         },
         "model_awc_station_poll_stagger_seconds": 5,
@@ -360,6 +365,8 @@ def default_config() -> dict[str, Any]:
         "model_awc_poll_delay_seconds": 180,
         "model_awc_poll_interval_seconds": 60,
         "model_awc_poll_attempts": 5,
+        "model_awc_adjacent_yes_max_total_price": 0.9,
+        "model_awc_adjacent_yes_shares": 10,
     }
     return {
     "api": {
@@ -991,6 +998,160 @@ def station_for_event(config: dict[str, Any], city: str, event_url: str, allow_n
     return station
 
 
+def source_station_for_event(config: dict[str, Any], city: str, event_url: str) -> str:
+    """Resolve the Polymarket settlement source station from the event page."""
+    if not event_url:
+        return ""
+    try:
+        return station_from_wu_url(extract_wunderground_source(config, event_url))
+    except requests.RequestException as exc:
+        LOGGER.warning("source station check request failed city=%s url=%s error=%s", city, event_url, exc)
+        return ""
+    except Exception:
+        LOGGER.exception("source station check failed city=%s url=%s", city, event_url)
+        return ""
+
+
+def source_station_block_city(event_date: str, city: str) -> None:
+    """Block live trading for one city/date after source-station mismatch."""
+    if not event_date or not city:
+        return
+    with SOURCE_STATION_GUARD_LOCK:
+        SOURCE_STATION_DISABLED_CITIES_BY_DATE.setdefault(event_date, set()).add(city)
+
+
+def source_station_city_blocked(event_date: str, city: str) -> bool:
+    """Return whether source-station guard has blocked live trading for a city/date."""
+    if not event_date or not city:
+        return False
+    with SOURCE_STATION_GUARD_LOCK:
+        return city in SOURCE_STATION_DISABLED_CITIES_BY_DATE.get(event_date, set())
+
+
+def prune_source_station_blocks(today: date) -> None:
+    """Drop stale source-station guard blocks from previous event dates."""
+    with SOURCE_STATION_GUARD_LOCK:
+        for event_date in list(SOURCE_STATION_DISABLED_CITIES_BY_DATE):
+            try:
+                parsed = date.fromisoformat(event_date)
+            except ValueError:
+                SOURCE_STATION_DISABLED_CITIES_BY_DATE.pop(event_date, None)
+                continue
+            if parsed < today:
+                SOURCE_STATION_DISABLED_CITIES_BY_DATE.pop(event_date, None)
+
+
+def check_polymarket_source_stations(config: dict[str, Any], target: date) -> dict[str, Any]:
+    """Compare Polymarket weather source stations with configured city stations."""
+    mismatches: list[dict[str, str]] = []
+    checked: dict[str, dict[str, str]] = {}
+    events = discover_temperature_events(config, target)
+    for event in events:
+        city = str(event.get("_parsed_city") or "")
+        event_date = str(event.get("_parsed_event_date") or target.isoformat())
+        event_url = poly_url_from_event(event)
+        configured = configured_station_for_city(config, city)
+        if not city or not configured:
+            continue
+        key = f"{event_date}:{city}"
+        if key in checked:
+            continue
+        source_station = source_station_for_event(config, city, event_url)
+        if not source_station:
+            LOGGER.warning(
+                "source station check unavailable city=%s event_date=%s configured_station=%s url=%s",
+                city,
+                event_date,
+                configured,
+                event_url,
+            )
+            continue
+        checked[key] = {
+            "city": city,
+            "event_date": event_date,
+            "configured_station": configured,
+            "source_station": source_station,
+            "polymarket_url": event_url,
+        }
+        if source_station != configured:
+            source_station_block_city(event_date, city)
+            mismatch = checked[key]
+            mismatches.append(mismatch)
+            LOGGER.error(
+                "source station mismatch blocking live trades city=%s event_date=%s configured_station=%s source_station=%s url=%s",
+                city,
+                event_date,
+                configured,
+                source_station,
+                event_url,
+            )
+        else:
+            LOGGER.info(
+                "source station check ok city=%s event_date=%s station=%s",
+                city,
+                event_date,
+                configured,
+            )
+    LOGGER.info(
+        "source station check complete target=%s events=%s checked_cities=%s mismatches=%s",
+        target.isoformat(),
+        len(events),
+        len(checked),
+        len(mismatches),
+    )
+    return {
+        "target": target.isoformat(),
+        "events": len(events),
+        "checked": list(checked.values()),
+        "mismatches": mismatches,
+    }
+
+
+def next_source_station_check_time(config: dict[str, Any], now: Optional[datetime] = None) -> datetime:
+    """Return the next configured source-station check time."""
+    trading = config.get("trading", {})
+    tz_name = str(trading.get("source_station_check_timezone", "America/Chicago"))
+    tz = ZoneInfo(tz_name)
+    now_local = (now or datetime.now(timezone.utc)).astimezone(tz)
+    check_hour = int(trading.get("source_station_check_hour_ct", 3))
+    candidate = now_local.replace(hour=check_hour, minute=0, second=0, microsecond=0)
+    if now_local >= candidate:
+        candidate += timedelta(days=1)
+    return candidate
+
+
+def source_station_guard_supervisor(config: dict[str, Any]) -> None:
+    """Run the Polymarket source-station guard once daily at the configured CT hour."""
+    if not bool(config.get("trading", {}).get("source_station_check_enabled", True)):
+        LOGGER.info("source station guard disabled")
+        return
+    tz_name = str(config.get("trading", {}).get("source_station_check_timezone", "America/Chicago"))
+    tz = ZoneInfo(tz_name)
+    check_hour = int(config.get("trading", {}).get("source_station_check_hour_ct", 3))
+    last_checked_date = ""
+    LOGGER.info("source station guard started timezone=%s check_hour=%s", tz_name, check_hour)
+    while True:
+        try:
+            now_local = datetime.now(tz)
+            prune_source_station_blocks(now_local.date())
+            if now_local.hour >= check_hour and last_checked_date != now_local.date().isoformat():
+                check_polymarket_source_stations(config, now_local.date())
+                last_checked_date = now_local.date().isoformat()
+            next_check = next_source_station_check_time(config)
+            sleep_seconds = max(30.0, min(900.0, (next_check - datetime.now(tz)).total_seconds()))
+            time.sleep(sleep_seconds)
+        except Exception:
+            LOGGER.exception("source station guard loop failed")
+            time.sleep(300)
+
+
+def start_source_station_guard_thread(config: dict[str, Any]) -> threading.Thread:
+    """Start the daily source-station guard in a daemon thread."""
+    thread = threading.Thread(target=source_station_guard_supervisor, args=(config,), name="source-station-guard", daemon=True)
+    thread.start()
+    return thread
+
+
 def infer_temperature_unit(text: str, default_unit: str = "F") -> str:
     """Infer Fahrenheit or Celsius from market text, falling back to a supplied default unit.
     
@@ -1257,6 +1418,23 @@ def asset_id_for_market_side(market: TemperatureMarket, side: str) -> str:
         if outcome.strip().lower() == wanted:
             return asset_id
     return ""
+
+
+def market_neg_risk(market: TemperatureMarket) -> bool:
+    """Return whether a Polymarket market requires neg-risk order signing."""
+    raw = parse_jsonish(market.raw_market_json, {})
+    if not isinstance(raw, dict):
+        return False
+    for key in ("negRisk", "neg_risk", "negativeRisk", "negative_risk"):
+        if key not in raw:
+            continue
+        value = raw.get(key)
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, str):
+            return value.strip().lower() in {"true", "1", "yes"}
+        return bool(value)
+    return False
 
 
 def parse_clob_levels(levels: Any) -> list[tuple[float, float]]:
@@ -1997,9 +2175,35 @@ def model_awc_enabled(config: dict[str, Any]) -> bool:
     return bool(config.get("trading", {}).get("model_awc_enabled", True))
 
 
+def model_awc_live_stations(config: dict[str, Any]) -> set[str]:
+    """Return stations allowed to place real live orders."""
+    trading = config.get("trading", {})
+    raw_stations = trading.get("model_awc_live_stations", trading.get("model_awc_live_station", "KAUS"))
+    if isinstance(raw_stations, str):
+        stations = [part.strip() for part in raw_stations.split(",")]
+    elif isinstance(raw_stations, (list, tuple, set)):
+        stations = [str(part).strip() for part in raw_stations]
+    else:
+        stations = ["KAUS"]
+    return {station.upper() for station in stations if station}
+
+
 def model_awc_live_station(config: dict[str, Any]) -> str:
-    """Return the one station allowed to place real live orders."""
-    return str(config.get("trading", {}).get("model_awc_live_station", "KAUS")).upper()
+    """Return a display value for model AWC live stations."""
+    stations = sorted(model_awc_live_stations(config))
+    return ",".join(stations) if stations else "KAUS"
+
+
+def configured_max_buy_price(config: dict[str, Any]) -> float:
+    """Return the configured max live buy price, clamped to a valid probability range."""
+    raw = config.get("trading", {}).get("max_buy_price", 0.85)
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return 0.85
+    if value <= 0 or value >= 1:
+        return 0.85
+    return value
 
 
 def model_awc_load_model(config: dict[str, Any]) -> Any:
@@ -2166,16 +2370,66 @@ def model_awc_market_candidate(
     market: TemperatureMarket,
     predicted_high_f: float,
     event_unit: str,
+    predicted_yes_market_id: str,
 ) -> Optional[dict[str, Any]]:
     """Return the YES/NO side and executable price implied by one market range."""
     predicted = convert_temperature(predicted_high_f, "F", event_unit)
     if predicted is None:
         return None
-    side = "YES" if market_contains_temperature(market, float(predicted), event_unit) else "NO"
+    side = "YES" if market.market_id == predicted_yes_market_id else "NO"
     price = best_buy_price(config, market, side)
     if price is None or price <= 0:
         return None
     return {"market": market, "side": side, "price": float(price)}
+
+
+def model_awc_predicted_yes_market(
+    markets: list[TemperatureMarket],
+    predicted_high_f: float,
+    event_unit: str,
+) -> Optional[TemperatureMarket]:
+    """Return the unique market interval that contains the model high prediction."""
+    predicted = convert_temperature(predicted_high_f, "F", event_unit)
+    if predicted is None:
+        return None
+    matches = []
+    for market in markets:
+        if market_contains_temperature(market, float(predicted), event_unit):
+            matches.append(market)
+    if len(matches) != 1:
+        return None
+    return matches[0]
+
+
+def model_awc_adjacent_prediction_markets(
+    markets: list[TemperatureMarket],
+    predicted_high_f: float,
+    event_unit: str,
+) -> Optional[tuple[TemperatureMarket, TemperatureMarket]]:
+    """Return two adjacent markets around an imprecise model high prediction."""
+    predicted = convert_temperature(predicted_high_f, "F", event_unit)
+    if predicted is None:
+        return None
+    matched = [market for market in markets if market_contains_temperature(market, float(predicted), event_unit)]
+    if len(matched) == 2:
+        ordered = sorted_markets_for_unit(matched, event_unit)
+        return ordered[0], ordered[1]
+    if matched:
+        return None
+
+    lower_candidates: list[tuple[float, TemperatureMarket]] = []
+    upper_candidates: list[tuple[float, TemperatureMarket]] = []
+    for market in markets:
+        lo, hi, _ = comparable_rule_bounds(market, event_unit)
+        if hi is not None and hi < float(predicted):
+            lower_candidates.append((hi, market))
+        if lo is not None and lo > float(predicted):
+            upper_candidates.append((lo, market))
+    if not lower_candidates or not upper_candidates:
+        return None
+    lower = max(lower_candidates, key=lambda item: item[0])[1]
+    upper = min(upper_candidates, key=lambda item: item[0])[1]
+    return lower, upper
 
 
 def process_model_awc_prediction(
@@ -2207,54 +2461,147 @@ def process_model_awc_prediction(
         LOGGER.info("model awc skip no highest markets city=%s station=%s event_date=%s", city, station, event_date)
         return None
     event_unit = event_market_unit(markets)
-    candidates = []
-    for market in markets:
-        candidate = model_awc_market_candidate(config, market, predicted_high_f, event_unit)
-        if candidate:
-            candidates.append(candidate)
-    if not candidates:
-        LOGGER.info("model awc skip no priced candidates city=%s station=%s predicted_high_f=%.2f", city, station, predicted_high_f)
+    live_trader = get_live_trader() if live_trading_enabled(config) and station.upper() in model_awc_live_stations(config) else None
+
+    def submit_model_awc_trade(
+        market: TemperatureMarket,
+        side: str,
+        price: float,
+        reason: str,
+        amount_usd: Optional[float] = None,
+    ) -> Optional[PaperTrade]:
+        cycle_id = f"{datetime.now().strftime('%Y%m%dT%H%M%S')}:model_awc_high:{city}:{station}:{event_date}:hour_{local_hour:02d}"
+        trade = (
+            live_trader.submit_buy_trade(config, cycle_id, market, "", station, side, price, predicted_high_f, None, reason, amount_usd=amount_usd)
+            if live_trader
+            else make_trade(config, cycle_id, market, "", station, side, price, predicted_high_f, None, reason, notional_usdc=amount_usd)
+        )
+        if not trade:
+            return None
+        trade.forecast_source = f"model_awc_high_lightgbm:{MODEL_AWC_MODEL_PATH or config['trading'].get('model_awc_model_path', '')}"
+        trade.forecast_observed_at = latest_row.valid_utc.astimezone(timezone.utc).isoformat(timespec="seconds")
+        trade.forecast_first_valid_time_local = latest_local.isoformat(timespec="seconds")
+        trade.forecast_last_valid_time_local = latest_local.isoformat(timespec="seconds")
+        if not live_trader:
+            trade.execution_mode = "DRY_RUN"
+            notify_trade(config, trade, "BUY", "FILLED", reason)
+        trades.append(trade)
+        write_csv(config["outputs"]["trades_csv"], trades)
+        write_csv(config["outputs"]["settled_trades_csv"], trades)
+        write_performance_reports(config, trades)
+        LOGGER.info(
+            "model awc buy city=%s station=%s event_date=%s local_hour=%s predicted_high_f=%.2f side=%s market=%s price=%s amount_usd=%s shares=%s live=%s question=%r",
+            city,
+            station,
+            event_date,
+            local_hour,
+            predicted_high_f,
+            side,
+            market.market_id,
+            price,
+            amount_usd,
+            trade.shares,
+            bool(live_trader),
+            market.market_question,
+        )
+        return trade
+
+    predicted_yes_market = model_awc_predicted_yes_market(markets, predicted_high_f, event_unit)
+    if predicted_yes_market is not None:
+        candidates = []
+        for market in markets:
+            candidate = model_awc_market_candidate(config, market, predicted_high_f, event_unit, predicted_yes_market.market_id)
+            if candidate:
+                candidates.append(candidate)
+        if not candidates:
+            LOGGER.info("model awc skip no priced candidates city=%s station=%s predicted_high_f=%.2f", city, station, predicted_high_f)
+            return None
+        candidates.sort(key=lambda item: (float(item["price"]), str(item["market"].market_id), str(item["side"])))
+        selected = candidates[0]
+        market = selected["market"]
+        side = str(selected["side"])
+        price = round(float(selected["price"]), 2)
+        reason = f"model_awc_high_predicted_{predicted_high_f:.2f}_market_{predicted_yes_market.market_id}_local_hour_{local_hour:02d}"
+        return submit_model_awc_trade(market, side, price, reason)
+
+    adjacent_markets = model_awc_adjacent_prediction_markets(markets, predicted_high_f, event_unit)
+    if adjacent_markets is None:
+        LOGGER.info(
+            "model awc skip invalid prediction without adjacent market pair city=%s station=%s event_date=%s local_hour=%s predicted_high_f=%.2f event_unit=%s",
+            city,
+            station,
+            event_date,
+            local_hour,
+            predicted_high_f,
+            event_unit,
+        )
         return None
-    candidates.sort(key=lambda item: (float(item["price"]), str(item["market"].market_id), str(item["side"])))
-    selected = candidates[0]
-    market = selected["market"]
-    side = str(selected["side"])
-    price = float(selected["price"])
-    cycle_id = f"{datetime.now().strftime('%Y%m%dT%H%M%S')}:model_awc_high:{city}:{station}:{event_date}:hour_{local_hour:02d}"
-    reason = f"model_awc_high_predicted_{predicted_high_f:.2f}_local_hour_{local_hour:02d}"
-    live_trader = get_live_trader() if live_trading_enabled(config) and station.upper() == model_awc_live_station(config) else None
-    trade = (
-        live_trader.submit_buy_trade(config, cycle_id, market, "", station, side, price, predicted_high_f, None, reason)
-        if live_trader
-        else make_trade(config, cycle_id, market, "", station, side, price, predicted_high_f, None, reason)
-    )
-    if not trade:
+
+    adjacent_prices: list[tuple[TemperatureMarket, float]] = []
+    for market in adjacent_markets:
+        yes_price = best_buy_price(config, market, "YES")
+        if yes_price is None or yes_price <= 0:
+            LOGGER.info(
+                "model awc skip adjacent missing yes price city=%s station=%s event_date=%s local_hour=%s predicted_high_f=%.2f market=%s",
+                city,
+                station,
+                event_date,
+                local_hour,
+                predicted_high_f,
+                market.market_id,
+            )
+            return None
+        adjacent_prices.append((market, round(float(yes_price), 2)))
+    total_yes_price = sum(price for _market, price in adjacent_prices)
+    max_total_price = float(config["trading"].get("model_awc_adjacent_yes_max_total_price", 0.9))
+    adjacent_shares = float(config["trading"].get("model_awc_adjacent_yes_shares", 10))
+    if total_yes_price >= max_total_price:
+        LOGGER.info(
+            "model awc skip adjacent yes total too high city=%s station=%s event_date=%s local_hour=%s predicted_high_f=%.2f total_yes_price=%.4f max=%.4f markets=%s",
+            city,
+            station,
+            event_date,
+            local_hour,
+            predicted_high_f,
+            total_yes_price,
+            max_total_price,
+            [market.market_id for market, _price in adjacent_prices],
+        )
         return None
-    trade.forecast_source = f"model_awc_high_lightgbm:{MODEL_AWC_MODEL_PATH or config['trading'].get('model_awc_model_path', '')}"
-    trade.forecast_observed_at = latest_row.valid_utc.astimezone(timezone.utc).isoformat(timespec="seconds")
-    trade.forecast_first_valid_time_local = latest_local.isoformat(timespec="seconds")
-    trade.forecast_last_valid_time_local = latest_local.isoformat(timespec="seconds")
-    if not live_trader:
-        trade.execution_mode = "DRY_RUN"
-        notify_trade(config, trade, "BUY", "FILLED", reason)
-    trades.append(trade)
-    write_csv(config["outputs"]["trades_csv"], trades)
-    write_csv(config["outputs"]["settled_trades_csv"], trades)
-    write_performance_reports(config, trades)
+
+    created: list[PaperTrade] = []
+    adjacent_market_ids = "_".join(market.market_id for market, _price in adjacent_prices)
+    for market, price in adjacent_prices:
+        amount_usd = round(adjacent_shares * round(price, 2), 2)
+        reason = (
+            f"model_awc_high_predicted_{predicted_high_f:.2f}_adjacent_yes_{adjacent_market_ids}"
+            f"_shares_{adjacent_shares:g}_total_yes_{total_yes_price:.2f}_local_hour_{local_hour:02d}"
+        )
+        trade = submit_model_awc_trade(market, "YES", price, reason, amount_usd=amount_usd)
+        if trade:
+            created.append(trade)
+    if len(created) != len(adjacent_prices):
+        LOGGER.warning(
+            "model awc adjacent buy partially completed city=%s station=%s event_date=%s local_hour=%s created=%s expected=%s",
+            city,
+            station,
+            event_date,
+            local_hour,
+            len(created),
+            len(adjacent_prices),
+        )
     LOGGER.info(
-        "model awc buy city=%s station=%s event_date=%s local_hour=%s predicted_high_f=%.2f side=%s market=%s price=%s live=%s question=%r",
+        "model awc adjacent buy completed city=%s station=%s event_date=%s local_hour=%s predicted_high_f=%.2f total_yes_price=%.4f shares_each=%s trades=%s",
         city,
         station,
         event_date,
         local_hour,
         predicted_high_f,
-        side,
-        market.market_id,
-        price,
-        bool(live_trader),
-        market.market_question,
+        total_yes_price,
+        adjacent_shares,
+        [trade.trade_id for trade in created],
     )
-    return trade
+    return created[0] if created else None
 
 
 def parse_weather_record_timestamp(value: Any) -> Optional[datetime]:
@@ -2881,6 +3228,7 @@ def notify_trade(config: dict[str, Any], trade: PaperTrade, action: str, status:
         return
     notifier = get_telegram_notifier(config)
     if not notifier:
+        LOGGER.warning("telegram trade notification skipped notifier unavailable trade=%s action=%s status=%s", trade.trade_id, action, status)
         return
 
     action = action.upper()
@@ -2974,6 +3322,13 @@ class LiveTradingManager:
             signature_type=signature_type,
             funder_address=funder_address,
         )
+        LOGGER.info(
+            "live trading executor starting dry_run=%s signature_type=%s safe_configured=%s funder_configured=%s",
+            dry_run,
+            signature_type,
+            bool(safe_address),
+            bool(funder_address),
+        )
         if not self.executor.initialize():
             raise RuntimeError("executor.initialize() failed; live trading is not available")
         self.user_feed = PolymarketUserFeed(self.executor.get_api_creds(), on_message=self._on_user_order_message)
@@ -2999,7 +3354,20 @@ class LiveTradingManager:
         if self._thread:
             self._thread.join(timeout=2)
 
-    def submit_buy_trade(self, config: dict[str, Any], cycle_id: str, market: TemperatureMarket, wu_source: str, station: str, side: str, entry_price: float, observed_high: Optional[float], observed_low: Optional[float], reason: str) -> Optional[PaperTrade]:
+    def submit_buy_trade(
+        self,
+        config: dict[str, Any],
+        cycle_id: str,
+        market: TemperatureMarket,
+        wu_source: str,
+        station: str,
+        side: str,
+        entry_price: float,
+        observed_high: Optional[float],
+        observed_low: Optional[float],
+        reason: str,
+        amount_usd: Optional[float] = None,
+    ) -> Optional[PaperTrade]:
         """Post a live buy order and return a BUY_PENDING trade row when accepted by the CLOB.
         
         Args:
@@ -3023,13 +3391,45 @@ class LiveTradingManager:
         if not token_id:
             LOGGER.warning("live buy skipped missing token side=%s market=%s", side, market.market_id)
             return None
-        amount = float(config["trading"]["buy_notional_usdc"])
-        result = self.executor.place_buy_order(token_id, amount, price=entry_price)
+        if source_station_city_blocked(market.event_date, market.city):
+            LOGGER.warning(
+                "live buy skipped source station mismatch block city=%s event_date=%s market=%s side=%s",
+                market.city,
+                market.event_date,
+                market.market_id,
+                side,
+            )
+            return None
+        amount = float(amount_usd if amount_usd is not None else config["trading"]["buy_notional_usdc"])
+        max_price = configured_max_buy_price(config)
+        if float(entry_price) > max_price:
+            LOGGER.info(
+                "live buy skipped price above configured max side=%s market=%s price=%.4f max_buy_price=%.4f",
+                side,
+                market.market_id,
+                float(entry_price),
+                max_price,
+            )
+            return None
+        neg_risk = market_neg_risk(market)
+        result = self.executor.place_buy_order(token_id, amount, price=entry_price, neg_risk=neg_risk)
         if not _result_value(result, "success", False):
-            LOGGER.error("live buy rejected side=%s market=%s price=%s error=%s", side, market.market_id, entry_price, _result_value(result, "error", ""))
+            LOGGER.error("live buy rejected side=%s market=%s price=%s neg_risk=%s error=%s", side, market.market_id, entry_price, neg_risk, _result_value(result, "error", ""))
             return None
 
-        trade = make_trade(config, cycle_id, market, wu_source, station, side, float(_result_value(result, "price", entry_price)), observed_high, observed_low, reason)
+        trade = make_trade(
+            config,
+            cycle_id,
+            market,
+            wu_source,
+            station,
+            side,
+            float(_result_value(result, "price", entry_price)),
+            observed_high,
+            observed_low,
+            reason,
+            notional_usdc=float(_result_value(result, "amount_usd", amount)),
+        )
         self._apply_buy_result_to_trade(trade, result, pending=True)
         self._register_pending(
             LivePendingOrder(
@@ -3045,7 +3445,7 @@ class LiveTradingManager:
                 token_balance_before=_result_value(result, "token_balance_before", None),
             )
         )
-        LOGGER.info("live buy pending trade=%s order=%s side=%s market=%s price=%s shares=%s", trade.trade_id, trade.live_buy_order_id, side, market.market_id, trade.yes_price, trade.shares)
+        LOGGER.info("live buy pending trade=%s order=%s side=%s market=%s price=%s shares=%s neg_risk=%s", trade.trade_id, trade.live_buy_order_id, side, market.market_id, trade.yes_price, trade.shares, neg_risk)
         notify_trade(config, trade, "BUY", "SUBMITTED", reason)
         return trade
 
@@ -3069,7 +3469,8 @@ class LiveTradingManager:
             trade.live_order_error = "missing token id for sell"
             LOGGER.warning("live sell skipped missing token trade=%s market=%s", trade.trade_id, market.market_id)
             return False
-        result = self.executor.place_sell_order(token_id, trade.shares, price=exit_price)
+        neg_risk = market_neg_risk(market)
+        result = self.executor.place_sell_order(token_id, trade.shares, price=exit_price, neg_risk=neg_risk)
         if not _result_value(result, "success", False):
             trade.live_order_status = str(_result_value(result, "status", "FAILED"))
             trade.live_order_error = str(_result_value(result, "error", ""))
@@ -3396,7 +3797,19 @@ class LiveTradingManager:
         LOGGER.info("live order cancelled order=%s kind=%s reason=%s cancelled=%s", pending.order_id, pending.kind, reason, cancelled)
 
 
-def make_trade(config: dict[str, Any], cycle_id: str, market: TemperatureMarket, wu_source: str, station: str, side: str, entry_price: float, observed_high: Optional[float], observed_low: Optional[float], reason: str) -> PaperTrade:
+def make_trade(
+    config: dict[str, Any],
+    cycle_id: str,
+    market: TemperatureMarket,
+    wu_source: str,
+    station: str,
+    side: str,
+    entry_price: float,
+    observed_high: Optional[float],
+    observed_low: Optional[float],
+    reason: str,
+    notional_usdc: Optional[float] = None,
+) -> PaperTrade:
     """Create a PaperTrade record for a deterministic strategy entry.
     
     Args:
@@ -3417,7 +3830,7 @@ def make_trade(config: dict[str, Any], cycle_id: str, market: TemperatureMarket,
     now = datetime.now().isoformat(timespec="seconds")
     side = side.upper()
     price = float(entry_price)
-    notional = float(config["trading"]["buy_notional_usdc"])
+    notional = float(notional_usdc if notional_usdc is not None else config["trading"]["buy_notional_usdc"])
     shares = notional / price if price > 0 else 0.0
     fee = taker_fee_usdc(shares, price, float(config["trading"]["fee_rate"]), bool(config["trading"].get("fee_enabled", True)))
     comparable_min, comparable_max, comparable_unit = comparable_rule_bounds(market, market.unit)
@@ -6759,6 +7172,7 @@ def run(config: dict[str, Any]) -> None:
     LOGGER.info("bot started config=%s", json.dumps(redacted_config(config), ensure_ascii=False, sort_keys=True))
     start_live_trader(config)
     sync_polymarket_positions_to_disk(config, reason="start")
+    start_source_station_guard_thread(config)
     start_model_awc_thread(config)
     try:
         while True:

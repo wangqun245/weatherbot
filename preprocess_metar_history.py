@@ -18,6 +18,7 @@ STATION_TIMEZONES = {
     "KATL": "America/New_York",
     "KAUS": "America/Chicago",
     "KDAL": "America/Chicago",
+    "KBKF": "America/Denver",
     "KDEN": "America/Denver",
     "KHOU": "America/Chicago",
     "KLAX": "America/Los_Angeles",
@@ -49,6 +50,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
     parser.add_argument("--start-hour", type=int, default=9)
     parser.add_argument("--end-hour", type=int, default=19)
+    parser.add_argument(
+        "--stations",
+        nargs="*",
+        help="Optional ICAO station list to process, for example: --stations KBKF",
+    )
     parser.add_argument(
         "--full-day",
         action="store_true",
@@ -184,7 +190,14 @@ def main() -> int:
         raise SystemExit("--start-hour and --end-hour must be between 0 and 23, with start <= end")
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
-    station_dirs = [p for p in sorted(args.input_dir.iterdir()) if p.is_dir()]
+    requested_stations = {station.upper() for station in (args.stations or [])}
+    station_dirs = [
+        p
+        for p in sorted(args.input_dir.iterdir())
+        if p.is_dir() and (not requested_stations or p.name.upper() in requested_stations)
+    ]
+    if requested_stations and not station_dirs:
+        raise SystemExit(f"No requested station directories found: {', '.join(sorted(requested_stations))}")
     window_label = output_window_label(args.start_hour, args.end_hour, args.full_day)
 
     summary: dict[str, dict[str, int | str]] = {}

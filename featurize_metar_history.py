@@ -20,6 +20,7 @@ STATION_TIMEZONES = {
     "KATL": "America/New_York",
     "KAUS": "America/Chicago",
     "KDAL": "America/Chicago",
+    "KBKF": "America/Denver",
     "KDEN": "America/Denver",
     "KHOU": "America/Chicago",
     "KLAX": "America/Los_Angeles",
@@ -34,6 +35,7 @@ SHORT_TO_ICAO = {
     "ATL": "KATL",
     "AUS": "KAUS",
     "DAL": "KDAL",
+    "BKF": "KBKF",
     "DEN": "KDEN",
     "HOU": "KHOU",
     "LAX": "KLAX",
@@ -44,7 +46,20 @@ SHORT_TO_ICAO = {
     "SFO": "KSFO",
 }
 
-STATION_IDS = {station: index for index, station in enumerate(sorted(STATION_TIMEZONES), start=1)}
+STATION_IDS = {
+    "KATL": 1,
+    "KAUS": 2,
+    "KDAL": 3,
+    "KBKF": 4,
+    "KDEN": 4,
+    "KHOU": 5,
+    "KLAX": 6,
+    "KLGA": 7,
+    "KMIA": 8,
+    "KORD": 9,
+    "KSEA": 10,
+    "KSFO": 11,
+}
 
 RMK_TEMP_RE = re.compile(r"(?:^|\s)T([01])(\d{3})([01])(\d{3})(?:\s|$)")
 BODY_TEMP_RE = re.compile(r"^(M?\d{2}|//)/(M?\d{2}|//)$")

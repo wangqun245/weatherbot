@@ -230,10 +230,10 @@ def _signature_type(value: int) -> SignatureTypeV2:
         return SignatureTypeV2.EOA
 
 
-def _order_options() -> PartialCreateOrderOptions:
+def _order_options(neg_risk: bool = DEFAULT_NEG_RISK) -> PartialCreateOrderOptions:
     return PartialCreateOrderOptions(
         tick_size=DEFAULT_TICK_SIZE,
-        neg_risk=DEFAULT_NEG_RISK,
+        neg_risk=bool(neg_risk),
     )
 
 
@@ -535,10 +535,19 @@ class Executor:
                 side="BUY", price=market_price, token_id=token_id[:16] + "...",
             )
 
+        balance_before = self.get_balance(refresh=True)
+        if balance_before < clean_amount:
+            return OrderResult(
+                success=False, status=REJECTED,
+                error=f"Insufficient USDC balance: ${balance_before:.2f} available < ${clean_amount:.2f} required",
+                side="BUY", price=market_price, amount_usd=clean_amount,
+                shares=shares, token_id=token_id[:16] + "...",
+                dry_run=False, balance_before=balance_before,
+            )
+
         print(f"  [order] Market price: ${market_price:.3f}/share "
               f"-> {int(shares)} shares for ${clean_amount:.2f}")
 
-        balance_before = self.get_balance()
         token_balance_before = self._get_token_balance_optional(token_id)
         try:
             result = self.client.create_and_post_order(
@@ -606,7 +615,7 @@ class Executor:
                 side="BUY", price=market_price, token_id=token_id[:16] + "...",
             )
 
-    def place_buy_order(self, token_id: str, amount_usd: float, price: float = 0.0) -> OrderResult:
+    def place_buy_order(self, token_id: str, amount_usd: float, price: float = 0.0, neg_risk: bool = DEFAULT_NEG_RISK) -> OrderResult:
         """Post a buy order and return immediately; caller verifies/cancels later."""
         amount_usd = round(float(amount_usd), 2)
         if amount_usd < MIN_AMOUNT_USD:
@@ -649,6 +658,22 @@ class Executor:
                 side="BUY", price=market_price, token_id=token_id[:16] + "...",
             )
 
+        if not self.dry_run:
+            if not self._initialized:
+                return OrderResult(success=False, status=FAILED, error="Not initialized")
+
+            balance_before = self.get_balance(refresh=True)
+            if balance_before < clean_amount:
+                return OrderResult(
+                    success=False, status=REJECTED,
+                    error=f"Insufficient USDC balance: ${balance_before:.2f} available < ${clean_amount:.2f} required",
+                    side="BUY", price=market_price, amount_usd=clean_amount,
+                    shares=shares, token_id=token_id[:16] + "...",
+                    dry_run=False, balance_before=balance_before,
+                )
+        else:
+            balance_before = 0.0
+
         print(f"  [order] Posting buy: ${market_price:.3f}/share "
               f"-> {int(shares)} shares for ${clean_amount:.2f}")
 
@@ -660,10 +685,6 @@ class Executor:
                 token_id=token_id[:16] + "...", dry_run=True,
             )
 
-        if not self._initialized:
-            return OrderResult(success=False, status=FAILED, error="Not initialized")
-
-        balance_before = self.get_balance()
         token_balance_before = self._get_token_balance_optional(token_id)
         try:
             result = self.client.create_and_post_order(
@@ -673,7 +694,7 @@ class Executor:
                     size=float(int(shares)),
                     side="BUY",
                 ),
-                options=_order_options(),
+                options=_order_options(neg_risk),
                 order_type=OrderType.GTC,
             )
             order_id = result.get("orderID", "")
@@ -751,7 +772,7 @@ class Executor:
             dry_run=False,
         )
 
-    def place_sell_order(self, token_id: str, shares: float, price: float = 0.0) -> OrderResult:
+    def place_sell_order(self, token_id: str, shares: float, price: float = 0.0, neg_risk: bool = DEFAULT_NEG_RISK) -> OrderResult:
         """Post a sell order and return immediately; caller verifies/cancels later."""
         sell_shares = int(shares)
         if sell_shares < 1:
@@ -833,7 +854,7 @@ class Executor:
                     price=market_price,
                     order_type=OrderType.GTC,
                 ),
-                options=_order_options(),
+                options=_order_options(neg_risk),
                 order_type=OrderType.GTC,
             )
             order_id = result.get("orderID", "")

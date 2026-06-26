@@ -61,7 +61,7 @@
     "trading":  {
                     "strategy_name":  "model_awc_high",
                     "strategy_mode":  "model_awc_high",
-                    "buy_notional_usdc":  5,
+                    "buy_notional_usdc":  10,
                     "fee_rate":  0.05,
                     "fee_enabled":  true,
                     "deterministic_min_yes_price":  0.01,
@@ -107,7 +107,7 @@
                     "weather_record_receive_window_seconds":  300,
                     "tgftp_window_max_inflight_per_station":  10
                     ,"model_awc_enabled": true
-                    ,"model_awc_model_path": "models/lightgbm_rolling_6y_holdout_24h_lag6_kbkf_denver/lightgbm_metar_high_rolling_6y_best.pkl"
+                    ,"model_awc_model_path": "models/lightgbm_rolling_6y_holdout_24h_lag6_speci_context_regular_20260625_2240/lightgbm_metar_high_rolling_6y_best.pkl"
                     ,"model_awc_live_stations": [
                         "KMIA",
                         "KLAX",
@@ -124,14 +124,15 @@
                     ,"model_awc_station_observation_minutes": {
                         "KORD": 51,
                         "KATL": 52,
-                        "KLGA": 52,
-                        "KSFO": 57,
-                        "KBKF": 0,
-                        "KAUS": 54,
-                        "KDAL": 54,
-                        "KHOU": 54,
-                        "KSEA": 54,
-                        "KMIA": 54
+                        "KLGA": 51,
+                        "KSFO": 56,
+                        "KBKF": 58,
+                        "KAUS": 53,
+                        "KDAL": 53,
+                        "KHOU": 53,
+                        "KLAX": 53,
+                        "KSEA": 53,
+                        "KMIA": 53
                     }
                     ,"model_awc_station_poll_stagger_seconds": 5
                     ,"model_awc_lag_tolerance_minutes": 30
@@ -140,6 +141,7 @@
                     ,"model_awc_poll_attempts": 5
                     ,"model_awc_adjacent_yes_max_total_price": 0.9
                     ,"model_awc_adjacent_yes_shares": 10
+                    ,"model_awc_interval_snap_tolerance_f": 0.15
                 },
     "scheduler":  {
                       "poll_interval_minutes":  15,
@@ -215,7 +217,7 @@
                            "trading":  {
                                            "strategy_name":  "model_awc_high",
                                            "strategy_mode":  "model_awc_high",
-                                           "buy_notional_usdc":  5,
+                                           "buy_notional_usdc":  10,
                                            "fee_rate":  0.05,
                                            "fee_enabled":  true,
                                            "deterministic_min_yes_price":  0.01,
@@ -259,7 +261,7 @@
                                            "weather_record_receive_window_seconds":  300,
                                            "tgftp_window_max_inflight_per_station":  10
                                            ,"model_awc_enabled": true
-                                           ,"model_awc_model_path": "models/lightgbm_rolling_6y_holdout_24h_lag6_kbkf_denver/lightgbm_metar_high_rolling_6y_best.pkl"
+                                           ,"model_awc_model_path": "models/lightgbm_rolling_6y_holdout_24h_lag6_speci_context_regular_20260625_2240/lightgbm_metar_high_rolling_6y_best.pkl"
                                            ,"model_awc_live_stations": [
                                                "KMIA",
                                                "KLAX",
@@ -274,16 +276,17 @@
                                            ,"model_awc_metar_lookback_hours": 7
                                            ,"model_awc_observation_minute": 53
                                            ,"model_awc_station_observation_minutes": {
-                                               "KORD": 53,
-                                               "KATL": 54,
-                                               "KLGA": 54,
-                                               "KSFO": 59,
-                                               "KBKF": 0,
-                                               "KAUS": 56,
-                                               "KDAL": 56,
-                                               "KHOU": 56,
-                                               "KSEA": 56,
-                                               "KMIA": 56
+                                               "KORD": 51,
+                                               "KATL": 52,
+                                               "KLGA": 51,
+                                               "KSFO": 56,
+                                               "KBKF": 58,
+                                               "KAUS": 53,
+                                               "KDAL": 53,
+                                               "KHOU": 53,
+                                               "KLAX": 53,
+                                               "KSEA": 53,
+                                               "KMIA": 53
                                            }
                                            ,"model_awc_station_poll_stagger_seconds": 5
                                            ,"model_awc_lag_tolerance_minutes": 30
@@ -292,6 +295,7 @@
                                            ,"model_awc_poll_attempts": 5
                                            ,"model_awc_adjacent_yes_max_total_price": 0.9
                                            ,"model_awc_adjacent_yes_shares": 10
+                                           ,"model_awc_interval_snap_tolerance_f": 0.15
                                        }
                        }
                    ]

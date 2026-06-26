@@ -719,6 +719,94 @@ class Executor:
                 token_balance_before=token_balance_before,
             )
 
+    def place_buy_order_shares(self, token_id: str, shares: float, price: float, neg_risk: bool = DEFAULT_NEG_RISK) -> OrderResult:
+        """Post a buy order for an exact whole-share size."""
+        market_price = round(float(price), 2)
+        order_shares = int(float(shares))
+        clean_amount = round(order_shares * market_price, 2)
+        if order_shares < int(MIN_SHARES):
+            return OrderResult(
+                success=False, status=REJECTED,
+                error=f"Shares {shares:.4f} below min", side="BUY",
+                price=market_price, shares=float(order_shares), token_id=token_id[:16] + "...",
+            )
+        if clean_amount < POLY_MIN_NOTIONAL:
+            return OrderResult(
+                success=False, status=REJECTED,
+                error=f"Fixed share order ${clean_amount:.2f} < ${POLY_MIN_NOTIONAL:.0f} min",
+                side="BUY", price=market_price, amount_usd=clean_amount,
+                shares=float(order_shares), token_id=token_id[:16] + "...",
+            )
+        cap_price = max_buy_price()
+        if market_price > cap_price:
+            return OrderResult(
+                success=False, status=REJECTED,
+                error=f"Price ${market_price:.3f} > cap ${cap_price:.2f}",
+                side="BUY", price=market_price, amount_usd=clean_amount,
+                shares=float(order_shares), token_id=token_id[:16] + "...",
+            )
+        if not self.dry_run:
+            if not self._initialized:
+                return OrderResult(success=False, status=FAILED, error="Not initialized")
+            balance_before = self.get_balance(refresh=True)
+            if balance_before < clean_amount:
+                return OrderResult(
+                    success=False, status=REJECTED,
+                    error=f"Insufficient USDC balance: ${balance_before:.2f} available < ${clean_amount:.2f} required",
+                    side="BUY", price=market_price, amount_usd=clean_amount,
+                    shares=float(order_shares), token_id=token_id[:16] + "...",
+                    dry_run=False, balance_before=balance_before,
+                )
+        else:
+            balance_before = 0.0
+
+        print(f"  [order] Posting fixed buy: ${market_price:.3f}/share "
+              f"-> {order_shares} shares for ${clean_amount:.2f}")
+
+        if self.dry_run:
+            return OrderResult(
+                success=True, order_id=f"DRY-{int(time.time() * 1000)}",
+                status="PENDING", side="BUY", price=market_price,
+                amount_usd=clean_amount, shares=float(order_shares),
+                token_id=token_id[:16] + "...", dry_run=True,
+            )
+
+        token_balance_before = self._get_token_balance_optional(token_id)
+        try:
+            result = self.client.create_and_post_order(
+                order_args=OrderArgs(
+                    token_id=token_id,
+                    price=market_price,
+                    size=float(order_shares),
+                    side="BUY",
+                ),
+                options=_order_options(neg_risk),
+                order_type=OrderType.GTC,
+            )
+            order_id = result.get("orderID", "")
+            if not order_id:
+                return OrderResult(
+                    success=False, status=REJECTED,
+                    error=f"No orderID: {result}", side="BUY", price=market_price,
+                    amount_usd=clean_amount, shares=float(order_shares),
+                    token_id=token_id[:16] + "...",
+                )
+            return OrderResult(
+                success=True, order_id=order_id, status="PENDING",
+                side="BUY", price=market_price, amount_usd=clean_amount,
+                shares=float(order_shares), token_id=token_id[:16] + "...",
+                dry_run=False, balance_before=balance_before,
+                token_balance_before=token_balance_before,
+            )
+        except Exception as e:
+            return OrderResult(
+                success=False, status=FAILED, error=_friendly_error(e),
+                side="BUY", price=market_price, amount_usd=clean_amount,
+                shares=float(order_shares), token_id=token_id[:16] + "...",
+                balance_before=balance_before,
+                token_balance_before=token_balance_before,
+            )
+
     def check_pending_buy(
         self,
         order_id: str,

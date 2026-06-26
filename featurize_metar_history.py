@@ -5,7 +5,7 @@ import csv
 import json
 import math
 import re
-from bisect import bisect_left
+from bisect import bisect_left, bisect_right
 from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -120,8 +120,13 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--input-dir", type=Path, default=DEFAULT_INPUT_DIR)
     parser.add_argument("--lag-tolerance-minutes", type=int, default=30)
-    parser.add_argument("--max-lag-hours", type=int, default=3)
+    parser.add_argument("--max-lag-hours", type=int, default=6)
     parser.add_argument("--combined-file", type=Path)
+    parser.add_argument(
+        "--regular-inputs-only",
+        action="store_true",
+        help="Only output regular scheduled observation rows; use SPECI/COR rows as lookback context features.",
+    )
     parser.add_argument("--overwrite", action="store_true")
     return parser.parse_args()
 
@@ -410,6 +415,26 @@ BASE_FEATURE_COLUMNS = [
     "lowest_ceiling_ft",
     "wx_token_count",
     *[f"wx_{code.lower()}" for code in WX_CODES],
+    "is_extra_metar_report",
+    "metar_obs_count_past_6h",
+    "metar_obs_max_temp_f_past_6h",
+    "metar_obs_max_temp_minutes_ago_past_6h",
+    "metar_obs_min_temp_f_past_6h",
+    "metar_obs_min_temp_minutes_ago_past_6h",
+    "metar_obs_latest_temp_f_past_6h",
+    "metar_obs_latest_temp_minutes_ago_past_6h",
+    "metar_obs_temp_range_f_past_6h",
+    "extra_metar_count_past_6h",
+    "has_extra_metar_past_6h",
+    "extra_metar_max_temp_f_past_6h",
+    "extra_metar_max_temp_minutes_ago_past_6h",
+    "extra_metar_min_temp_f_past_6h",
+    "extra_metar_min_temp_minutes_ago_past_6h",
+    "extra_metar_latest_temp_f_past_6h",
+    "extra_metar_latest_temp_minutes_ago_past_6h",
+    "temp_f_change_from_latest_extra_metar_past_6h",
+    "temp_f_change_from_max_extra_metar_past_6h",
+    "temp_f_change_from_min_extra_metar_past_6h",
 ]
 
 
@@ -474,6 +499,109 @@ def nearest_lag_value(
     return temp_values[best_idx] if best_idx is not None else None
 
 
+def regular_observation_minutes_by_year(rows: list[MetarRow]) -> dict[int, int]:
+    counts_by_year: dict[int, Counter] = {}
+    for row in rows:
+        counts_by_year.setdefault(row.valid_utc.year, Counter())[row.valid_utc.minute] += 1
+    return {
+        year: counts.most_common(1)[0][0]
+        for year, counts in counts_by_year.items()
+        if counts
+    }
+
+
+def is_extra_metar_report(row: MetarRow, regular_minutes_by_year: dict[int, int]) -> bool:
+    regular_minute = regular_minutes_by_year.get(row.valid_utc.year)
+    if regular_minute is None:
+        return True
+    return row.valid_utc.minute != regular_minute or " COR " in f" {row.metar} "
+
+
+def add_observation_context_features(
+    features: dict[str, object | None],
+    row: MetarRow,
+    row_idx: int,
+    valid_times: list[datetime],
+    temp_values: list[float | None],
+    extra_flags: list[bool],
+    window: timedelta,
+) -> None:
+    temp_f = features.get("temp_f")
+    is_extra = extra_flags[row_idx]
+    features["is_extra_metar_report"] = 1 if is_extra else 0
+
+    start = row.valid_utc - window
+    start_idx = bisect_left(valid_times, start)
+    end_idx = bisect_right(valid_times, row.valid_utc)
+    all_values: list[tuple[datetime, float]] = []
+    extra_values: list[tuple[datetime, float]] = []
+    for idx in range(start_idx, end_idx):
+        value = temp_values[idx]
+        if value is None:
+            continue
+        numeric_value = float(value)
+        all_values.append((valid_times[idx], numeric_value))
+        if not extra_flags[idx]:
+            continue
+        extra_values.append((valid_times[idx], numeric_value))
+
+    features["metar_obs_count_past_6h"] = len(all_values)
+    if all_values:
+        all_values_only = [value for _valid_time, value in all_values]
+        latest_time, latest_value = all_values[-1]
+        max_time, max_value = max(all_values, key=lambda item: item[1])
+        min_time, min_value = min(all_values, key=lambda item: item[1])
+        features["metar_obs_max_temp_f_past_6h"] = max_value
+        features["metar_obs_max_temp_minutes_ago_past_6h"] = (row.valid_utc - max_time).total_seconds() / 60.0
+        features["metar_obs_min_temp_f_past_6h"] = min_value
+        features["metar_obs_min_temp_minutes_ago_past_6h"] = (row.valid_utc - min_time).total_seconds() / 60.0
+        features["metar_obs_latest_temp_f_past_6h"] = latest_value
+        features["metar_obs_latest_temp_minutes_ago_past_6h"] = (row.valid_utc - latest_time).total_seconds() / 60.0
+        features["metar_obs_temp_range_f_past_6h"] = max(all_values_only) - min(all_values_only)
+    else:
+        features["metar_obs_max_temp_f_past_6h"] = None
+        features["metar_obs_max_temp_minutes_ago_past_6h"] = None
+        features["metar_obs_min_temp_f_past_6h"] = None
+        features["metar_obs_min_temp_minutes_ago_past_6h"] = None
+        features["metar_obs_latest_temp_f_past_6h"] = None
+        features["metar_obs_latest_temp_minutes_ago_past_6h"] = None
+        features["metar_obs_temp_range_f_past_6h"] = None
+
+    features["extra_metar_count_past_6h"] = len(extra_values)
+    features["has_extra_metar_past_6h"] = 1 if extra_values else 0
+    if not extra_values:
+        features["extra_metar_max_temp_f_past_6h"] = None
+        features["extra_metar_max_temp_minutes_ago_past_6h"] = None
+        features["extra_metar_min_temp_f_past_6h"] = None
+        features["extra_metar_min_temp_minutes_ago_past_6h"] = None
+        features["extra_metar_latest_temp_f_past_6h"] = None
+        features["extra_metar_latest_temp_minutes_ago_past_6h"] = None
+        features["temp_f_change_from_latest_extra_metar_past_6h"] = None
+        features["temp_f_change_from_max_extra_metar_past_6h"] = None
+        features["temp_f_change_from_min_extra_metar_past_6h"] = None
+        return
+
+    values = [value for _valid_time, value in extra_values]
+    latest_time, latest_value = extra_values[-1]
+    max_time, max_value = max(extra_values, key=lambda item: item[1])
+    min_time, min_value = min(extra_values, key=lambda item: item[1])
+    features["extra_metar_max_temp_f_past_6h"] = max_value
+    features["extra_metar_max_temp_minutes_ago_past_6h"] = (row.valid_utc - max_time).total_seconds() / 60.0
+    features["extra_metar_min_temp_f_past_6h"] = min_value
+    features["extra_metar_min_temp_minutes_ago_past_6h"] = (row.valid_utc - min_time).total_seconds() / 60.0
+    features["extra_metar_latest_temp_f_past_6h"] = latest_value
+    features["extra_metar_latest_temp_minutes_ago_past_6h"] = (row.valid_utc - latest_time).total_seconds() / 60.0
+    features["temp_f_change_from_latest_extra_metar_past_6h"] = (
+        None if temp_f is None else float(temp_f) - latest_value
+    )
+    features["temp_f_change_from_max_extra_metar_past_6h"] = (
+        None if temp_f is None else float(temp_f) - max_value
+    )
+    features["temp_f_change_from_min_extra_metar_past_6h"] = (
+        None if temp_f is None else float(temp_f) - min_value
+    )
+
+
 def feature_file_for(input_file: Path) -> Path:
     return input_file.with_name(f"{input_file.stem}_features{input_file.suffix}")
 
@@ -493,6 +621,7 @@ def write_station_features(
     combined_writer: csv.DictWriter,
     tolerance: timedelta,
     max_lag_hours: int,
+    regular_inputs_only: bool,
     columns: list[str],
     fieldnames: list[str],
 ) -> Counter:
@@ -508,13 +637,25 @@ def write_station_features(
         features["station_id"] = STATION_IDS[station_icao]
     valid_times = [row.valid_utc for row in rows]
     temp_values = [features.get("temp_f") for features in decoded]
+    regular_minutes_by_year = regular_observation_minutes_by_year(rows)
+    extra_flags = [is_extra_metar_report(row, regular_minutes_by_year) for row in rows]
+    extra_window = timedelta(hours=6)
 
-    stats: Counter = Counter(input_rows=len(rows), output_rows=0)
+    stats: Counter = Counter(
+        input_rows=len(rows),
+        output_rows=0,
+        extra_metar_rows=sum(1 for flag in extra_flags if flag),
+    )
+    stats["regular_observation_minute_years"] = len(regular_minutes_by_year)
     with output_file.open("w", encoding="utf-8", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=fieldnames, lineterminator="\n")
         writer.writeheader()
 
-        for row, features in zip(rows, decoded):
+        for row_idx, (row, features) in enumerate(zip(rows, decoded)):
+            if regular_inputs_only and extra_flags[row_idx]:
+                stats["extra_metar_input_rows_skipped"] += 1
+                continue
+
             temp_f = features.get("temp_f")
             for hours in range(1, max_lag_hours + 1):
                 lag_value = nearest_lag_value(
@@ -527,6 +668,15 @@ def write_station_features(
                 features[f"temp_f_change_{hours}h"] = (
                     None if temp_f is None or lag_value is None else float(temp_f) - lag_value
                 )
+            add_observation_context_features(
+                features=features,
+                row=row,
+                row_idx=row_idx,
+                valid_times=valid_times,
+                temp_values=temp_values,
+                extra_flags=extra_flags,
+                window=extra_window,
+            )
 
             output_row = {
                 "daily_high_f": row.daily_high_f,
@@ -541,6 +691,8 @@ def write_station_features(
             for hours in range(1, max_lag_hours + 1):
                 if features.get(f"temp_f_lag_{hours}h") is None:
                     stats[f"missing_temp_lag_{hours}h"] += 1
+            if features.get("extra_metar_count_past_6h"):
+                stats["rows_with_extra_metar_in_past_6h"] += 1
 
     return stats
 
@@ -592,6 +744,7 @@ def main() -> int:
                 combined_writer,
                 tolerance,
                 args.max_lag_hours,
+                args.regular_inputs_only,
                 columns,
                 fieldnames,
             )
@@ -607,6 +760,7 @@ def main() -> int:
     summary["_config"] = {
         "lag_tolerance_minutes": args.lag_tolerance_minutes,
         "max_lag_hours": args.max_lag_hours,
+        "regular_inputs_only": int(args.regular_inputs_only),
         "combined_file": str(args.combined_file),
     }
     summary_file = args.input_dir / "feature_summary.json"

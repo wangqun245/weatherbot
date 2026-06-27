@@ -343,11 +343,11 @@ def default_config() -> dict[str, Any]:
         "depth_price_notional_multiplier": 2.0,
         "depth_price_extra_levels": 1,
         "model_awc_enabled": True,
-        "model_awc_model_path": "models/lightgbm_rolling_6y_holdout_24h_lag6_speci_context_regular_20260625_2240/lightgbm_metar_high_rolling_6y_best.pkl",
+        "model_awc_model_path": "models/lightgbm_rolling_6y_holdout_24h_lag10_speci_context_regular_20260626/lightgbm_metar_high_rolling_6y_best.pkl",
         "model_awc_live_stations": ["KMIA", "KLAX", "KSFO", "KSEA", "KHOU", "KAUS", "KATL"],
         "model_awc_buy_start_hour": 12,
-        "model_awc_buy_end_hour": 18,
-        "model_awc_metar_lookback_hours": 7,
+        "model_awc_buy_end_hour": 16,
+        "model_awc_metar_lookback_hours": 11,
         "model_awc_observation_minute": 53,
         "model_awc_station_observation_minutes": {
             "KORD": 51,
@@ -2245,6 +2245,19 @@ def model_awc_required_lag_hours(config: dict[str, Any]) -> int:
     return max(lag_hours, default=3)
 
 
+def model_awc_required_context_hours(config: dict[str, Any]) -> int:
+    """Return the observation/SPECI context window required by the loaded model."""
+    model = model_awc_load_model(config)
+    feature_names = list(getattr(model, "feature_name_", []))
+    context_hours = [
+        int(match.group(1))
+        for name in feature_names
+        for match in [re.search(r"_past_(\d+)h$", str(name))]
+        if match
+    ]
+    return max(context_hours, default=6)
+
+
 def model_awc_parse_row(row: dict[str, Any], station: str) -> Optional[FeatureMetarRow]:
     """Convert one AviationWeather JSON row into the feature pipeline row shape."""
     raw_metar = str(row.get("rawOb") or row.get("raw") or row.get("metar") or "").strip()
@@ -2337,7 +2350,7 @@ def model_awc_feature_row(
     latest = regular_inputs[-1]
     latest_local = latest.valid_utc.astimezone(tz)
     start_hour = int(config["trading"].get("model_awc_buy_start_hour", 12))
-    end_hour = int(config["trading"].get("model_awc_buy_end_hour", 18))
+    end_hour = int(config["trading"].get("model_awc_buy_end_hour", 16))
     if latest_local.hour < start_hour or latest_local.hour > end_hour:
         return None
 
@@ -2357,6 +2370,7 @@ def model_awc_feature_row(
             None if current_temp is None or lag_value is None else float(current_temp) - float(lag_value)
         )
     latest_idx = parsed.index(latest)
+    context_hours = model_awc_required_context_hours(config)
     add_observation_context_features(
         features=features,
         row=latest,
@@ -2364,7 +2378,8 @@ def model_awc_feature_row(
         valid_times=valid_times,
         temp_values=temp_values,
         extra_flags=extra_flags,
-        window=timedelta(hours=6),
+        window=timedelta(hours=context_hours),
+        context_hours=context_hours,
     )
     return features, latest, latest_local
 
@@ -6651,9 +6666,13 @@ def model_awc_supervisor(config: dict[str, Any]) -> None:
     poll_delay_seconds = max(0, int(config["trading"].get("model_awc_poll_delay_seconds", 180)))
     poll_interval_seconds = max(10, int(config["trading"].get("model_awc_poll_interval_seconds", 60)))
     poll_attempts = max(1, int(config["trading"].get("model_awc_poll_attempts", 5)))
-    lookback_hours = max(7, int(config["trading"].get("model_awc_metar_lookback_hours", 7)))
+    required_history_hours = model_awc_required_lag_hours(config) + 1
+    lookback_hours = max(
+        required_history_hours,
+        int(config["trading"].get("model_awc_metar_lookback_hours", required_history_hours)),
+    )
     start_hour = int(config["trading"].get("model_awc_buy_start_hour", 12))
-    end_hour = int(config["trading"].get("model_awc_buy_end_hour", 18))
+    end_hour = int(config["trading"].get("model_awc_buy_end_hour", 16))
     event_cache: list[dict[str, Any]] = []
     station_groups: dict[tuple[str, str], dict[str, Any]] = {}
     window_state: dict[str, dict[str, Any]] = {}

@@ -6,17 +6,28 @@ import io
 from datetime import datetime
 
 AIRPORTS = {
-    "Atlanta": ("KATL", "GA_ASOS", "ATL"),
-     "Austin": ("KAUS", "TX_ASOS", "AUS"),
-     "Chicago": ("KORD", "IL_ASOS", "ORD"),
-        "Dallas": ("KDAL", "TX_ASOS", "DAL"),
-    "Denver": ("KBKF", "CO_ASOS", "BKF"),
-     "Houston": ("KHOU", "TX_ASOS", "HOU"),
-      "Los Angeles": ("KLAX", "CA_ASOS", "LAX"),
-       "Miami": ("KMIA", "FL_ASOS", "MIA"),
-       "NYC": ("KLGA", "NY_ASOS", "LGA"),
-      "San Francisco": ("KSFO", "CA_ASOS", "SFO"),
-     "Seattle": ("KSEA", "WA_ASOS", "SEA"),
+   ## "Atlanta": ("KATL", "GA_ASOS", "ATL"),
+   ##  "Austin": ("KAUS", "TX_ASOS", "AUS"),
+   ##  "Chicago": ("KORD", "IL_ASOS", "ORD"),
+   ##     "Dallas": ("KDAL", "TX_ASOS", "DAL"),
+   ## "Denver": ("KBKF", "CO_ASOS", "BKF"),
+   ##  "Houston": ("KHOU", "TX_ASOS", "HOU"),
+    ##  "Los Angeles": ("KLAX", "CA_ASOS", "LAX"),
+    ##   "Miami": ("KMIA", "FL_ASOS", "MIA"),
+    ##   "NYC": ("KLGA", "NY_ASOS", "LGA"),
+    ##  "San Francisco": ("KSFO", "CA_ASOS", "SFO"),
+   ##  "Seattle": ("KSEA", "WA_ASOS", "SEA"),
+    # Polymarket China highest-temperature resolution stations.
+    "Beijing": ("ZBAA", "CN__ASOS", "ZBAA"),
+    "Chengdu": ("ZUUU", "CN__ASOS", "ZUUU"),
+    "Chongqing": ("ZUCK", "CN__ASOS", "ZUCK"),
+    "Guangzhou": ("ZGGG", "CN__ASOS", "ZGGG"),
+    "Jinan": ("ZSJN", "CN__ASOS", "ZSJN"),
+    "Qingdao": ("ZSQD", "CN__ASOS", "ZSQD"),
+    "Shanghai": ("ZSPD", "CN__ASOS", "ZSPD"),
+    "Shenzhen": ("ZGSZ", "CN__ASOS", "ZGSZ"),
+    "Wuhan": ("ZHHH", "CN__ASOS", "ZHHH"),
+    "Zhengzhou": ("ZHCC", "CN__ASOS", "ZHCC"),
 }
 
 CURRENT_YEAR = datetime.now().year

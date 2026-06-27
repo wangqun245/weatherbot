@@ -1,0 +1,51 @@
+{
+  "kalshi": {
+    "base_url": "https://api.elections.kalshi.com/trade-api/v2",
+    "series_ticker": "KXHIGHAUS",
+    "api_key_id_env": "KALSHI_API_KEY_ID",
+    "private_key_path_env": "KALSHI_PRIVATE_KEY_PATH",
+    "subaccount": 0,
+    "request_timeout_seconds": 20
+  },
+  "market": {
+    "target_date": "today",
+    "expected_rules_text": "Austin Bergstrom",
+    "allow_source_station_mismatch": true
+  },
+  "observations": {
+    "station": "KATT",
+    "timezone": "fixed_cst",
+    "aviation_weather_url": "https://aviationweather.gov/api/data/metar",
+    "lookback_hours": 14,
+    "regular_observation_minute": 51,
+    "lag_tolerance_minutes": 30,
+    "poll_delay_seconds": 180,
+    "poll_interval_seconds": 60
+  },
+  "model": {
+    "path": "kalshi/models/rolling_6y_holdout_lag10_two_asos_context/lightgbm_metar_high_rolling_6y_best.pkl",
+    "buy_start_hour": 12,
+    "buy_end_hour": 16
+  },
+  "trading": {
+    "live_enabled": true,
+    "dry_run": false,
+    "default_contracts": 10,
+    "max_order_cost_dollars": 5.00,
+    "min_buy_price": 0.01,
+    "max_buy_price": 0.85,
+    "interval_snap_tolerance_f": 0.15,
+    "adjacent_yes_max_total_price": 0.90,
+    "time_in_force": "immediate_or_cancel",
+    "one_order_per_hour": true
+  },
+  "scheduler": {
+    "run_once": false,
+    "poll_seconds": 60
+  },
+  "outputs": {
+    "state_json": "kalshi/runtime/state.json",
+    "trades_jsonl": "kalshi/runtime/trades.jsonl",
+    "log_file": "kalshi/runtime/kalshi_weather_trader.log"
+  }
+}

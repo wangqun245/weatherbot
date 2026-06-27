@@ -1,0 +1,9 @@
+requests
+python-dotenv
+joblib
+lightgbm
+numpy
+pandas
+scikit-learn
+cryptography
+tzdata

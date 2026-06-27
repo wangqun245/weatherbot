@@ -6,21 +6,21 @@ import io
 from datetime import datetime
 
 AIRPORTS = {
-    "Atlanta": ("KATL", "GA_ASOS", "ATL"),
-     "Austin": ("KAUS", "TX_ASOS", "AUS"),
-     "Chicago": ("KORD", "IL_ASOS", "ORD"),
-        "Dallas": ("KDAL", "TX_ASOS", "DAL"),
-    "Denver": ("KBKF", "CO_ASOS", "BKF"),
-     "Houston": ("KHOU", "TX_ASOS", "HOU"),
-      "Los Angeles": ("KLAX", "CA_ASOS", "LAX"),
-       "Miami": ("KMIA", "FL_ASOS", "MIA"),
-       "NYC": ("KLGA", "NY_ASOS", "LGA"),
-      "San Francisco": ("KSFO", "CA_ASOS", "SFO"),
-     "Seattle": ("KSEA", "WA_ASOS", "SEA"),
+   ## "Atlanta": ("KATL", "GA_ASOS", "ATL"),
+     "Austin": ("KATT", "TX_ASOS", "ATT"),
+    ##  "Chicago": ("KORD", "IL_ASOS", "ORD"),
+    ##    "Dallas": ("KDAL", "TX_ASOS", "DAL"),
+    ## "Denver": ("KBKF", "CO_ASOS", "BKF"),
+    ##  "Houston": ("KHOU", "TX_ASOS", "HOU"),
+    ##  "Los Angeles": ("KLAX", "CA_ASOS", "LAX"),
+    ##   "Miami": ("KMIA", "FL_ASOS", "MIA"),
+    ##   "NYC": ("KLGA", "NY_ASOS", "LGA"),
+    ##  "San Francisco": ("KSFO", "CA_ASOS", "SFO"),
+    ## "Seattle": ("KSEA", "WA_ASOS", "SEA"),
 }
 
 CURRENT_YEAR = datetime.now().year
-START_YEAR = CURRENT_YEAR - 49
+START_YEAR = CURRENT_YEAR - 10
 OVERWRITE_EXISTING = True
 
 BASE_DIR = r"C:\weather\metar_history"

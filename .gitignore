@@ -13,3 +13,14 @@ polymarket_weather_performance_by_event.csv
 polymarket_weather_state.json
 
 *.log
+*.pem
+*.key
+secrets/
+kalshi/runtime/
+kalshi/data/
+kalshi/models/
+backup
+models
+outputs
+metar_history_processed2
+*.csv

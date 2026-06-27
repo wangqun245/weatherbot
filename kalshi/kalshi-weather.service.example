@@ -1,0 +1,18 @@
+[Unit]
+Description=Kalshi Austin weather trader
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=weatherbot
+WorkingDirectory=/opt/weatherbot
+EnvironmentFile=/opt/weatherbot/.env
+ExecStart=/opt/weatherbot/.venv/bin/python /opt/weatherbot/kalshi_weather_trader.py run --config /opt/weatherbot/kalshi_weather_config.json
+Restart=on-failure
+RestartSec=10
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

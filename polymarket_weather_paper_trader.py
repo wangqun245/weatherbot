@@ -2656,7 +2656,7 @@ def process_model_awc_prediction(
         write_csv(config["outputs"]["settled_trades_csv"], trades)
         write_performance_reports(config, trades)
         LOGGER.info(
-            "model awc buy city=%s station=%s event_date=%s local_hour=%s predicted_high_f=%.2f side=%s market=%s price=%s amount_usd=%s shares=%s live=%s question=%r",
+            "model awc buy city=%s station=%s event_date=%s local_hour=%s predicted_high_f=%r side=%s market=%s price=%s amount_usd=%s shares=%s live=%s question=%r",
             city,
             station,
             event_date,
@@ -2683,7 +2683,7 @@ def process_model_awc_prediction(
             if candidate:
                 candidates.append(candidate)
         if not candidates:
-            LOGGER.info("model awc skip no priced candidates city=%s station=%s predicted_high_f=%.2f", city, station, predicted_high_f)
+            LOGGER.info("model awc skip no priced candidates city=%s station=%s predicted_high_f=%r", city, station, predicted_high_f)
             return None
         candidates.sort(key=lambda item: (float(item["price"]), str(item["market"].market_id), str(item["side"])))
         selected = candidates[0]
@@ -2702,7 +2702,7 @@ def process_model_awc_prediction(
         yes_price = best_buy_price(config, snap_market, "YES")
         if yes_price is None or yes_price <= 0:
             LOGGER.info(
-                "model awc skip snapped interval missing yes price city=%s station=%s event_date=%s local_hour=%s predicted_high_f=%.2f market=%s distance=%.4f%s",
+                "model awc skip snapped interval missing yes price city=%s station=%s event_date=%s local_hour=%s predicted_high_f=%r market=%s distance=%r%s",
                 city,
                 station,
                 event_date,
@@ -2720,7 +2720,7 @@ def process_model_awc_prediction(
             f"_distance_{snap_distance:.3f}{event_unit}_tolerance_{tolerance_f:.2f}F_local_hour_{local_hour:02d}"
         )
         LOGGER.info(
-            "model awc boundary snap city=%s station=%s event_date=%s local_hour=%s predicted_high_f=%.2f market=%s distance=%.4f%s tolerance_f=%.4f yes_price=%.4f",
+            "model awc boundary snap city=%s station=%s event_date=%s local_hour=%s predicted_high_f=%r market=%s distance=%r%s tolerance_f=%r yes_price=%.4f",
             city,
             station,
             event_date,
@@ -2738,7 +2738,7 @@ def process_model_awc_prediction(
     adjacent_markets = model_awc_adjacent_prediction_markets(markets, predicted_high_f, event_unit)
     if adjacent_markets is None:
         LOGGER.info(
-            "model awc skip invalid prediction without adjacent market pair city=%s station=%s event_date=%s local_hour=%s predicted_high_f=%.2f event_unit=%s",
+            "model awc skip invalid prediction without adjacent market pair city=%s station=%s event_date=%s local_hour=%s predicted_high_f=%r event_unit=%s",
             city,
             station,
             event_date,
@@ -2753,7 +2753,7 @@ def process_model_awc_prediction(
         yes_price = best_buy_price(config, market, "YES")
         if yes_price is None or yes_price <= 0:
             LOGGER.info(
-                "model awc skip adjacent missing yes price city=%s station=%s event_date=%s local_hour=%s predicted_high_f=%.2f market=%s",
+                "model awc skip adjacent missing yes price city=%s station=%s event_date=%s local_hour=%s predicted_high_f=%r market=%s",
                 city,
                 station,
                 event_date,
@@ -2772,7 +2772,7 @@ def process_model_awc_prediction(
         held_market_ids = set(held_adjacent_yes)
         if len(held_market_ids) >= len(adjacent_markets):
             LOGGER.info(
-                "model awc skip adjacent hedge already has both yes sides city=%s station=%s event_date=%s local_hour=%s predicted_high_f=%.2f markets=%s",
+                "model awc skip adjacent hedge already has both yes sides city=%s station=%s event_date=%s local_hour=%s predicted_high_f=%r markets=%s",
                 city,
                 station,
                 event_date,
@@ -2784,7 +2784,7 @@ def process_model_awc_prediction(
         missing = [(market, price) for market, price in adjacent_prices if market.market_id not in held_market_ids]
         if len(missing) != 1:
             LOGGER.info(
-                "model awc skip adjacent hedge ambiguous held yes city=%s station=%s event_date=%s local_hour=%s predicted_high_f=%.2f held=%s missing=%s",
+                "model awc skip adjacent hedge ambiguous held yes city=%s station=%s event_date=%s local_hour=%s predicted_high_f=%r held=%s missing=%s",
                 city,
                 station,
                 event_date,
@@ -2815,7 +2815,7 @@ def process_model_awc_prediction(
             return None
         if hedge_total_price > max_total_price:
             LOGGER.info(
-                "model awc skip adjacent hedge total too high city=%s station=%s event_date=%s local_hour=%s predicted_high_f=%.2f held_market=%s held_cost=%.4f hedge_market=%s hedge_price=%.4f total=%.4f max=%.4f held_shares=%s hedge_shares=%s",
+                "model awc skip adjacent hedge total too high city=%s station=%s event_date=%s local_hour=%s predicted_high_f=%r held_market=%s held_cost=%.4f hedge_market=%s hedge_price=%.4f total=%.4f max=%.4f held_shares=%s hedge_shares=%s",
                 city,
                 station,
                 event_date,
@@ -2850,7 +2850,7 @@ def process_model_awc_prediction(
         trade = submit_model_awc_trade(hedge_market, "YES", hedge_price, reason, amount_usd=amount_usd, shares=hedge_shares)
         if trade:
             LOGGER.info(
-                "model awc adjacent hedge buy completed city=%s station=%s event_date=%s local_hour=%s predicted_high_f=%.2f held_market=%s hedge_market=%s held_cost=%.4f hedge_price=%.4f total=%.4f held_shares=%s hedge_shares=%s trade=%s",
+                "model awc adjacent hedge buy completed city=%s station=%s event_date=%s local_hour=%s predicted_high_f=%r held_market=%s hedge_market=%s held_cost=%.4f hedge_price=%.4f total=%.4f held_shares=%s hedge_shares=%s trade=%s",
                 city,
                 station,
                 event_date,
@@ -2877,7 +2877,7 @@ def process_model_awc_prediction(
     if total_yes_price >= max_total_price:
         if non_adjacent_no is None:
             LOGGER.info(
-                "model awc skip adjacent yes total too high and no non-adjacent no candidate city=%s station=%s event_date=%s local_hour=%s predicted_high_f=%.2f total_yes_price=%.4f max=%.4f markets=%s",
+                "model awc skip adjacent yes total too high and no non-adjacent no candidate city=%s station=%s event_date=%s local_hour=%s predicted_high_f=%r total_yes_price=%.4f max=%.4f markets=%s",
                 city,
                 station,
                 event_date,
@@ -2898,7 +2898,7 @@ def process_model_awc_prediction(
             )
             return submit_model_awc_trade(no_market, "NO", no_price, reason)
         LOGGER.info(
-            "model awc skip adjacent yes total too high and non-adjacent no above max city=%s station=%s event_date=%s local_hour=%s predicted_high_f=%.2f total_yes_price=%.4f max=%.4f no_price=%.4f no_max=%.4f no_market=%s markets=%s",
+            "model awc skip adjacent yes total too high and non-adjacent no above max city=%s station=%s event_date=%s local_hour=%s predicted_high_f=%r total_yes_price=%.4f max=%.4f no_price=%.4f no_max=%.4f no_market=%s markets=%s",
             city,
             station,
             event_date,
@@ -2944,7 +2944,7 @@ def process_model_awc_prediction(
             len(adjacent_prices),
         )
     LOGGER.info(
-        "model awc adjacent buy completed city=%s station=%s event_date=%s local_hour=%s predicted_high_f=%.2f total_yes_price=%.4f shares_each=%s trades=%s",
+        "model awc adjacent buy completed city=%s station=%s event_date=%s local_hour=%s predicted_high_f=%r total_yes_price=%.4f shares_each=%s trades=%s",
         city,
         station,
         event_date,

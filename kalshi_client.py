@@ -52,6 +52,11 @@ class KalshiClient:
     def _auth_headers(self, method: str, endpoint: str) -> dict[str, str]:
         timestamp = str(int(time.time() * 1000))
         signing_path = "/trade-api/v2" + endpoint.split("?", 1)[0]
+        return self._signed_headers(timestamp, method, signing_path)
+
+    def _signed_headers(
+        self, timestamp: str, method: str, signing_path: str
+    ) -> dict[str, str]:
         message = f"{timestamp}{method.upper()}{signing_path}".encode("utf-8")
         signature = self._load_private_key().sign(
             message,
@@ -66,6 +71,12 @@ class KalshiClient:
             "KALSHI-ACCESS-TIMESTAMP": timestamp,
             "KALSHI-ACCESS-SIGNATURE": base64.b64encode(signature).decode("ascii"),
         }
+
+    def websocket_auth_headers(self) -> dict[str, str]:
+        timestamp = str(int(time.time() * 1000))
+        return self._signed_headers(
+            timestamp, "GET", "/trade-api/ws/v2"
+        )
 
     def request(
         self,
@@ -142,6 +153,64 @@ class KalshiClient:
             "GET", f"/portfolio/orders/{order_id}", private=True
         ).get("order", {})
 
+    def get_orders(
+        self,
+        *,
+        status: str = "",
+        ticker: str = "",
+        subaccount: int | None = None,
+    ) -> list[dict[str, Any]]:
+        params: dict[str, Any] = {"limit": 1000}
+        if status:
+            params["status"] = status
+        if ticker:
+            params["ticker"] = ticker
+        if subaccount is not None:
+            params["subaccount"] = subaccount
+        return self.request(
+            "GET", "/portfolio/orders", params=params, private=True
+        ).get("orders", [])
+
+    @staticmethod
+    def order_body(
+        ticker: str,
+        outcome_side: str,
+        count: int,
+        outcome_price_dollars: float,
+        *,
+        time_in_force: str,
+        subaccount: int,
+        expiration_time: int | None = None,
+        client_order_id: str = "",
+    ) -> dict[str, Any]:
+        outcome_side = outcome_side.lower()
+        if outcome_side not in {"yes", "no"}:
+            raise ValueError("outcome_side must be 'yes' or 'no'")
+        book_side = "bid" if outcome_side == "yes" else "ask"
+        yes_scale_price = (
+            outcome_price_dollars
+            if outcome_side == "yes"
+            else 1.0 - outcome_price_dollars
+        )
+        body: dict[str, Any] = {
+            "ticker": ticker,
+            "client_order_id": client_order_id or str(uuid.uuid4()),
+            "side": book_side,
+            "count": f"{int(count)}.00",
+            "price": f"{yes_scale_price:.4f}",
+            "time_in_force": time_in_force,
+            "self_trade_prevention_type": "taker_at_cross",
+            "cancel_order_on_pause": True,
+            "subaccount": int(subaccount),
+        }
+        if expiration_time is not None:
+            if time_in_force != "good_till_canceled":
+                raise ValueError(
+                    "expiration_time requires good_till_canceled"
+                )
+            body["expiration_time"] = int(expiration_time)
+        return body
+
     def create_order(
         self,
         ticker: str,
@@ -151,34 +220,36 @@ class KalshiClient:
         *,
         time_in_force: str = "immediate_or_cancel",
         subaccount: int = 0,
+        expiration_time: int | None = None,
+        client_order_id: str = "",
     ) -> dict[str, Any]:
-        outcome_side = outcome_side.lower()
-        if outcome_side not in {"yes", "no"}:
-            raise ValueError("outcome_side must be 'yes' or 'no'")
-        # Kalshi V2 quotes both directions on the YES price scale.
-        book_side = "bid" if outcome_side == "yes" else "ask"
-        yes_scale_price = (
-            outcome_price_dollars
-            if outcome_side == "yes"
-            else 1.0 - outcome_price_dollars
+        body = self.order_body(
+            ticker,
+            outcome_side,
+            count,
+            outcome_price_dollars,
+            time_in_force=time_in_force,
+            subaccount=subaccount,
+            expiration_time=expiration_time,
+            client_order_id=client_order_id,
         )
-        body = {
-            "ticker": ticker,
-            "client_order_id": str(uuid.uuid4()),
-            "side": book_side,
-            "count": f"{int(count)}.00",
-            "price": f"{yes_scale_price:.4f}",
-            "time_in_force": time_in_force,
-            "self_trade_prevention_type": "taker_at_cross",
-            "cancel_order_on_pause": True,
-            "subaccount": int(subaccount),
-        }
         return self.request(
             "POST",
             "/portfolio/events/orders",
             json_body=body,
             private=True,
         )
+
+    def create_orders_batch(
+        self,
+        orders: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        return self.request(
+            "POST",
+            "/portfolio/events/orders/batched",
+            json_body={"orders": orders},
+            private=True,
+        ).get("orders", [])
 
     def create_yes_buy(
         self,

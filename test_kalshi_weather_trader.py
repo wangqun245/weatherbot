@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import json
+import time
 from datetime import date
 from pathlib import Path
 
@@ -9,6 +10,13 @@ from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.asymmetric import padding, rsa
 
 from kalshi_client import KalshiClient
+from kalshi_execution import (
+    HourlyBatch,
+    KalshiHourlyExecutionManager,
+    ManagedLeg,
+    depth_price,
+)
+from kalshi_ws import KalshiWebSocketFeed
 from kalshi_weather_trader import (
     contract_count_for_order,
     event_date_from_ticker,
@@ -106,12 +114,12 @@ def test_exact_interval_compares_target_yes_with_other_no() -> None:
     assert reason.startswith("exact_interval_MID")
 
 
-def test_prediction_within_point_15_snaps_to_adjacent_yes() -> None:
+def test_prediction_within_point_15_compares_snapped_yes_with_other_no() -> None:
     orders, reason = select_order_plan(_config(), _markets(), 93.97)
     assert [(order["market"]["ticker"], order["side"]) for order in orders] == [
-        ("MID", "YES")
+        ("HIGH", "NO")
     ]
-    assert reason.startswith("boundary_snap_yes_MID")
+    assert reason.startswith("boundary_snap_interval_MID")
 
 
 def test_prediction_in_middle_gap_buys_adjacent_yes_pair_when_cheaper() -> None:
@@ -147,12 +155,216 @@ def test_default_ten_contracts_respects_five_dollar_cap() -> None:
     assert contract_count_for_order(1.00, trading) == 5
 
 
+def test_depth_price_requires_full_one_to_one_quantity() -> None:
+    levels = [(0.20, 3), (0.25, 7)]
+    assert depth_price(levels, 10, 0.85) == 0.25
+    assert depth_price(levels, 11, 0.85) is None
+
+
+class _FakeFeed:
+    def __init__(self, levels):
+        self.levels = levels
+
+    def start(self):
+        pass
+
+    def stop(self):
+        pass
+
+    def subscribe(self, _tickers):
+        pass
+
+    def has_book(self, _ticker):
+        return True
+
+    def buy_levels(self, ticker, _side):
+        return self.levels[ticker]
+
+
+class _FakeClient:
+    order_body = staticmethod(KalshiClient.order_body)
+
+    def __init__(self):
+        self.batches = []
+        self.singles = []
+        self.cancels = []
+
+    def create_orders_batch(self, bodies):
+        self.batches.append(bodies)
+        return [
+            {
+                "order_id": f"batch-{index}",
+                "fill_count": body["count"],
+                "remaining_count": "0.00",
+                "average_fill_price": body["price"],
+            }
+            for index, body in enumerate(bodies)
+        ]
+
+    def create_order(
+        self,
+        ticker,
+        outcome_side,
+        count,
+        price,
+        **kwargs,
+    ):
+        self.singles.append(
+            {
+                "ticker": ticker,
+                "outcome_side": outcome_side,
+                "count": count,
+                "price": price,
+                **kwargs,
+            }
+        )
+        return {
+            "order_id": "single-order",
+            "fill_count": "0.00",
+            "remaining_count": f"{count}.00",
+        }
+
+    def cancel_order(self, order_id, _subaccount=0):
+        self.cancels.append(order_id)
+        return {}
+
+
+def _manager(client, feed):
+    return KalshiHourlyExecutionManager(
+        client=client,
+        feed=feed,
+        trading={
+            "max_buy_price": 0.85,
+            "min_buy_price": 0.01,
+            "adjacent_yes_max_total_price": 0.90,
+            "order_management_window_minutes": 40,
+        },
+        subaccount=0,
+    )
+
+
+def test_adjacent_batch_submits_equal_contract_counts() -> None:
+    client = _FakeClient()
+    feed = _FakeFeed({"LEFT": [(0.35, 10)], "RIGHT": [(0.45, 10)]})
+    manager = _manager(client, feed)
+    batch = HourlyBatch(
+        batch_id="b",
+        window_key="2026-06-28:hour_12",
+        mode="adjacent",
+        legs=(ManagedLeg("LEFT", "YES"), ManagedLeg("RIGHT", "YES")),
+        target_shares=10,
+        predicted_high_f=90,
+        created_ts=time.time(),
+        expires_ts=time.time() + 2400,
+        acquired=[0, 0],
+        total_cost=[0, 0],
+    )
+    manager._manage_adjacent(batch)
+    assert len(client.batches) == 1
+    assert [body["count"] for body in client.batches[0]] == [
+        "10.00",
+        "10.00",
+    ]
+
+
+def test_adjacent_total_equal_point_90_does_not_buy() -> None:
+    client = _FakeClient()
+    feed = _FakeFeed({"LEFT": [(0.40, 10)], "RIGHT": [(0.50, 10)]})
+    manager = _manager(client, feed)
+    batch = HourlyBatch(
+        batch_id="b",
+        window_key="2026-06-28:hour_12",
+        mode="adjacent",
+        legs=(ManagedLeg("LEFT", "YES"), ManagedLeg("RIGHT", "YES")),
+        target_shares=10,
+        predicted_high_f=90,
+        created_ts=time.time(),
+        expires_ts=time.time() + 2400,
+        acquired=[0, 0],
+        total_cost=[0, 0],
+    )
+    manager._manage_adjacent(batch)
+    assert client.batches == []
+
+
+def test_adjacent_pair_reduces_equal_size_to_keep_repair_under_five_dollars() -> None:
+    client = _FakeClient()
+    feed = _FakeFeed({"LEFT": [(0.30, 10)], "RIGHT": [(0.50, 10)]})
+    manager = _manager(client, feed)
+    batch = HourlyBatch(
+        batch_id="b",
+        window_key="2026-06-28:hour_12",
+        mode="adjacent",
+        legs=(ManagedLeg("LEFT", "YES"), ManagedLeg("RIGHT", "YES")),
+        target_shares=10,
+        predicted_high_f=90,
+        created_ts=time.time(),
+        expires_ts=time.time() + 2400,
+        acquired=[0, 0],
+        total_cost=[0, 0],
+    )
+    manager._manage_adjacent(batch)
+    assert [body["count"] for body in client.batches[0]] == [
+        "9.00",
+        "9.00",
+    ]
+
+
+def test_adjacent_single_leg_fill_places_balance_repair() -> None:
+    client = _FakeClient()
+    feed = _FakeFeed({"LEFT": [], "RIGHT": []})
+    manager = _manager(client, feed)
+    batch = HourlyBatch(
+        batch_id="b",
+        window_key="2026-06-28:hour_12",
+        mode="adjacent",
+        legs=(ManagedLeg("LEFT", "YES"), ManagedLeg("RIGHT", "YES")),
+        target_shares=5,
+        predicted_high_f=90,
+        created_ts=time.time(),
+        expires_ts=time.time() + 2400,
+        acquired=[5, 0],
+        total_cost=[1.5, 0],
+    )
+    manager._manage_adjacent(batch)
+    assert len(client.singles) == 1
+    repair = client.singles[0]
+    assert repair["ticker"] == "RIGHT"
+    assert repair["count"] == 5
+    assert repair["price"] == 0.55
+    assert repair["time_in_force"] == "good_till_canceled"
+    assert repair["expiration_time"] == int(batch.expires_ts)
+
+
+def test_websocket_unified_yes_scale_builds_yes_and_no_asks() -> None:
+    feed = KalshiWebSocketFeed(
+        client=object(),
+        url="wss://example.test",
+        on_message=lambda _message: None,
+    )
+    feed._process(
+        {
+            "type": "orderbook_snapshot",
+            "msg": {
+                "market_ticker": "M",
+                "yes_dollars_fp": [["0.4000", "8.00"]],
+                "no_dollars_fp": [["0.5500", "7.00"]],
+            },
+        }
+    )
+    assert feed.buy_levels("M", "YES") == [(0.55, 7.0)]
+    assert feed.buy_levels("M", "NO") == [(0.6, 8.0)]
+
+
 def test_production_strategy_parameters_match_requested_policy() -> None:
     config = json.loads(Path("kalshi_weather_config.json").read_text(encoding="utf-8"))
     assert config["model"]["buy_start_hour"] == 12
     assert config["model"]["buy_end_hour"] == 16
+    assert config["observations"]["station"] == "KAUS"
+    assert config["observations"]["timezone"] == "America/Chicago"
     assert config["trading"]["max_buy_price"] == 0.85
     assert config["trading"]["interval_snap_tolerance_f"] == 0.15
     assert config["trading"]["adjacent_yes_max_total_price"] == 0.90
     assert config["trading"]["default_contracts"] == 10
     assert config["trading"]["max_order_cost_dollars"] == 5.00
+    assert config["trading"]["order_management_window_minutes"] == 40

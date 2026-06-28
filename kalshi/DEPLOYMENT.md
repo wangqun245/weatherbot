@@ -33,9 +33,9 @@ enabled, but never submits an order.
 .venv/bin/python kalshi_weather_trader.py once --config kalshi_weather_config.json
 ```
 
-The production config trades only during fixed-CST hours 12 through 16. It may
-therefore exit without an order outside the window or when price protections
-reject the selected plan.
+The production config uses KAUS observations and trades only during Austin
+hours 12 through 16. When a managed batch starts, `once` remains alive until
+the target fills or its 40-minute order-management window expires.
 
 ## Continuous operation
 
@@ -49,5 +49,10 @@ sudo journalctl -u kalshi-weather -f
 ```
 
 Each individual order targets 10 contracts but is reduced as necessary so its
-notional never exceeds $5. A two-adjacent-YES plan can submit two separately
-capped orders.
+notional never exceeds $5. Adjacent-YES entries always request the same number
+of contracts on both legs. They only cross when both live books have 1:1 depth,
+each leg is at or below $0.85, and their combined price is below $0.90. If only
+one leg fills, a GTC balance-repair order is posted for the exact share deficit.
+All resting orders carry the batch expiration time and are also explicitly
+cancelled when the 40-minute window closes or the next hourly model output
+replaces the batch.

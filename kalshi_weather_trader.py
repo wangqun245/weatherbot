@@ -1,17 +1,20 @@
 from __future__ import annotations
 
 import argparse
+import atexit
 import json
 import logging
 import math
 import os
 import re
+import threading
 import time
 import warnings
 from collections import deque
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo
 
 import joblib
 import requests
@@ -20,11 +23,18 @@ from dotenv import load_dotenv
 from featurize_metar_history import MetarRow, decode_metar, nearest_lag_value
 from kalshi.featurize_katt import parse_six_hour_extrema
 from kalshi_client import KalshiClient
+from kalshi_execution import (
+    KalshiHourlyExecutionManager,
+    ManagedLeg,
+    depth_price,
+)
+from kalshi_ws import KalshiWebSocketFeed
 
 
 DEFAULT_CONFIG = "kalshi_weather_config.json"
 NWS_LST = timezone(timedelta(hours=-6), name="CST")
 LOGGER = logging.getLogger("kalshi_weather_trader")
+ORDER_EVENT_LOCK = threading.RLock()
 EVENT_DATE_RE = re.compile(r"-(\d{2}[A-Z]{3}\d{2})(?:-|$)")
 
 
@@ -84,7 +94,10 @@ def fetch_metars(config: dict[str, Any]) -> list[dict[str, Any]]:
 
 
 def parse_metar_rows(
-    source_rows: list[dict[str, Any]], station: str, target_date: date
+    source_rows: list[dict[str, Any]],
+    station: str,
+    target_date: date,
+    local_timezone: Any = NWS_LST,
 ) -> list[MetarRow]:
     parsed: list[MetarRow] = []
     for source in source_rows:
@@ -98,7 +111,7 @@ def parse_metar_rows(
         )
         if not metar or valid_utc is None:
             continue
-        if valid_utc.astimezone(NWS_LST).date() != target_date:
+        if valid_utc.astimezone(local_timezone).date() != target_date:
             continue
         parsed.append(
             MetarRow(
@@ -185,7 +198,10 @@ def build_feature_row(
 ) -> tuple[dict[str, Any], MetarRow, datetime] | None:
     observations = config["observations"]
     station = str(observations["station"]).upper()
-    rows = parse_metar_rows(source_rows, station, target_date)
+    local_timezone = configured_timezone(config)
+    rows = parse_metar_rows(
+        source_rows, station, target_date, local_timezone
+    )
     if not rows:
         return None
     regular_minute = int(observations["regular_observation_minute"])
@@ -198,7 +214,7 @@ def build_feature_row(
     if not regular:
         return None
     latest = regular[-1]
-    latest_local = latest.valid_utc.astimezone(NWS_LST)
+    latest_local = latest.valid_utc.astimezone(local_timezone)
     if not (
         int(config["model"]["buy_start_hour"])
         <= latest_local.hour
@@ -206,8 +222,10 @@ def build_feature_row(
     ):
         return None
 
-    decoded_rows = [decode_metar(row, station, NWS_LST) for row in rows]
-    features = decode_metar(latest, station, NWS_LST)
+    decoded_rows = [
+        decode_metar(row, station, local_timezone) for row in rows
+    ]
+    features = decode_metar(latest, station, local_timezone)
     features["station_id"] = 1
     features["local_week_of_year"] = float(latest_local.isocalendar().week)
     valid_times = [row.valid_utc for row in rows]
@@ -269,6 +287,9 @@ def market_contains_temperature(market: dict[str, Any], temperature_f: float) ->
 def outcome_ask(market: dict[str, Any], side: str) -> float:
     side = side.upper()
     try:
+        depth_value = market.get(f"_{side.lower()}_depth_price")
+        if depth_value not in (None, ""):
+            return float(depth_value)
         direct = market.get(f"{side.lower()}_ask_dollars")
         if direct not in (None, ""):
             return float(direct)
@@ -278,6 +299,55 @@ def outcome_ask(market: dict[str, Any], side: str) -> float:
         return 1.0 - float(opposite_bid) if opposite_bid not in (None, "") else 0.0
     except (TypeError, ValueError):
         return 0.0
+
+
+def hydrate_orderbook_prices(
+    client: KalshiClient,
+    markets: list[dict[str, Any]],
+    trading: dict[str, Any],
+) -> None:
+    """Attach 1:1 depth prices for both outcomes to each market."""
+    for market in markets:
+        ticker = str(market.get("ticker") or "")
+        if not ticker:
+            continue
+        try:
+            book = client.get_orderbook(ticker, depth=100)
+        except Exception:
+            LOGGER.exception("Unable to load Kalshi orderbook ticker=%s", ticker)
+            continue
+        yes_bids = [
+            (float(price), float(quantity))
+            for price, quantity in (
+                book.get("yes_dollars") or book.get("yes_dollars_fp") or []
+            )
+        ]
+        no_bids = [
+            (float(price), float(quantity))
+            for price, quantity in (
+                book.get("no_dollars") or book.get("no_dollars_fp") or []
+            )
+        ]
+        yes_asks = sorted(
+            [(round(1.0 - price, 4), quantity) for price, quantity in no_bids]
+        )
+        no_asks = sorted(
+            [(round(1.0 - price, 4), quantity) for price, quantity in yes_bids]
+        )
+        for side, levels in (("yes", yes_asks), ("no", no_asks)):
+            best = levels[0][0] if levels else None
+            target_shares = (
+                contract_count_for_order(best, trading)
+                if best is not None
+                else max(1, int(trading.get("default_contracts", 10)))
+            )
+            full_depth = depth_price(levels, target_shares, 1.0)
+            market[f"_{side}_depth_price"] = (
+                full_depth if full_depth is not None else best
+            )
+            market[f"_{side}_has_target_depth"] = full_depth is not None
+            market[f"_{side}_target_shares"] = target_shares
+            market[f"_{side}_buy_levels"] = levels
 
 
 def market_bounds(market: dict[str, Any]) -> tuple[float | None, float | None]:
@@ -378,13 +448,33 @@ def select_order_plan(
     tolerance = float(trading.get("interval_snap_tolerance_f", 0.15))
     snapped = boundary_snap_market(markets, prediction_f, tolerance)
     if snapped is not None:
-        market, distance = snapped
-        price = outcome_ask(market, "YES")
-        if price <= 0:
-            return [], "boundary_snap_missing_yes_price"
-        return [{"market": market, "side": "YES", "price": price}], (
-            f"boundary_snap_yes_{market['ticker']}_distance_{distance:.4f}F_"
-            f"tolerance_{tolerance:.4f}F"
+        predicted_market, distance = snapped
+        candidates = []
+        for market in markets:
+            side = (
+                "YES"
+                if market["ticker"] == predicted_market["ticker"]
+                else "NO"
+            )
+            price = outcome_ask(market, side)
+            if price > 0:
+                candidates.append(
+                    {"market": market, "side": side, "price": price}
+                )
+        if not candidates:
+            return [], "boundary_snap_no_priced_candidates"
+        selected = min(
+            candidates,
+            key=lambda item: (
+                float(item["price"]),
+                str(item["market"]["ticker"]),
+                str(item["side"]),
+            ),
+        )
+        return [selected], (
+            f"boundary_snap_interval_{predicted_market['ticker']}_distance_"
+            f"{distance:.4f}F_tolerance_{tolerance:.4f}F_selected_"
+            f"{selected['side']}_{selected['market']['ticker']}"
         )
 
     adjacent = adjacent_prediction_markets(markets, prediction_f)
@@ -473,10 +563,21 @@ def append_trade(path: Path, payload: dict[str, Any]) -> None:
         handle.write(json.dumps(payload, ensure_ascii=False) + "\n")
 
 
+def configured_timezone(config: dict[str, Any]) -> Any:
+    value = str(
+        config.get("observations", {}).get(
+            "timezone", "America/Chicago"
+        )
+    )
+    if value.lower() == "fixed_cst":
+        return NWS_LST
+    return ZoneInfo(value)
+
+
 def target_date(config: dict[str, Any]) -> date:
     configured = str(config["market"].get("target_date", "today"))
     if configured.lower() == "today":
-        return datetime.now(NWS_LST).date()
+        return datetime.now(configured_timezone(config)).date()
     return date.fromisoformat(configured)
 
 
@@ -501,7 +602,12 @@ def verify_series(config: dict[str, Any], client: KalshiClient) -> None:
     )
 
 
-def run_cycle(config: dict[str, Any], client: KalshiClient, model: Any) -> None:
+def run_cycle(
+    config: dict[str, Any],
+    client: KalshiClient,
+    model: Any,
+    execution_manager: KalshiHourlyExecutionManager | None = None,
+) -> None:
     day = target_date(config)
     markets = [
         market
@@ -511,6 +617,11 @@ def run_cycle(config: dict[str, Any], client: KalshiClient, model: Any) -> None:
     if not markets:
         LOGGER.info("No open Kalshi markets for %s", day)
         return
+    hydrate_orderbook_prices(
+        client,
+        markets,
+        config["trading"],
+    )
 
     expected_rules = str(config["market"].get("expected_rules_text") or "")
     mismatch = expected_rules and not any(
@@ -551,6 +662,79 @@ def run_cycle(config: dict[str, Any], client: KalshiClient, model: Any) -> None:
     if not order_plan:
         LOGGER.info("Skip order: no valid order plan")
         return
+    state_path = Path(config["outputs"]["state_json"])
+    state = load_state(state_path)
+    window_key = f"{day}:hour_{latest_local.hour:02d}"
+    if trading.get("one_order_per_hour", True) and (
+        window_key in state.get("completed_windows", {})
+        or (
+            execution_manager is not None
+            and execution_manager.has_window(window_key)
+        )
+    ):
+        LOGGER.info("Skip duplicate window %s", window_key)
+        return
+
+    dry_run = bool(trading.get("dry_run", True)) or not bool(
+        trading.get("live_enabled", False)
+    )
+    if execution_manager is not None and not dry_run:
+        if len(order_plan) == 2:
+            requested = min(
+                contract_count_for_order(float(order["price"]), trading)
+                for order in order_plan
+            )
+            mode = "adjacent"
+        else:
+            requested = contract_count_for_order(
+                float(order_plan[0]["price"]), trading
+            )
+            mode = "single"
+        if requested <= 0:
+            LOGGER.info(
+                "Skip managed batch: no affordable contracts plan=%s",
+                order_plan,
+            )
+            return
+        batch = execution_manager.start_batch(
+            window_key=window_key,
+            mode=mode,
+            legs=tuple(
+                ManagedLeg(
+                    ticker=str(order["market"]["ticker"]),
+                    outcome_side=str(order["side"]).upper(),
+                )
+                for order in order_plan
+            ),
+            target_shares=requested,
+            predicted_high_f=prediction,
+        )
+        record = {
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "window_key": window_key,
+            "target_date": day.isoformat(),
+            "station": config["observations"]["station"],
+            "observation_utc": latest.valid_utc.isoformat(),
+            "observation_local": latest_local.isoformat(),
+            "prediction_f": prediction,
+            "predicted_integer_f": predicted_integer,
+            "selection_reason": selection_reason,
+            "execution_mode": "MANAGED_WEBSOCKET",
+            "batch_id": batch.batch_id,
+            "target_shares_each": requested,
+            "orders": [
+                {
+                    "ticker": leg.ticker,
+                    "outcome_side": leg.outcome_side,
+                }
+                for leg in batch.legs
+            ],
+        }
+        append_trade(Path(config["outputs"]["trades_jsonl"]), record)
+        state.setdefault("completed_windows", {})[window_key] = record
+        save_state(state_path, state)
+        return
+
     max_buy_price = float(trading.get("max_buy_price", 0.85))
     min_buy_price = float(trading.get("min_buy_price", 0.01))
     invalid = [
@@ -574,18 +758,6 @@ def run_cycle(config: dict[str, Any], client: KalshiClient, model: Any) -> None:
         )
         return
 
-    state_path = Path(config["outputs"]["state_json"])
-    state = load_state(state_path)
-    window_key = f"{day}:hour_{latest_local.hour:02d}"
-    if trading.get("one_order_per_hour", True) and window_key in state.get(
-        "completed_windows", {}
-    ):
-        LOGGER.info("Skip duplicate window %s", window_key)
-        return
-
-    dry_run = bool(trading.get("dry_run", True)) or not bool(
-        trading.get("live_enabled", False)
-    )
     order_results: list[dict[str, Any]] = []
     for planned in order_plan:
         market = planned["market"]
@@ -641,7 +813,7 @@ def run_cycle(config: dict[str, Any], client: KalshiClient, model: Any) -> None:
         "target_date": day.isoformat(),
         "station": config["observations"]["station"],
         "observation_utc": latest.valid_utc.isoformat(),
-        "observation_nws_lst": latest_local.isoformat(),
+        "observation_local": latest_local.isoformat(),
         "prediction_f": prediction,
         "predicted_integer_f": predicted_integer,
         "selection_reason": selection_reason,
@@ -688,12 +860,73 @@ def main() -> None:
         if os.getenv(config["kalshi"]["api_key_id_env"]):
             LOGGER.info("Balance=%s", client.get_balance())
         return
+    execution_manager: KalshiHourlyExecutionManager | None = None
+    if live:
+        holder: dict[str, KalshiHourlyExecutionManager] = {}
+
+        def websocket_callback(message: dict[str, Any]) -> None:
+            manager = holder.get("manager")
+            if manager is not None:
+                manager.on_websocket_message(message)
+
+        def execution_event(event: dict[str, Any]) -> None:
+            event = {
+                "created_at": datetime.now(timezone.utc).isoformat(),
+                **event,
+            }
+            with ORDER_EVENT_LOCK:
+                append_trade(
+                    Path(
+                        config["outputs"].get(
+                            "order_events_jsonl",
+                            "kalshi/runtime/order_events.jsonl",
+                        )
+                    ),
+                    event,
+                )
+
+        feed = KalshiWebSocketFeed(
+            client=client,
+            url=str(
+                config["kalshi"].get(
+                    "websocket_url",
+                    "wss://external-api-ws.kalshi.com/trade-api/ws/v2",
+                )
+            ),
+            on_message=websocket_callback,
+            reconnect_seconds=float(
+                config["kalshi"].get(
+                    "websocket_reconnect_seconds", 2
+                )
+            ),
+        )
+        execution_manager = KalshiHourlyExecutionManager(
+            client=client,
+            feed=feed,
+            trading=config["trading"],
+            subaccount=int(config["kalshi"].get("subaccount", 0)),
+            event_callback=execution_event,
+            state_path=Path(
+                config["outputs"].get(
+                    "managed_batches_json",
+                    "kalshi/runtime/managed_batches.json",
+                )
+            ),
+        )
+        holder["manager"] = execution_manager
+        execution_manager.start()
+        atexit.register(execution_manager.stop)
     if args.command == "once":
-        run_cycle(config, client, model)
+        run_cycle(config, client, model, execution_manager)
+        while (
+            execution_manager is not None
+            and execution_manager.active_batch_count() > 0
+        ):
+            time.sleep(1)
         return
     while True:
         try:
-            run_cycle(config, client, model)
+            run_cycle(config, client, model, execution_manager)
         except Exception:
             LOGGER.exception("Kalshi trading cycle failed")
         time.sleep(max(10, int(config["scheduler"]["poll_seconds"])))

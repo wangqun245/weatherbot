@@ -1,6 +1,8 @@
 {
   "kalshi": {
     "base_url": "https://api.elections.kalshi.com/trade-api/v2",
+    "websocket_url": "wss://external-api-ws.kalshi.com/trade-api/ws/v2",
+    "websocket_reconnect_seconds": 2,
     "series_ticker": "KXHIGHAUS",
     "api_key_id_env": "KALSHI_API_KEY_ID",
     "private_key_path_env": "KALSHI_PRIVATE_KEY_PATH",
@@ -10,14 +12,14 @@
   "market": {
     "target_date": "today",
     "expected_rules_text": "Austin Bergstrom",
-    "allow_source_station_mismatch": true
+    "allow_source_station_mismatch": false
   },
   "observations": {
-    "station": "KATT",
-    "timezone": "fixed_cst",
+    "station": "KAUS",
+    "timezone": "America/Chicago",
     "aviation_weather_url": "https://aviationweather.gov/api/data/metar",
     "lookback_hours": 14,
-    "regular_observation_minute": 51,
+    "regular_observation_minute": 53,
     "lag_tolerance_minutes": 30,
     "poll_delay_seconds": 180,
     "poll_interval_seconds": 60
@@ -36,6 +38,7 @@
     "max_buy_price": 0.85,
     "interval_snap_tolerance_f": 0.15,
     "adjacent_yes_max_total_price": 0.90,
+    "order_management_window_minutes": 40,
     "time_in_force": "immediate_or_cancel",
     "one_order_per_hour": true
   },
@@ -46,6 +49,8 @@
   "outputs": {
     "state_json": "kalshi/runtime/state.json",
     "trades_jsonl": "kalshi/runtime/trades.jsonl",
+    "order_events_jsonl": "kalshi/runtime/order_events.jsonl",
+    "managed_batches_json": "kalshi/runtime/managed_batches.json",
     "log_file": "kalshi/runtime/kalshi_weather_trader.log"
   }
 }

@@ -1,5 +1,7 @@
 kalshi_weather_trader.py
 kalshi_client.py
+kalshi_execution.py
+kalshi_ws.py
 kalshi_weather_config.json
 featurize_metar_history.py
 kalshi/__init__.py

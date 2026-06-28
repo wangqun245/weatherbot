@@ -150,9 +150,23 @@ def test_kalshi_no_order_uses_ask_and_yes_scale_price(monkeypatch) -> None:
 
 def test_default_ten_contracts_respects_five_dollar_cap() -> None:
     trading = {"default_contracts": 10, "max_order_cost_dollars": 5}
+    assert contract_count_for_order(0.29, trading) == 10
     assert contract_count_for_order(0.40, trading) == 10
     assert contract_count_for_order(0.75, trading) == 6
     assert contract_count_for_order(1.00, trading) == 5
+
+
+def test_kalshi_fixed_shares_may_cost_less_than_five_dollars() -> None:
+    body = KalshiClient.order_body(
+        "KXTEST",
+        "yes",
+        10,
+        0.29,
+        time_in_force="immediate_or_cancel",
+        subaccount=0,
+    )
+    assert body["count"] == "10.00"
+    assert body["price"] == "0.2900"
 
 
 def test_depth_price_requires_full_one_to_one_quantity() -> None:

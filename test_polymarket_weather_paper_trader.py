@@ -61,7 +61,7 @@ class ClobPricingTest(unittest.TestCase):
 
         self.assertEqual(0.37, round(bot.best_buy_price(self.config, self.market, "NO"), 2))
 
-    def test_best_buy_price_uses_depth_multiplier_and_extra_level(self):
+    def test_best_buy_price_uses_exact_one_to_one_depth_without_extra_level(self):
         self.config["trading"]["buy_notional_usdc"] = 5.0
         self.config["trading"]["depth_price_notional_multiplier"] = 2.0
         self.config["trading"]["depth_price_extra_levels"] = 1
@@ -81,7 +81,9 @@ class ClobPricingTest(unittest.TestCase):
 
         bot.clob_get = fake_clob_get
 
-        self.assertEqual(0.47, bot.best_buy_price(self.config, self.market, "NO"))
+        # Production strategy intentionally ignores legacy extra-depth
+        # settings and prices only the required 1:1 order quantity.
+        self.assertEqual(0.45, bot.best_buy_price(self.config, self.market, "NO"))
 
     def test_clob_asset_sell_prices_batches_prices(self):
         captured = {}

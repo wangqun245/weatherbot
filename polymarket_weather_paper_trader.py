@@ -363,7 +363,7 @@ def default_config() -> dict[str, Any]:
         "live_trading_enabled": False,
         "live_trading_dry_run": False,
         "live_order_timeout_seconds": 20,
-        "live_order_check_seconds": 1,
+        "live_order_check_seconds": 5,
         "max_buy_price": 0.85,
         "source_station_check_enabled": True,
         "source_station_check_hour_ct": 3,
@@ -4196,7 +4196,10 @@ class LiveTradingManager:
                     )
 
     def _batch_token_balance(self, batch: ModelAwcHourlyBatch, token: str) -> float:
-        current = self.executor._get_token_balance_optional(token, refresh=True)
+        # Websocket order/trade messages are the primary fill signal. This
+        # cached balance is only a reconciliation fallback; forcing a refresh
+        # on every market tick caused balance-allowance request storms.
+        current = self.executor._get_token_balance_optional(token, refresh=False)
         if current is None:
             return batch.acquired_shares.get(token, 0.0)
         return max(0.0, float(current) - batch.baseline_balances.get(token, 0.0))
@@ -4322,6 +4325,7 @@ class LiveTradingManager:
             configured_max_buy_price(self.config),
             f"{batch.reason}_single_limit_085",
         )
+        batch.next_action_ts = time.time() + 2.0
 
     def _manage_adjacent_hourly_batch(
         self, batch: ModelAwcHourlyBatch
@@ -4359,6 +4363,7 @@ class LiveTradingManager:
                 repair_price,
                 f"{batch.reason}_balance_repair",
             )
+            batch.next_action_ts = time.time() + 2.0
             LOGGER.info(
                 "model awc adjacent repair batch=%s poorer=%s deficit=%s "
                 "repair_price=%s other_cost=%s",
@@ -4612,7 +4617,7 @@ class LiveTradingManager:
         Returns:
             None: This function is executed for its side effects.
         """
-        check_seconds = max(0.5, float(self.config.get("trading", {}).get("live_order_check_seconds", 1)))
+        check_seconds = max(1.0, float(self.config.get("trading", {}).get("live_order_check_seconds", 5)))
         while self._running:
             time.sleep(check_seconds)
             try:
@@ -4635,18 +4640,19 @@ class LiveTradingManager:
         with self._lock:
             pending_orders = list(self._pending.values())
         for pending in pending_orders:
+            with self._lock:
+                managed_order = pending.order_id in self._managed_order_ids
+            if managed_order:
+                # Managed model-AWC orders are driven by the authenticated
+                # user websocket and the hourly batch's cached balance
+                # reconciliation. Do not poll them every second.
+                continue
             if pending.kind == "BUY":
                 result = self.executor.check_pending_buy(pending.order_id, pending.price, pending.shares, pending.token_id, pending.balance_before, pending.token_balance_before)
             else:
                 result = self.executor.check_pending_sell(pending.order_id, pending.price, pending.shares, pending.token_id, pending.balance_before, pending.token_balance_before)
             if result and _result_value(result, "success", False):
                 self._apply_order_result(pending, result, source="poll")
-                continue
-            with self._lock:
-                managed_order = pending.order_id in self._managed_order_ids
-            if managed_order:
-                # The hourly batch owns cancellation/repricing and has its own
-                # configurable hard expiry (40 minutes by default).
                 continue
             if time.time() - pending.created_ts >= timeout:
                 cancelled = self.executor.cancel_order(pending.order_id)

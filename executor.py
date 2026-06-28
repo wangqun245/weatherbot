@@ -7,6 +7,7 @@ and retries once if the CLOB reports an order-version mismatch.
 
 import os
 import re
+import threading
 import time
 from dataclasses import dataclass
 from typing import Optional
@@ -44,6 +45,9 @@ BUY_VERIFY_DELAY_SECONDS = 3.0
 BUY_RETRY_BUFFER_USD = 0.05
 BALANCE_REFRESH_MIN_INTERVAL = float(os.getenv("BALANCE_SYNC_INTERVAL_SECONDS", "300"))
 BALANCE_REFRESH_BACKOFF_SECONDS = 90.0
+TOKEN_BALANCE_CACHE_SECONDS = max(
+    1.0, float(os.getenv("TOKEN_BALANCE_CACHE_SECONDS", "5"))
+)
 
 DEFAULT_TICK_SIZE = "0.01"
 DEFAULT_NEG_RISK = False
@@ -250,6 +254,8 @@ class Executor:
         self._balance_refresh_blocked_until: float = 0.0
         self._balance_cache_value: float = 0.0
         self._balance_cache_ts: float = 0.0
+        self._token_balance_cache: dict[str, tuple[float, float]] = {}
+        self._balance_lock = threading.RLock()
         self._minimum_order_shares_cache: dict[str, float] = {}
 
         if self.signature_type == SignatureTypeV2.POLY_1271:
@@ -341,28 +347,42 @@ class Executor:
         """Return the wallet's conditional-token balance, or None if unavailable."""
         if not self._initialized or not token_id:
             return None
-        try:
-            conditional_type = getattr(AssetType, "CONDITIONAL", None)
-            if conditional_type is None:
-                return None
+        token_id = str(token_id)
+        now = time.time()
+        with self._balance_lock:
+            cached = self._token_balance_cache.get(token_id)
+            if (
+                not refresh
+                and cached is not None
+                and now - cached[1] < TOKEN_BALANCE_CACHE_SECONDS
+            ):
+                return cached[0]
             try:
-                params = BalanceAllowanceParams(
-                    asset_type=conditional_type,
-                    token_id=str(token_id),
-                )
-            except TypeError:
-                params = BalanceAllowanceParams(
-                    asset_type=conditional_type,
-                    asset_id=str(token_id),
-                )
-            if refresh:
-                self._refresh_balance_allowance(params, f"conditional:{token_id}", force=True)
-            bal = self.client.get_balance_allowance(params)
-            raw = bal.get("balance", 0) if isinstance(bal, dict) else 0
-            return float(raw) / 1e6
-        except Exception as e:
-            print(f"[executor] Token balance check failed: {e}")
-            return None
+                conditional_type = getattr(AssetType, "CONDITIONAL", None)
+                if conditional_type is None:
+                    return None
+                try:
+                    params = BalanceAllowanceParams(
+                        asset_type=conditional_type,
+                        token_id=token_id,
+                    )
+                except TypeError:
+                    params = BalanceAllowanceParams(
+                        asset_type=conditional_type,
+                        asset_id=token_id,
+                    )
+                if refresh:
+                    self._refresh_balance_allowance(
+                        params, f"conditional:{token_id}", force=True
+                    )
+                bal = self.client.get_balance_allowance(params)
+                raw = bal.get("balance", 0) if isinstance(bal, dict) else 0
+                value = float(raw) / 1e6
+                self._token_balance_cache[token_id] = (value, time.time())
+                return value
+            except Exception as e:
+                print(f"[executor] Token balance check failed: {e}")
+                return cached[0] if cached is not None else None
 
     def get_token_balance(self, token_id: str, refresh: bool = True) -> float:
         """Return the wallet's conditional-token balance for one outcome token."""
@@ -862,20 +882,45 @@ class Executor:
                 shares=shares, token_id=token_id[:16] + "...", dry_run=True,
             )
 
+        fill = self._check_order(order_id)
+        if fill:
+            matched = self._extract_fill(fill, price)
+            if matched:
+                status = FILLED if matched[2] >= shares - 0.001 else PARTIAL
+                return OrderResult(
+                    success=True, order_id=order_id, status=status,
+                    side="BUY", price=matched[0], amount_usd=matched[1],
+                    shares=matched[2], token_id=token_id[:16] + "...",
+                    dry_run=False,
+                )
+            return None
+
+        # Only use cached balances when the order endpoint itself is
+        # unavailable. Websocket/order status is the primary confirmation
+        # path; balance refresh endpoints are heavily rate limited.
         if balance_before > 0:
-            balance_after = self.get_balance(refresh=True)
+            balance_after = self.get_balance(refresh=False)
             spent = balance_before - balance_after
-            token_balance_after = self._get_token_balance_optional(token_id, refresh=True)
+            token_balance_after = self._get_token_balance_optional(
+                token_id, refresh=False
+            )
             token_delta = (
                 max(0.0, token_balance_after - token_balance_before)
-                if token_balance_before is not None and token_balance_after is not None
+                if token_balance_before is not None
+                and token_balance_after is not None
                 else None
             )
             if spent > 0.50 or (token_delta is not None and token_delta > 0):
-                actual_shares = token_delta if token_delta is not None and token_delta > 0 else (
-                    spent / price if spent > 0.50 and price > 0 else shares
+                actual_shares = (
+                    token_delta
+                    if token_delta is not None and token_delta > 0
+                    else spent / price
+                    if price > 0
+                    else shares
                 )
-                actual_spent = spent if spent > 0.10 else actual_shares * price
+                actual_spent = (
+                    spent if spent > 0.10 else actual_shares * price
+                )
                 status = FILLED if actual_shares >= shares - 0.001 else PARTIAL
                 return OrderResult(
                     success=True, order_id=order_id, status=status,
@@ -883,20 +928,7 @@ class Executor:
                     shares=actual_shares, token_id=token_id[:16] + "...",
                     dry_run=False,
                 )
-
-        fill = self._check_order(order_id)
-        if not fill:
-            return None
-        matched = self._extract_fill(fill, price)
-        if not matched:
-            return None
-        status = FILLED if matched[2] >= shares - 0.001 else PARTIAL
-        return OrderResult(
-            success=True, order_id=order_id, status=status,
-            side="BUY", price=matched[0], amount_usd=matched[1],
-            shares=matched[2], token_id=token_id[:16] + "...",
-            dry_run=False,
-        )
+        return None
 
     def place_sell_order(self, token_id: str, shares: float, price: float = 0.0, neg_risk: bool = DEFAULT_NEG_RISK) -> OrderResult:
         """Post a sell order and return immediately; caller verifies/cancels later."""
@@ -1022,17 +1054,40 @@ class Executor:
                 token_id=token_id[:16] + "...", dry_run=True,
             )
 
+        fill = self._check_order(order_id)
+        if fill:
+            matched = self._extract_fill(fill, price)
+            if matched:
+                shares_left = max(0.0, shares - matched[2])
+                status = FILLED if shares_left < 1 else PARTIAL
+                return OrderResult(
+                    success=True, order_id=order_id, status=status,
+                    side="SELL", price=matched[0], amount_usd=matched[1],
+                    shares=matched[2], shares_remaining=shares_left,
+                    token_id=token_id[:16] + "...", dry_run=False,
+                )
+            return None
+
         if balance_before > 0:
-            balance_after = self.get_balance(refresh=True)
+            balance_after = self.get_balance(refresh=False)
             received = balance_after - balance_before
-            token_balance_after = self._get_token_balance_optional(token_id, refresh=True)
+            token_balance_after = self._get_token_balance_optional(
+                token_id, refresh=False
+            )
             token_delta = (
                 max(0.0, token_balance_before - token_balance_after)
-                if token_balance_before is not None and token_balance_after is not None
+                if token_balance_before is not None
+                and token_balance_after is not None
                 else None
             )
             if received > 0.10 or (token_delta is not None and token_delta > 0):
-                sold_shares = token_delta if token_delta is not None else (received / price if price > 0 else shares)
+                sold_shares = (
+                    token_delta
+                    if token_delta is not None
+                    else received / price
+                    if price > 0
+                    else shares
+                )
                 revenue = received if received > 0.10 else sold_shares * price
                 shares_left = max(0.0, shares - sold_shares)
                 status = FILLED if shares_left < 1 else PARTIAL
@@ -1042,21 +1097,7 @@ class Executor:
                     shares=sold_shares, shares_remaining=shares_left,
                     token_id=token_id[:16] + "...", dry_run=False,
                 )
-
-        fill = self._check_order(order_id)
-        if not fill:
-            return None
-        matched = self._extract_fill(fill, price)
-        if not matched:
-            return None
-        shares_left = max(0.0, shares - matched[2])
-        status = FILLED if shares_left < 1 else PARTIAL
-        return OrderResult(
-            success=True, order_id=order_id, status=status,
-            side="SELL", price=matched[0], amount_usd=matched[1],
-            shares=matched[2], shares_remaining=shares_left,
-            token_id=token_id[:16] + "...", dry_run=False,
-        )
+        return None
 
     def _verify_buy_via_balance(
         self, order_id: str, price: float, shares: float,

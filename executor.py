@@ -38,7 +38,7 @@ FAILED = "FAILED"
 MIN_SHARES = 1.0
 MIN_AMOUNT_USD = 1.0
 DEFAULT_MAX_BUY_PRICE = 0.90
-POLY_MIN_NOTIONAL = 5.0
+SELL_DUST_NOTIONAL = 5.0
 BUY_VERIFY_ATTEMPTS = 8
 BUY_VERIFY_DELAY_SECONDS = 3.0
 BUY_RETRY_BUFFER_USD = 0.05
@@ -77,13 +77,7 @@ def calculate_order_size(price: float, max_usd: float) -> tuple[float, float]:
         return 0.0, 0.0
 
     max_shares = max_usd_cents // price_cents
-    min_notional_cents = int(POLY_MIN_NOTIONAL * 100)
-    min_notional_shares = (min_notional_cents + price_cents - 1) // price_cents
-    min_required_shares = max(int(MIN_SHARES), min_notional_shares)
-
-    # Whole-share rounding can turn a $5 Kelly budget into a sub-$5 notional
-    # at high prices. Round up to the smallest valid Polymarket notional.
-    shares = int(max(max_shares, min_required_shares))
+    shares = int(max_shares)
     spend = shares * price_cents / 100.0
     return float(shares), spend
 
@@ -256,6 +250,7 @@ class Executor:
         self._balance_refresh_blocked_until: float = 0.0
         self._balance_cache_value: float = 0.0
         self._balance_cache_ts: float = 0.0
+        self._minimum_order_shares_cache: dict[str, float] = {}
 
         if self.signature_type == SignatureTypeV2.POLY_1271:
             print(
@@ -393,6 +388,49 @@ class Executor:
                 print(f"[executor] Price check failed: {e}")
             return 0.0
 
+    def minimum_order_shares(self, token_id: str) -> float:
+        """Return the token's CLOB minimum size, expressed in shares."""
+        token_id = str(token_id)
+        cached = self._minimum_order_shares_cache.get(token_id)
+        if cached is not None:
+            return cached
+        if not self._initialized or self.client is None:
+            return float(MIN_SHARES)
+        try:
+            book = self.client.get_order_book(token_id)
+            raw = (
+                book.get("min_order_size")
+                if isinstance(book, dict)
+                else None
+            )
+            minimum = max(float(MIN_SHARES), float(raw))
+            self._minimum_order_shares_cache[token_id] = minimum
+            return minimum
+        except Exception as exc:
+            print(
+                f"[executor] Minimum order size lookup failed for "
+                f"{token_id[:16]}...: {exc}; letting CLOB validate"
+            )
+            return float(MIN_SHARES)
+
+    def _minimum_size_error(
+        self, token_id: str, shares: float, side: str = "BUY"
+    ) -> Optional[OrderResult]:
+        minimum = self.minimum_order_shares(token_id)
+        if shares + 1e-9 >= minimum:
+            return None
+        return OrderResult(
+            success=False,
+            status=REJECTED,
+            error=(
+                f"Shares {shares:.4f} below market minimum "
+                f"{minimum:g} shares"
+            ),
+            side=side,
+            shares=float(shares),
+            token_id=token_id[:16] + "...",
+        )
+
     def _shares_within_budget(self, price: float, budget_usd: float) -> tuple[float, float]:
         if price <= 0 or budget_usd <= 0:
             return 0.0, 0.0
@@ -433,18 +471,22 @@ class Executor:
         retry_shares = min(retry_shares, max(0.0, original_shares - 1.0))
         retry_amount = retry_shares * round(market_price * 100) / 100.0
 
-        if retry_amount < POLY_MIN_NOTIONAL or retry_shares < 1:
+        minimum_error = self._minimum_size_error(token_id, retry_shares)
+        if retry_shares < 1 or minimum_error is not None:
             print(
                 f"  [order] Balance available after active orders is only "
-                f"${free_balance:.2f}; below ${POLY_MIN_NOTIONAL:.0f} buy minimum"
+                f"${free_balance:.2f}; below market minimum share size"
             )
-            return OrderResult(
-                success=False, status=REJECTED,
+            return minimum_error or OrderResult(
+                success=False,
+                status=REJECTED,
                 error=(
                     f"Insufficient available balance after active orders: "
                     f"${free_balance:.2f}"
                 ),
-                side="BUY", price=market_price, token_id=token_id[:16] + "...",
+                side="BUY",
+                price=market_price,
+                token_id=token_id[:16] + "...",
             )
 
         print(
@@ -528,12 +570,11 @@ class Executor:
                 error=f"Can't afford 1 share at ${market_price:.3f} within ${amount_usd:.2f}",
                 side="BUY", price=market_price, token_id=token_id[:16] + "...",
             )
-        if clean_amount < POLY_MIN_NOTIONAL:
-            return OrderResult(
-                success=False, status=REJECTED,
-                error=f"Amount ${clean_amount:.2f} < ${POLY_MIN_NOTIONAL:.0f} min",
-                side="BUY", price=market_price, token_id=token_id[:16] + "...",
-            )
+        minimum_error = self._minimum_size_error(token_id, shares)
+        if minimum_error is not None:
+            minimum_error.price = market_price
+            minimum_error.amount_usd = clean_amount
+            return minimum_error
 
         balance_before = self.get_balance(refresh=True)
         if balance_before < clean_amount:
@@ -651,12 +692,11 @@ class Executor:
                 error=f"Can't afford 1 share at ${market_price:.3f} within ${amount_usd:.2f}",
                 side="BUY", price=market_price, token_id=token_id[:16] + "...",
             )
-        if clean_amount < POLY_MIN_NOTIONAL:
-            return OrderResult(
-                success=False, status=REJECTED,
-                error=f"Amount ${clean_amount:.2f} < ${POLY_MIN_NOTIONAL:.0f} min",
-                side="BUY", price=market_price, token_id=token_id[:16] + "...",
-            )
+        minimum_error = self._minimum_size_error(token_id, shares)
+        if minimum_error is not None:
+            minimum_error.price = market_price
+            minimum_error.amount_usd = clean_amount
+            return minimum_error
 
         if not self.dry_run:
             if not self._initialized:
@@ -730,13 +770,11 @@ class Executor:
                 error=f"Shares {shares:.4f} below min", side="BUY",
                 price=market_price, shares=float(order_shares), token_id=token_id[:16] + "...",
             )
-        if clean_amount < POLY_MIN_NOTIONAL:
-            return OrderResult(
-                success=False, status=REJECTED,
-                error=f"Fixed share order ${clean_amount:.2f} < ${POLY_MIN_NOTIONAL:.0f} min",
-                side="BUY", price=market_price, amount_usd=clean_amount,
-                shares=float(order_shares), token_id=token_id[:16] + "...",
-            )
+        minimum_error = self._minimum_size_error(token_id, order_shares)
+        if minimum_error is not None:
+            minimum_error.price = market_price
+            minimum_error.amount_usd = clean_amount
+            return minimum_error
         cap_price = max_buy_price()
         if market_price > cap_price:
             return OrderResult(
@@ -881,10 +919,10 @@ class Executor:
         market_price = round(price, 2)
 
         sell_amount = round(sell_shares * market_price, 2)
-        if sell_amount < POLY_MIN_NOTIONAL:
+        if sell_amount < SELL_DUST_NOTIONAL:
             return OrderResult(
                 success=False, status=REJECTED,
-                error=f"Notional ${sell_amount:.2f} < ${POLY_MIN_NOTIONAL:.0f} min - hold to resolution",
+                error=f"Notional ${sell_amount:.2f} < ${SELL_DUST_NOTIONAL:.0f} min - hold to resolution",
                 side="SELL", price=market_price, shares=float(sell_shares),
                 shares_remaining=float(sell_shares), token_id=token_id[:16] + "...",
             )
@@ -923,10 +961,10 @@ class Executor:
                 error="No sellable token balance", side="SELL",
                 price=market_price, shares=0.0, token_id=token_id[:16] + "...",
             )
-        if sell_amount < POLY_MIN_NOTIONAL:
+        if sell_amount < SELL_DUST_NOTIONAL:
             return OrderResult(
                 success=False, status=REJECTED,
-                error=f"Notional ${sell_amount:.2f} < ${POLY_MIN_NOTIONAL:.0f} min - hold to resolution",
+                error=f"Notional ${sell_amount:.2f} < ${SELL_DUST_NOTIONAL:.0f} min - hold to resolution",
                 side="SELL", price=market_price, shares=float(sell_shares),
                 shares_remaining=float(sell_shares), token_id=token_id[:16] + "...",
             )
@@ -1177,10 +1215,10 @@ class Executor:
                 )
 
         sell_amount = round(sell_shares * price, 2)
-        if sell_amount < POLY_MIN_NOTIONAL:
+        if sell_amount < SELL_DUST_NOTIONAL:
             return OrderResult(
                 success=False, status=REJECTED,
-                error=f"Notional ${sell_amount:.2f} < ${POLY_MIN_NOTIONAL:.0f} min - hold to resolution",
+                error=f"Notional ${sell_amount:.2f} < ${SELL_DUST_NOTIONAL:.0f} min - hold to resolution",
                 side="SELL", price=price, shares=float(sell_shares),
                 shares_remaining=float(sell_shares),
                 token_id=token_id[:16] + "...",
@@ -1264,7 +1302,7 @@ class Executor:
             retry_shares = int(actual_balance)
             if "not enough balance" in err.lower() and retry_shares >= 1 and retry_shares < sell_shares:
                 retry_amount = round(retry_shares * price, 2)
-                if retry_amount >= POLY_MIN_NOTIONAL:
+                if retry_amount >= SELL_DUST_NOTIONAL:
                     print(
                         f"  [order] Retrying sell with actual token balance: "
                         f"{retry_shares} shares @ ${price:.3f} = ${retry_amount:.2f}"
@@ -1303,7 +1341,7 @@ class Executor:
                         success=False, status=REJECTED,
                         error=(
                             f"Actual token balance {retry_shares} shares has "
-                            f"notional ${retry_amount:.2f} < ${POLY_MIN_NOTIONAL:.0f} min"
+                            f"notional ${retry_amount:.2f} < ${SELL_DUST_NOTIONAL:.0f} min"
                         ),
                         side="SELL", price=price,
                         shares=float(retry_shares),

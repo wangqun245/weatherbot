@@ -12,7 +12,8 @@ Only keeps the current strategy:
 By default this runs as a paper trader. If live trading is explicitly enabled
 in config, real Polymarket orders are posted through executor.py and confirmed
 through the authenticated Polymarket user websocket, with REST polling as a
-fallback. Market-price websocket momentum is not used for strategy decisions.
+fallback. The public market websocket manages model-AWC hourly accumulation
+orders; unrelated price-momentum trading remains disabled.
 """
 
 from __future__ import annotations
@@ -266,6 +267,33 @@ class LivePendingOrder:
     token_balance_before: Optional[float] = None
 
 
+@dataclass
+class ModelAwcHourlyBatch:
+    """One city/hour live accumulation target managed from CLOB websocket books."""
+
+    batch_id: str
+    city: str
+    station: str
+    event_date: str
+    local_hour: int
+    mode: str
+    markets: tuple[TemperatureMarket, ...]
+    sides: tuple[str, ...]
+    token_ids: tuple[str, ...]
+    target_shares: float
+    predicted_high_f: float
+    cycle_id: str
+    reason: str
+    baseline_balances: dict[str, float]
+    acquired_shares: dict[str, float]
+    average_prices: dict[str, float]
+    open_order_ids: dict[str, str]
+    expires_ts: float
+    repair_token_id: str = ""
+    next_action_ts: float = 0.0
+    closed: bool = False
+
+
 def deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
     """Recursively merge an override dictionary into a base dictionary without mutating the original base object.
     
@@ -340,8 +368,8 @@ def default_config() -> dict[str, Any]:
         "source_station_check_enabled": True,
         "source_station_check_hour_ct": 3,
         "source_station_check_timezone": "America/Chicago",
-        "depth_price_notional_multiplier": 2.0,
-        "depth_price_extra_levels": 1,
+        "depth_price_notional_multiplier": 1.0,
+        "depth_price_extra_levels": 0,
         "model_awc_enabled": True,
         "model_awc_model_path": "models/lightgbm_rolling_6y_holdout_24h_lag10_speci_context_regular_20260626/lightgbm_metar_high_rolling_6y_best.pkl",
         "model_awc_live_stations": ["KMIA", "KLAX", "KSFO", "KSEA", "KHOU", "KAUS", "KATL"],
@@ -369,6 +397,7 @@ def default_config() -> dict[str, Any]:
         "model_awc_poll_attempts": 5,
         "model_awc_adjacent_yes_max_total_price": 0.9,
         "model_awc_adjacent_yes_shares": 10,
+        "model_awc_order_management_window_minutes": 40,
         "model_awc_interval_snap_tolerance_f": 0.15,
     }
     return {
@@ -1524,16 +1553,16 @@ def depth_target_notional(config: dict[str, Any]) -> float:
     """Return the notional depth to inspect when selecting a live buy price."""
     trading = config.get("trading", {})
     notional = float(trading.get("buy_notional_usdc", 10.0))
-    multiplier = max(1.0, float(trading.get("depth_price_notional_multiplier", 2.0)))
+    multiplier = max(1.0, float(trading.get("depth_price_notional_multiplier", 1.0)))
     return max(notional, notional * multiplier)
 
 
 def depth_extra_levels(config: dict[str, Any]) -> int:
     """Return how many levels beyond the target depth to step for buy aggressiveness."""
     try:
-        return max(0, int(float(config.get("trading", {}).get("depth_price_extra_levels", 1))))
+        return max(0, int(float(config.get("trading", {}).get("depth_price_extra_levels", 0))))
     except (TypeError, ValueError):
-        return 1
+        return 0
 
 
 def price_for_buy_notional(asks: list[tuple[float, float]], target_notional: float, extra_levels: int = 0) -> Optional[float]:
@@ -1570,7 +1599,84 @@ def price_for_complement_bid_notional(bids: list[tuple[float, float]], target_no
     return None
 
 
-def best_buy_price(config: dict[str, Any], market: TemperatureMarket, side: str) -> Optional[float]:
+def price_for_buy_shares(
+    asks: list[tuple[float, float]], target_shares: float
+) -> Optional[float]:
+    """Return the highest ask needed to fill exactly the requested share quantity."""
+    if target_shares <= 0:
+        return None
+    cumulative = 0.0
+    for price, size in sorted(asks or [], key=lambda item: item[0]):
+        if price <= 0 or size <= 0:
+            continue
+        cumulative += size
+        if cumulative >= target_shares:
+            return price
+    return None
+
+
+def price_for_complement_bid_shares(
+    bids: list[tuple[float, float]], target_shares: float
+) -> Optional[float]:
+    """Return the complement price backed by the requested opposite-side shares."""
+    if target_shares <= 0:
+        return None
+    cumulative = 0.0
+    levels = sorted(
+        [
+            (float(clamp_price(1.0 - bid) or 0.0), size)
+            for bid, size in (bids or [])
+            if bid > 0 and size > 0
+        ],
+        key=lambda item: item[0],
+    )
+    for price, size in levels:
+        if price <= 0:
+            continue
+        cumulative += size
+        if cumulative >= target_shares:
+            return price
+    return None
+
+
+def best_buy_offer(
+    config: dict[str, Any], market: TemperatureMarket, side: str
+) -> Optional[tuple[float, float]]:
+    """Return the cheapest top-of-book buy price and immediately available shares."""
+    normalized = side.strip().upper()
+    direct_asset_id = asset_id_for_market_side(market, normalized)
+    complement_asset_id = asset_id_for_market_side(
+        market, opposite_side(normalized)
+    )
+    if not direct_asset_id:
+        return None
+    direct_bids, direct_asks = clob_book_levels(config, direct_asset_id)
+    complement_bids, _complement_asks = clob_book_levels(
+        config, complement_asset_id
+    )
+    offers: list[tuple[float, float]] = []
+    if direct_asks:
+        price, size = min(direct_asks, key=lambda item: item[0])
+        if price > 0 and size > 0:
+            offers.append((float(price), float(size)))
+    if complement_bids:
+        bid, size = max(complement_bids, key=lambda item: item[0])
+        price = clamp_price(1.0 - bid)
+        if price is not None and price > 0 and size > 0:
+            offers.append((float(price), float(size)))
+    if not offers:
+        return None
+    return min(offers, key=lambda item: item[0])
+
+
+def best_buy_price(
+    config: dict[str, Any],
+    market: TemperatureMarket,
+    side: str,
+    *,
+    target_notional: Optional[float] = None,
+    target_shares: Optional[float] = None,
+) -> Optional[float]:
     """Return the best currently executable buy price for a YES/NO market side.
     
     Args:
@@ -1591,23 +1697,39 @@ def best_buy_price(config: dict[str, Any], market: TemperatureMarket, side: str)
         LOGGER.warning("clob buy unavailable missing asset_id side=%s market=%s question=%r", normalized, market.market_id, market.market_question)
         return None
     try:
-        target_notional = depth_target_notional(config)
-        extra_levels = depth_extra_levels(config)
+        if target_shares is not None and target_shares > 0:
+            depth_type = "shares"
+            depth_target = float(target_shares)
+        else:
+            depth_type = "notional"
+            depth_target = (
+                float(target_notional)
+                if target_notional is not None and target_notional > 0
+                else depth_target_notional(config)
+            )
         direct_bids, direct_asks = clob_book_levels(config, direct_asset_id)
         complement_bids, complement_asks = clob_book_levels(config, complement_asset_id)
         direct_bid = max((price for price, _ in direct_bids), default=None)
         direct_ask = min((price for price, _ in direct_asks), default=None)
         complement_bid = max((price for price, _ in complement_bids), default=None)
         complement_ask = min((price for price, _ in complement_asks), default=None)
-        direct_depth_price = price_for_buy_notional(direct_asks, target_notional, extra_levels)
-        complement_depth_price = price_for_complement_bid_notional(complement_bids, target_notional, extra_levels)
+        if depth_type == "shares":
+            direct_depth_price = price_for_buy_shares(direct_asks, depth_target)
+            complement_depth_price = price_for_complement_bid_shares(
+                complement_bids, depth_target
+            )
+        else:
+            direct_depth_price = price_for_buy_notional(
+                direct_asks, depth_target, extra_levels=0
+            )
+            complement_depth_price = price_for_complement_bid_notional(
+                complement_bids, depth_target, extra_levels=0
+            )
         complement_bid_as_buy = clamp_price(1.0 - complement_bid) if complement_bid is not None else None
         prices = [p for p in (direct_depth_price, complement_depth_price) if p is not None]
         if not prices:
-            prices = [p for p in (direct_ask, complement_bid_as_buy) if p is not None]
-        if not prices:
             LOGGER.info(
-                "clob buy unavailable side=%s market=%s direct_asset=%s direct_bids=%s direct_asks=%s direct_best_bid=%s direct_best_ask=%s complement_asset=%s complement_bids=%s complement_asks=%s complement_best_bid=%s complement_best_ask=%s target_notional=%s extra_levels=%s question=%r",
+                "clob buy unavailable insufficient 1:1 depth side=%s market=%s direct_asset=%s direct_bids=%s direct_asks=%s direct_best_bid=%s direct_best_ask=%s complement_asset=%s complement_bids=%s complement_asks=%s complement_best_bid=%s complement_best_ask=%s depth_type=%s depth_target=%s question=%r",
                 normalized,
                 market.market_id,
                 direct_asset_id,
@@ -1620,14 +1742,14 @@ def best_buy_price(config: dict[str, Any], market: TemperatureMarket, side: str)
                 len(complement_asks),
                 complement_bid,
                 complement_ask,
-                target_notional,
-                extra_levels,
+                depth_type,
+                depth_target,
                 market.market_question,
             )
             return None
         selected = min(prices)
         LOGGER.info(
-            "clob depth buy price side=%s market=%s selected=%s direct_depth=%s complement_depth=%s direct_best_ask=%s complement_bid_as_buy=%s target_notional=%s extra_levels=%s",
+            "clob 1:1 depth buy price side=%s market=%s selected=%s direct_depth=%s complement_depth=%s direct_best_ask=%s complement_bid_as_buy=%s depth_type=%s depth_target=%s",
             normalized,
             market.market_id,
             selected,
@@ -1635,8 +1757,8 @@ def best_buy_price(config: dict[str, Any], market: TemperatureMarket, side: str)
             complement_depth_price,
             direct_ask,
             complement_bid_as_buy,
-            target_notional,
-            extra_levels,
+            depth_type,
+            depth_target,
         )
         return selected
     except Exception:
@@ -1650,13 +1772,8 @@ def clob_asset_buy_price(config: dict[str, Any], asset_id: str) -> Optional[floa
         return None
     try:
         target_notional = depth_target_notional(config)
-        extra_levels = depth_extra_levels(config)
         _, asks = clob_book_levels(config, asset_id)
-        depth_price = price_for_buy_notional(asks, target_notional, extra_levels)
-        if depth_price is not None:
-            return depth_price
-        ask_prices = [price for price, _ in asks]
-        return min(ask_prices) if ask_prices else None
+        return price_for_buy_notional(asks, target_notional, extra_levels=0)
     except Exception:
         LOGGER.exception("clob asset buy query failed asset=%s", asset_id)
         return None
@@ -2677,6 +2794,37 @@ def process_model_awc_prediction(
         if duplicate_window:
             LOGGER.info("model awc skip duplicate city=%s station=%s event_date=%s local_hour=%s", city, station, event_date, local_hour)
             return None
+        if live_trader:
+            yes_offer = best_buy_offer(
+                config, predicted_yes_market, "YES"
+            )
+            managed_target_shares = float(
+                config["trading"].get("model_awc_adjacent_yes_shares", 10)
+            )
+            if (
+                yes_offer is None
+                or yes_offer[0] > configured_max_buy_price(config)
+                or yes_offer[1] < managed_target_shares
+            ):
+                batch_id = live_trader.start_model_awc_hourly_batch(
+                    city,
+                    station,
+                    event_date,
+                    local_hour,
+                    (predicted_yes_market,),
+                    ("YES",),
+                    managed_target_shares,
+                    predicted_high_f,
+                    "single",
+                )
+                LOGGER.info(
+                    "model awc single interval delegated to 0.85 limit "
+                    "manager batch=%s market=%s current_offer=%s",
+                    batch_id,
+                    predicted_yes_market.market_id,
+                    yes_offer,
+                )
+                return None
         candidates = []
         for market in markets:
             candidate = model_awc_market_candidate(config, market, predicted_high_f, event_unit, predicted_yes_market.market_id)
@@ -2699,6 +2847,28 @@ def process_model_awc_prediction(
             LOGGER.info("model awc skip duplicate city=%s station=%s event_date=%s local_hour=%s", city, station, event_date, local_hour)
             return None
         snap_market, snap_distance = snapped
+        if live_trader:
+            snap_offer = best_buy_offer(config, snap_market, "YES")
+            managed_target_shares = float(
+                config["trading"].get("model_awc_adjacent_yes_shares", 10)
+            )
+            if (
+                snap_offer is None
+                or snap_offer[0] > configured_max_buy_price(config)
+                or snap_offer[1] < managed_target_shares
+            ):
+                live_trader.start_model_awc_hourly_batch(
+                    city,
+                    station,
+                    event_date,
+                    local_hour,
+                    (snap_market,),
+                    ("YES",),
+                    managed_target_shares,
+                    predicted_high_f,
+                    "single",
+                )
+                return None
         yes_price = best_buy_price(config, snap_market, "YES")
         if yes_price is None or yes_price <= 0:
             LOGGER.info(
@@ -2748,9 +2918,43 @@ def process_model_awc_prediction(
         )
         return None
 
+    adjacent_shares = float(config["trading"].get("model_awc_adjacent_yes_shares", 10))
+    if live_trader:
+        if duplicate_window:
+            LOGGER.info(
+                "model awc skip duplicate managed adjacent batch city=%s "
+                "station=%s event_date=%s local_hour=%s",
+                city,
+                station,
+                event_date,
+                local_hour,
+            )
+            return None
+        batch_id = live_trader.start_model_awc_hourly_batch(
+            city,
+            station,
+            event_date,
+            local_hour,
+            tuple(adjacent_markets),
+            ("YES", "YES"),
+            adjacent_shares,
+            predicted_high_f,
+            "adjacent",
+        )
+        LOGGER.info(
+            "model awc adjacent delegated to websocket manager batch=%s "
+            "markets=%s target_shares_each=%s",
+            batch_id,
+            [market.market_id for market in adjacent_markets],
+            adjacent_shares,
+        )
+        return None
+
     adjacent_prices: list[tuple[TemperatureMarket, float]] = []
     for market in adjacent_markets:
-        yes_price = best_buy_price(config, market, "YES")
+        yes_price = best_buy_price(
+            config, market, "YES", target_shares=adjacent_shares
+        )
         if yes_price is None or yes_price <= 0:
             LOGGER.info(
                 "model awc skip adjacent missing yes price city=%s station=%s event_date=%s local_hour=%s predicted_high_f=%r market=%s",
@@ -2765,7 +2969,6 @@ def process_model_awc_prediction(
         adjacent_prices.append((market, round(float(yes_price), 2)))
     total_yes_price = sum(price for _market, price in adjacent_prices)
     max_total_price = float(config["trading"].get("model_awc_adjacent_yes_max_total_price", 0.9))
-    adjacent_shares = float(config["trading"].get("model_awc_adjacent_yes_shares", 10))
     held_no_exists = any((trade.position_side or "YES").upper() == "NO" for trade in active_event_positions)
     held_adjacent_yes = model_awc_adjacent_yes_position_summary(active_event_positions, adjacent_markets)
     if held_adjacent_yes and not held_no_exists:
@@ -3640,10 +3843,15 @@ class LiveTradingManager:
         self.config = config
         self.executor: Any = None
         self.user_feed: Any = None
+        self.market_feed: Any = None
         self._pending: dict[str, LivePendingOrder] = {}
+        self._hourly_batches: dict[str, ModelAwcHourlyBatch] = {}
+        self._managed_order_ids: set[str] = set()
+        self._market_wakeup = threading.Event()
         self._lock = threading.RLock()
         self._running = False
         self._thread: Optional[threading.Thread] = None
+        self._batch_thread: Optional[threading.Thread] = None
 
     def start(self) -> None:
         """Initialize executor.py, start the user websocket, and launch the pending-order poller.
@@ -3666,7 +3874,7 @@ class LiveTradingManager:
         signature_type = int(signature_type_raw or "3")
         dry_run = bool(self.config.get("trading", {}).get("live_trading_dry_run", False))
         from executor import Executor
-        from polymarket_ws import PolymarketUserFeed
+        from polymarket_ws import PolymarketMarketFeed, PolymarketUserFeed
 
         self.executor = Executor(
             private_key=private_key,
@@ -3686,9 +3894,19 @@ class LiveTradingManager:
             raise RuntimeError("executor.initialize() failed; live trading is not available")
         self.user_feed = PolymarketUserFeed(self.executor.get_api_creds(), on_message=self._on_user_order_message)
         self.user_feed.start()
+        self.market_feed = PolymarketMarketFeed(
+            on_raw_message=self._on_market_message
+        )
+        self.market_feed.start()
         self._running = True
         self._thread = threading.Thread(target=self._poll_loop, name="polymarket-live-orders", daemon=True)
         self._thread.start()
+        self._batch_thread = threading.Thread(
+            target=self._hourly_batch_loop,
+            name="model-awc-hourly-orders",
+            daemon=True,
+        )
+        self._batch_thread.start()
         self._recover_pending_from_disk()
         LOGGER.info("live trading manager started dry_run=%s", dry_run)
 
@@ -3704,8 +3922,12 @@ class LiveTradingManager:
         self._running = False
         if self.user_feed:
             self.user_feed.stop()
+        if self.market_feed:
+            self.market_feed.stop()
         if self._thread:
             self._thread.join(timeout=2)
+        if self._batch_thread:
+            self._batch_thread.join(timeout=2)
 
     def submit_buy_trade(
         self,
@@ -3824,6 +4046,383 @@ class LiveTradingManager:
         LOGGER.info("live buy pending trade=%s order=%s side=%s market=%s price=%s shares=%s neg_risk=%s", trade.trade_id, trade.live_buy_order_id, side, market.market_id, trade.yes_price, trade.shares, neg_risk)
         notify_trade(config, trade, "BUY", "SUBMITTED", reason)
         return trade
+
+    def start_model_awc_hourly_batch(
+        self,
+        city: str,
+        station: str,
+        event_date: str,
+        local_hour: int,
+        markets: tuple[TemperatureMarket, ...],
+        sides: tuple[str, ...],
+        target_shares: float,
+        predicted_high_f: float,
+        mode: str,
+    ) -> str:
+        """Replace the prior city/hour target and begin websocket order management."""
+        if not self.executor or not self.market_feed:
+            raise RuntimeError("live trading manager is not started")
+        batch_id = (
+            f"{city}:{station}:{event_date}:hour_{local_hour:02d}:{mode}"
+        )
+        group_prefix = f"{city}:{station}:{event_date}:"
+        token_ids = tuple(
+            asset_id_for_market_side(market, side)
+            for market, side in zip(markets, sides)
+        )
+        if not all(token_ids):
+            raise RuntimeError(f"missing token id for managed batch {batch_id}")
+        with self._lock:
+            old_batches = [
+                batch
+                for key, batch in self._hourly_batches.items()
+                if key.startswith(group_prefix)
+            ]
+        for old in old_batches:
+            self._close_hourly_batch(old, "next_hour_model_output")
+        baseline = {
+            token_id: float(
+                self.executor._get_token_balance_optional(
+                    token_id, refresh=True
+                )
+                or 0.0
+            )
+            for token_id in token_ids
+        }
+        batch = ModelAwcHourlyBatch(
+            batch_id=batch_id,
+            city=city,
+            station=station,
+            event_date=event_date,
+            local_hour=local_hour,
+            mode=mode,
+            markets=markets,
+            sides=sides,
+            token_ids=token_ids,
+            target_shares=float(target_shares),
+            predicted_high_f=float(predicted_high_f),
+            cycle_id=(
+                f"{datetime.now().strftime('%Y%m%dT%H%M%S')}:"
+                f"model_awc_managed:{city}:{station}:{event_date}:"
+                f"hour_{local_hour:02d}"
+            ),
+            reason=f"model_awc_managed_{mode}_hour_{local_hour:02d}",
+            baseline_balances=baseline,
+            acquired_shares={token_id: 0.0 for token_id in token_ids},
+            average_prices={token_id: 0.0 for token_id in token_ids},
+            open_order_ids={},
+            expires_ts=time.time()
+            + max(
+                1.0,
+                float(
+                    self.config["trading"].get(
+                        "model_awc_order_management_window_minutes", 40
+                    )
+                ),
+            )
+            * 60.0,
+        )
+        with self._lock:
+            self._hourly_batches[batch_id] = batch
+        self._refresh_hourly_market_subscriptions()
+        self._market_wakeup.set()
+        LOGGER.info(
+            "model awc hourly batch started batch=%s mode=%s tokens=%s "
+            "target_shares=%s predicted_high_f=%r window_minutes=%s",
+            batch_id,
+            mode,
+            [token[:16] for token in token_ids],
+            target_shares,
+            predicted_high_f,
+            self.config["trading"].get(
+                "model_awc_order_management_window_minutes", 40
+            ),
+        )
+        return batch_id
+
+    def _on_market_message(
+        self, _raw: str, received_ts: Optional[float] = None
+    ) -> None:
+        """Wake the hourly manager after a market book or price update."""
+        self._market_wakeup.set()
+
+    def _refresh_hourly_market_subscriptions(self) -> None:
+        if not self.market_feed:
+            return
+        with self._lock:
+            batches = [
+                batch for batch in self._hourly_batches.values()
+                if not batch.closed
+            ]
+        asset_ids = sorted(
+            {token for batch in batches for token in batch.token_ids}
+        )
+        labels = {
+            token: f"{batch.city}:{batch.local_hour}:{idx}"
+            for batch in batches
+            for idx, token in enumerate(batch.token_ids)
+        }
+        self.market_feed.subscribe(asset_ids, labels)
+
+    def _close_hourly_batch(
+        self, batch: ModelAwcHourlyBatch, reason: str
+    ) -> None:
+        for token_id in list(batch.open_order_ids):
+            self._cancel_batch_order(batch, token_id, reason=reason)
+        batch.closed = True
+        with self._lock:
+            self._hourly_batches.pop(batch.batch_id, None)
+        LOGGER.info(
+            "model awc hourly batch closed batch=%s reason=%s acquired=%s",
+            batch.batch_id,
+            reason,
+            batch.acquired_shares,
+        )
+        self._refresh_hourly_market_subscriptions()
+
+    def _hourly_batch_loop(self) -> None:
+        while self._running:
+            self._market_wakeup.wait(timeout=1.0)
+            self._market_wakeup.clear()
+            with self._lock:
+                batches = list(self._hourly_batches.values())
+            for batch in batches:
+                try:
+                    self._manage_hourly_batch(batch)
+                except Exception:
+                    LOGGER.exception(
+                        "model awc hourly batch management failed batch=%s",
+                        batch.batch_id,
+                    )
+
+    def _batch_token_balance(self, batch: ModelAwcHourlyBatch, token: str) -> float:
+        current = self.executor._get_token_balance_optional(token, refresh=True)
+        if current is None:
+            return batch.acquired_shares.get(token, 0.0)
+        return max(0.0, float(current) - batch.baseline_balances.get(token, 0.0))
+
+    def _cancel_batch_order(
+        self,
+        batch: ModelAwcHourlyBatch,
+        token_id: str,
+        reason: str = "managed_reprice",
+    ) -> None:
+        order_id = batch.open_order_ids.pop(token_id, "")
+        if not order_id:
+            return
+        with self._lock:
+            pending = self._pending.get(order_id)
+        if pending is not None and pending.kind == "BUY":
+            result = self.executor.check_pending_buy(
+                pending.order_id,
+                pending.price,
+                pending.shares,
+                pending.token_id,
+                pending.balance_before,
+                pending.token_balance_before,
+            )
+            if result and _result_value(result, "success", False):
+                self._apply_order_result(
+                    pending, result, source="managed_pre_cancel"
+                )
+                pending = None
+        cancelled = self.executor.cancel_order(order_id)
+        with self._lock:
+            self._managed_order_ids.discard(order_id)
+        if pending is not None:
+            self._mark_order_cancelled(pending, reason, cancelled)
+
+    def _submit_batch_order(
+        self,
+        batch: ModelAwcHourlyBatch,
+        leg_index: int,
+        shares: float,
+        price: float,
+        reason: str,
+    ) -> Optional[PaperTrade]:
+        order_shares = float(int(max(0.0, shares)))
+        if order_shares < 1:
+            return None
+        if batch.token_ids[leg_index] in batch.open_order_ids:
+            self._cancel_batch_order(batch, batch.token_ids[leg_index])
+        market = batch.markets[leg_index]
+        side = batch.sides[leg_index]
+        trade = self.submit_buy_trade(
+            self.config,
+            batch.cycle_id,
+            market,
+            "",
+            batch.station,
+            side,
+            float(price),
+            batch.predicted_high_f,
+            None,
+            reason,
+            amount_usd=round(order_shares * float(price), 2),
+            shares=order_shares,
+        )
+        if trade is None:
+            return None
+        trades = read_trades(self.config["outputs"]["trades_csv"])
+        trades.append(trade)
+        write_csv(self.config["outputs"]["trades_csv"], trades)
+        write_csv(self.config["outputs"]["settled_trades_csv"], trades)
+        write_performance_reports(self.config, trades)
+        token_id = batch.token_ids[leg_index]
+        batch.open_order_ids[token_id] = trade.live_buy_order_id
+        batch.average_prices[token_id] = float(price)
+        with self._lock:
+            self._managed_order_ids.add(trade.live_buy_order_id)
+        return trade
+
+    def _live_offer(
+        self, token_id: str
+    ) -> Optional[tuple[float, float]]:
+        if not self.market_feed:
+            return None
+        price = self.market_feed.get_price(token_id)
+        if price is None or price.best_ask <= 0 or price.ask_size <= 0:
+            return None
+        return float(price.best_ask), float(price.ask_size)
+
+    def _manage_hourly_batch(self, batch: ModelAwcHourlyBatch) -> None:
+        if batch.closed:
+            return
+        if time.time() >= batch.expires_ts:
+            self._close_hourly_batch(batch, "management_window_expired")
+            return
+        if time.time() < batch.next_action_ts:
+            return
+        for token in batch.token_ids:
+            batch.acquired_shares[token] = self._batch_token_balance(
+                batch, token
+            )
+        if batch.mode == "single":
+            self._manage_single_hourly_batch(batch)
+        else:
+            self._manage_adjacent_hourly_batch(batch)
+
+    def _manage_single_hourly_batch(
+        self, batch: ModelAwcHourlyBatch
+    ) -> None:
+        token = batch.token_ids[0]
+        acquired = batch.acquired_shares[token]
+        remaining = max(0, int(batch.target_shares - acquired))
+        if remaining < 1:
+            self._close_hourly_batch(batch, "target_filled")
+            return
+        if token in batch.open_order_ids:
+            return
+        # A 0.85 GTC bid both rests when the YES ask is too high and
+        # immediately matches any websocket-visible seller at 0.85 or below.
+        self._submit_batch_order(
+            batch,
+            0,
+            remaining,
+            configured_max_buy_price(self.config),
+            f"{batch.reason}_single_limit_085",
+        )
+
+    def _manage_adjacent_hourly_batch(
+        self, batch: ModelAwcHourlyBatch
+    ) -> None:
+        left, right = batch.token_ids
+        left_qty = batch.acquired_shares[left]
+        right_qty = batch.acquired_shares[right]
+        epsilon = 0.5
+        if abs(left_qty - right_qty) >= epsilon:
+            richer = left if left_qty > right_qty else right
+            poorer = right if richer == left else left
+            for token in list(batch.open_order_ids):
+                self._cancel_batch_order(
+                    batch, token, reason="adjacent_imbalance_reprice"
+                )
+            deficit = int(abs(left_qty - right_qty))
+            if deficit < 1 or poorer in batch.open_order_ids:
+                return
+            other_price = batch.average_prices.get(richer, 0.0)
+            repair_price = round(
+                max(
+                    0.01,
+                    min(
+                        configured_max_buy_price(self.config),
+                        0.85 - other_price,
+                    ),
+                ),
+                2,
+            )
+            batch.repair_token_id = poorer
+            self._submit_batch_order(
+                batch,
+                batch.token_ids.index(poorer),
+                deficit,
+                repair_price,
+                f"{batch.reason}_balance_repair",
+            )
+            LOGGER.info(
+                "model awc adjacent repair batch=%s poorer=%s deficit=%s "
+                "repair_price=%s other_cost=%s",
+                batch.batch_id,
+                poorer[:16],
+                deficit,
+                repair_price,
+                other_price,
+            )
+            return
+
+        if batch.repair_token_id:
+            self._cancel_batch_order(batch, batch.repair_token_id)
+            batch.repair_token_id = ""
+        for token in list(batch.open_order_ids):
+            self._cancel_batch_order(batch, token)
+        equal_qty = min(left_qty, right_qty)
+        remaining = max(0, int(batch.target_shares - equal_qty))
+        if remaining < 1:
+            self._close_hourly_batch(batch, "target_filled")
+            return
+        offers = [self._live_offer(token) for token in batch.token_ids]
+        if any(offer is None for offer in offers):
+            return
+        left_offer, right_offer = offers
+        assert left_offer is not None and right_offer is not None
+        max_price = configured_max_buy_price(self.config)
+        max_total = float(
+            self.config["trading"].get(
+                "model_awc_adjacent_yes_max_total_price", 0.9
+            )
+        )
+        if (
+            left_offer[0] > max_price
+            or right_offer[0] > max_price
+            or left_offer[0] + right_offer[0] > max_total
+        ):
+            return
+        common_shares = min(
+            remaining, int(left_offer[1]), int(right_offer[1])
+        )
+        if common_shares < 1:
+            return
+        submitted = []
+        for idx, offer in enumerate((left_offer, right_offer)):
+            submitted.append(
+                self._submit_batch_order(
+                    batch,
+                    idx,
+                    common_shares,
+                    offer[0],
+                    f"{batch.reason}_websocket_equal_pair",
+                )
+            )
+        batch.next_action_ts = time.time() + 2.0
+        LOGGER.info(
+            "model awc adjacent websocket buy batch=%s shares_each=%s "
+            "prices=%s total=%s submitted=%s",
+            batch.batch_id,
+            common_shares,
+            [left_offer[0], right_offer[0]],
+            left_offer[0] + right_offer[0],
+            [trade is not None for trade in submitted],
+        )
 
     def submit_sell_trade(self, config: dict[str, Any], trade: PaperTrade, market: TemperatureMarket, reason: str, exit_price: float) -> bool:
         """Post a live sell order for an existing open trade.
@@ -3977,6 +4576,7 @@ class LiveTradingManager:
             }
             LOGGER.info("live order websocket confirmed order=%s kind=%s shares=%s price=%s latency_ms=%.0f", pending.order_id, pending.kind, shares, price, (time.time() - received_ts) * 1000)
             self._apply_order_result(pending, result, source="user_websocket")
+            self._market_wakeup.set()
             return
 
     def _matched_order_from_user_msg(self, msg: dict[str, Any], order_id: str) -> Optional[tuple[float, float]]:
@@ -4041,6 +4641,12 @@ class LiveTradingManager:
                 result = self.executor.check_pending_sell(pending.order_id, pending.price, pending.shares, pending.token_id, pending.balance_before, pending.token_balance_before)
             if result and _result_value(result, "success", False):
                 self._apply_order_result(pending, result, source="poll")
+                continue
+            with self._lock:
+                managed_order = pending.order_id in self._managed_order_ids
+            if managed_order:
+                # The hourly batch owns cancellation/repricing and has its own
+                # configurable hard expiry (40 minutes by default).
                 continue
             if time.time() - pending.created_ts >= timeout:
                 cancelled = self.executor.cancel_order(pending.order_id)

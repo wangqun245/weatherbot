@@ -101,8 +101,8 @@
                     "source_station_check_enabled":  true,
                     "source_station_check_hour_ct":  3,
                     "source_station_check_timezone":  "America/Chicago",
-                    "depth_price_notional_multiplier":  2.0,
-                    "depth_price_extra_levels":  1,
+                    "depth_price_notional_multiplier":  1.0,
+                    "depth_price_extra_levels":  0,
                     "weather_record_pre_window_seconds":  120,
                     "weather_record_receive_window_seconds":  300,
                     "tgftp_window_max_inflight_per_station":  10
@@ -141,6 +141,7 @@
                     ,"model_awc_poll_attempts": 5
                     ,"model_awc_adjacent_yes_max_total_price": 0.9
                     ,"model_awc_adjacent_yes_shares": 10
+                    ,"model_awc_order_management_window_minutes": 40
                     ,"model_awc_interval_snap_tolerance_f": 0.15
                 },
     "scheduler":  {
@@ -295,6 +296,7 @@
                                            ,"model_awc_poll_attempts": 5
                                            ,"model_awc_adjacent_yes_max_total_price": 0.9
                                            ,"model_awc_adjacent_yes_shares": 10
+                                           ,"model_awc_order_management_window_minutes": 40
                                            ,"model_awc_interval_snap_tolerance_f": 0.15
                                        }
                        }

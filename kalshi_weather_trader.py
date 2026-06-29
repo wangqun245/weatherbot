@@ -1268,7 +1268,7 @@ def main() -> None:
             url=str(
                 config["kalshi"].get(
                     "websocket_url",
-                    "wss://external-api-ws.kalshi.com/trade-api/ws/v2",
+                    "wss://api.elections.kalshi.com/trade-api/ws/v2",
                 )
             ),
             on_message=websocket_callback,
@@ -1277,6 +1277,10 @@ def main() -> None:
                     "websocket_reconnect_seconds", 2
                 )
             ),
+            fallback_urls=[
+                str(url)
+                for url in config["kalshi"].get("websocket_fallback_urls", [])
+            ],
         )
         execution_manager = KalshiHourlyExecutionManager(
             client=client,

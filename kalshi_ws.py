@@ -25,9 +25,14 @@ class KalshiWebSocketFeed:
         url: str,
         on_message: Callable[[dict[str, Any]], None],
         reconnect_seconds: float = 2.0,
+        fallback_urls: list[str] | None = None,
     ) -> None:
         self.client = client
-        self.url = url
+        urls = [url, *(fallback_urls or [])]
+        self.urls = list(dict.fromkeys(str(item).strip() for item in urls if item))
+        if not self.urls:
+            raise ValueError("At least one Kalshi websocket URL is required")
+        self.url = self.urls[0]
         self.on_message = on_message
         self.reconnect_seconds = reconnect_seconds
         self._lock = threading.RLock()
@@ -143,6 +148,37 @@ class KalshiWebSocketFeed:
             },
         ]
 
+    def _connect(self) -> websocket.WebSocket:
+        last_error: Exception | None = None
+        for url in list(self.urls):
+            headers = self.client.websocket_auth_headers()
+            parsed_url = urlparse(url)
+            key_tail = self.client.api_key_id[-4:] if self.client.api_key_id else "none"
+            LOGGER.info(
+                "Kalshi websocket handshake url=%s key_suffix=%s content_type=%s",
+                f"{parsed_url.scheme}://{parsed_url.netloc}{parsed_url.path}",
+                key_tail,
+                headers.get("Content-Type", ""),
+            )
+            try:
+                ws = websocket.create_connection(
+                    url,
+                    header=[f"{key}: {value}" for key, value in headers.items()],
+                    timeout=5,
+                )
+            except Exception as exc:
+                last_error = exc
+                LOGGER.warning("Kalshi websocket handshake failed url=%s error=%s", url, exc)
+                continue
+            self.url = url
+            if self.urls[0] != url:
+                self.urls = [url, *[item for item in self.urls if item != url]]
+                LOGGER.info("Kalshi websocket promoted fallback url=%s", url)
+            return ws
+        if last_error is not None:
+            raise last_error
+        raise ConnectionError("Kalshi websocket connection failed without an error")
+
     def _run(self) -> None:
         while self._running:
             with self._lock:
@@ -154,20 +190,7 @@ class KalshiWebSocketFeed:
             try:
                 with self._lock:
                     self._snapshots.difference_update(tickers)
-                headers = self.client.websocket_auth_headers()
-                parsed_url = urlparse(self.url)
-                key_tail = self.client.api_key_id[-4:] if self.client.api_key_id else "none"
-                LOGGER.info(
-                    "Kalshi websocket handshake url=%s key_suffix=%s content_type=%s",
-                    f"{parsed_url.scheme}://{parsed_url.netloc}{parsed_url.path}",
-                    key_tail,
-                    headers.get("Content-Type", ""),
-                )
-                ws = websocket.create_connection(
-                    self.url,
-                    header=[f"{key}: {value}" for key, value in headers.items()],
-                    timeout=5,
-                )
+                ws = self._connect()
                 with self._lock:
                     self._ws = ws
                 for command in self._subscription_commands(tickers):

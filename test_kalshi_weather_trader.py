@@ -473,10 +473,60 @@ def test_websocket_unified_yes_scale_builds_yes_and_no_asks() -> None:
     assert feed.buy_levels("M", "NO") == [(0.6, 8.0)]
 
 
+class _WsAuthClient:
+    api_key_id = "key-dbc7"
+
+    def websocket_auth_headers(self) -> dict[str, str]:
+        return {
+            "KALSHI-ACCESS-KEY": self.api_key_id,
+            "KALSHI-ACCESS-TIMESTAMP": "123",
+            "KALSHI-ACCESS-SIGNATURE": "sig",
+            "Content-Type": "application/json",
+        }
+
+
+def test_websocket_connect_falls_back_and_promotes_url(monkeypatch) -> None:
+    calls = []
+    connected = object()
+
+    def fake_create_connection(url, header, timeout):
+        calls.append((url, header, timeout))
+        if "external-api-ws" in url:
+            raise RuntimeError("Handshake status 403 Forbidden")
+        return connected
+
+    monkeypatch.setattr(
+        "kalshi_ws.websocket.create_connection",
+        fake_create_connection,
+    )
+    feed = KalshiWebSocketFeed(
+        client=_WsAuthClient(),
+        url="wss://external-api-ws.kalshi.com/trade-api/ws/v2",
+        fallback_urls=["wss://api.elections.kalshi.com/trade-api/ws/v2"],
+        on_message=lambda _message: None,
+    )
+
+    assert feed._connect() is connected
+    assert [call[0] for call in calls] == [
+        "wss://external-api-ws.kalshi.com/trade-api/ws/v2",
+        "wss://api.elections.kalshi.com/trade-api/ws/v2",
+    ]
+    assert feed.url == "wss://api.elections.kalshi.com/trade-api/ws/v2"
+    assert feed.urls[0] == "wss://api.elections.kalshi.com/trade-api/ws/v2"
+    assert "Content-Type: application/json" in calls[1][1]
+
+
 def test_production_strategy_parameters_match_requested_policy() -> None:
     config = json.loads(Path("kalshi_weather_config.json").read_text(encoding="utf-8"))
     assert config["model"]["buy_start_hour"] == 12
     assert config["model"]["buy_end_hour"] == 16
+    assert (
+        config["kalshi"]["websocket_url"]
+        == "wss://api.elections.kalshi.com/trade-api/ws/v2"
+    )
+    assert config["kalshi"]["websocket_fallback_urls"] == [
+        "wss://external-api-ws.kalshi.com/trade-api/ws/v2"
+    ]
     assert config["observations"]["station"] == "KAUS"
     assert config["observations"]["timezone"] == "America/Chicago"
     assert config["trading"]["max_buy_price"] == 0.85

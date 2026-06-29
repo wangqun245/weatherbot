@@ -37,6 +37,7 @@ from kalshi_execution import (
     KalshiHourlyExecutionManager,
     ManagedLeg,
     depth_price,
+    executable_shares,
 )
 from kalshi_ws import KalshiWebSocketFeed
 from weather_telegram_notifier import TelegramNotifier
@@ -841,6 +842,53 @@ def contract_count_for_order(price: float, trading: dict[str, Any]) -> int:
     return max(0, min(requested, affordable))
 
 
+def partial_contract_plan_for_notional(
+    levels: list[tuple[float, float]],
+    target_notional: float,
+    trading: dict[str, Any],
+) -> dict[str, float] | None:
+    """Return the largest immediately executable contract count under budget."""
+    max_price = float(trading.get("max_buy_price", 0.85))
+    min_price = float(trading.get("min_buy_price", 0.01))
+    if target_notional < min_price:
+        return None
+    max_contracts = int(math.floor((target_notional + 1e-9) / min_price))
+    available = executable_shares(levels, max_contracts, max_price)
+    while available > 0:
+        price = depth_price(levels, available, max_price)
+        if price is not None and available * price <= target_notional + 1e-9:
+            return {
+                "contracts": float(available),
+                "price": float(price),
+                "cost": round(float(available) * float(price), 4),
+            }
+        available -= 1
+    return None
+
+
+def kalshi_fill_cost_from_response(
+    response: dict[str, Any],
+    outcome_side: str,
+    fallback_price: float,
+) -> tuple[float, float]:
+    """Return filled contracts and outcome-side cost from a Kalshi order response."""
+    filled = float(
+        response.get("fill_count")
+        or response.get("fill_count_fp")
+        or 0.0
+    )
+    if filled <= 0:
+        return 0.0, 0.0
+    raw_price = response.get("average_fill_price")
+    average_yes_scale = float(raw_price if raw_price not in (None, "") else fallback_price)
+    outcome_price = (
+        1.0 - average_yes_scale
+        if outcome_side.upper() == "NO" and raw_price not in (None, "")
+        else average_yes_scale
+    )
+    return filled, round(filled * outcome_price, 4)
+
+
 def load_state(path: Path) -> dict[str, Any]:
     if not path.exists():
         return {"completed_windows": {}}
@@ -1052,30 +1100,120 @@ def run_cycle(
                 for order in order_plan
             )
             mode = "adjacent"
-        else:
-            requested = contract_count_for_order(
-                float(order_plan[0]["price"]), trading
-            )
-            mode = "single"
-        if requested <= 0:
-            LOGGER.info(
-                "Skip managed batch: no affordable contracts plan=%s",
-                order_plan,
-            )
-            return
-        batch = execution_manager.start_batch(
-            window_key=window_key,
-            mode=mode,
-            legs=tuple(
-                ManagedLeg(
-                    ticker=str(order["market"]["ticker"]),
-                    outcome_side=str(order["side"]).upper(),
+            if requested <= 0:
+                LOGGER.info(
+                    "Skip managed batch: no affordable contracts plan=%s",
+                    order_plan,
                 )
-                for order in order_plan
-            ),
-            target_shares=requested,
-            predicted_high_f=prediction,
-        )
+                return
+            batch = execution_manager.start_batch(
+                window_key=window_key,
+                mode=mode,
+                legs=tuple(
+                    ManagedLeg(
+                        ticker=str(order["market"]["ticker"]),
+                        outcome_side=str(order["side"]).upper(),
+                    )
+                    for order in order_plan
+                ),
+                target_shares=requested,
+                predicted_high_f=prediction,
+            )
+            immediate_orders: list[dict[str, Any]] = []
+            remaining_notional = 0.0
+        else:
+            mode = "single"
+            planned = order_plan[0]
+            market = planned["market"]
+            side = str(planned["side"]).upper()
+            target_notional = float(trading.get("max_order_cost_dollars", 10.0))
+            levels = list(market.get(f"_{side.lower()}_buy_levels") or [])
+            partial = partial_contract_plan_for_notional(
+                levels, target_notional, trading
+            )
+            immediate_orders = []
+            spent_notional = 0.0
+            if partial is not None:
+                contracts = int(partial["contracts"])
+                price = float(partial["price"])
+                result = client.create_order(
+                    str(market["ticker"]),
+                    side.lower(),
+                    contracts,
+                    price,
+                    time_in_force="immediate_or_cancel",
+                    subaccount=int(config["kalshi"].get("subaccount", 0)),
+                )
+                filled, spent_notional = kalshi_fill_cost_from_response(
+                    result, side, price
+                )
+                immediate_orders.append(
+                    {
+                        "market_ticker": market["ticker"],
+                        "outcome_side": side,
+                        "outcome_price": price,
+                        "contracts": contracts,
+                        "filled_contracts": filled,
+                        "order_cost_dollars": spent_notional,
+                        "result": result,
+                    }
+                )
+                LOGGER.info(
+                    "Kalshi single interval immediate IOC before manager "
+                    "ticker=%s side=%s requested=%s filled=%s price=%.4f "
+                    "spent=%.4f target_notional=%.4f",
+                    market["ticker"],
+                    side,
+                    contracts,
+                    filled,
+                    price,
+                    spent_notional,
+                    target_notional,
+                )
+            remaining_notional = max(0.0, target_notional - spent_notional)
+            min_buy_price = float(trading.get("min_buy_price", 0.01))
+            if remaining_notional < min_buy_price:
+                record = {
+                    "created_at": datetime.now(timezone.utc).isoformat(),
+                    "window_key": window_key,
+                    "target_date": day.isoformat(),
+                    "station": config["observations"]["station"],
+                    "observation_utc": latest.valid_utc.isoformat(),
+                    "observation_local": latest_local.isoformat(),
+                    "prediction_f": prediction,
+                    "predicted_integer_f": predicted_integer,
+                    "selection_reason": selection_reason,
+                    "execution_mode": "LIVE_IMMEDIATE",
+                    "target_notional_dollars": target_notional,
+                    "orders": immediate_orders,
+                }
+                append_trade(Path(config["outputs"]["trades_jsonl"]), record)
+                state.setdefault("completed_windows", {})[window_key] = record
+                save_state(state_path, state)
+                notify_kalshi_trade(notifier, record)
+                return
+            requested = max(
+                1,
+                int(
+                    math.floor(
+                        (remaining_notional + 1e-9)
+                        / float(trading.get("min_buy_price", 0.01))
+                    )
+                ),
+            )
+            batch = execution_manager.start_batch(
+                window_key=window_key,
+                mode=mode,
+                legs=(
+                    ManagedLeg(
+                        ticker=str(market["ticker"]),
+                        outcome_side=side,
+                    ),
+                ),
+                target_shares=requested,
+                target_notional_dollars=remaining_notional,
+                predicted_high_f=prediction,
+            )
         record = {
             "created_at": datetime.now(timezone.utc).isoformat(),
             "window_key": window_key,
@@ -1089,6 +1227,8 @@ def run_cycle(
             "execution_mode": "MANAGED_WEBSOCKET",
             "batch_id": batch.batch_id,
             "target_shares_each": requested,
+            "target_notional_dollars": remaining_notional,
+            "immediate_orders": immediate_orders,
             "orders": [
                 {
                     "ticker": leg.ticker,

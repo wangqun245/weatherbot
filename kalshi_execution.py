@@ -82,6 +82,7 @@ class HourlyBatch:
     repair_order_id: str = ""
     closed: bool = False
     next_action_ts: float = 0.0
+    target_notional_dollars: float = 0.0
 
     def average_price(self, index: int) -> float:
         quantity = self.acquired[index]
@@ -163,6 +164,7 @@ class KalshiHourlyExecutionManager:
         legs: tuple[ManagedLeg, ...],
         target_shares: int,
         predicted_high_f: float,
+        target_notional_dollars: float = 0.0,
     ) -> HourlyBatch:
         if mode not in {"single", "adjacent"}:
             raise ValueError(f"Unsupported hourly mode: {mode}")
@@ -189,6 +191,7 @@ class KalshiHourlyExecutionManager:
             mode=mode,
             legs=legs,
             target_shares=int(target_shares),
+            target_notional_dollars=float(target_notional_dollars or 0.0),
             predicted_high_f=float(predicted_high_f),
             created_ts=now,
             expires_ts=now + max(1.0, minutes * 60),
@@ -207,16 +210,18 @@ class KalshiHourlyExecutionManager:
                 "mode": mode,
                 "legs": [leg.__dict__ for leg in legs],
                 "target_shares": target_shares,
+                "target_notional_dollars": target_notional_dollars,
                 "expires_ts": batch.expires_ts,
             }
         )
         LOGGER.info(
             "Kalshi hourly batch started id=%s mode=%s legs=%s target=%s "
-            "window_minutes=%s",
+            "target_notional=%.4f window_minutes=%s",
             batch.batch_id,
             mode,
             [(leg.ticker, leg.outcome_side) for leg in legs],
             target_shares,
+            float(target_notional_dollars or 0.0),
             minutes,
         )
         self._wakeup.set()
@@ -307,21 +312,25 @@ class KalshiHourlyExecutionManager:
         )
 
     def _manage_single(self, batch: HourlyBatch) -> None:
-        remaining = max(0, int(batch.target_shares - batch.acquired[0]))
-        if remaining < 1:
-            self.close_batch(batch, "target_filled")
-            return
         if self._active_order_for_leg(batch, 0) is not None:
             return
         maximum = float(self.trading.get("max_buy_price", 0.85))
+        minimum = float(self.trading.get("min_buy_price", 0.01))
         cost_budget = float(
-            self.trading.get("max_order_cost_dollars", 5.0)
+            batch.target_notional_dollars
+            if batch.target_notional_dollars > 0
+            else self.trading.get("max_order_cost_dollars", 5.0)
         )
         budget_remaining = max(0.0, cost_budget - batch.total_cost[0])
-        if budget_remaining < float(
-            self.trading.get("min_buy_price", 0.01)
-        ):
+        if budget_remaining < minimum:
             self.close_batch(batch, "cost_budget_filled")
+            return
+        if batch.target_notional_dollars > 0:
+            remaining = int(math.floor((budget_remaining + 1e-9) / minimum))
+        else:
+            remaining = max(0, int(batch.target_shares - batch.acquired[0]))
+        if remaining < 1:
+            self.close_batch(batch, "target_filled")
             return
         leg = batch.legs[0]
         levels = self.feed.buy_levels(leg.ticker, leg.outcome_side)
@@ -719,6 +728,7 @@ class KalshiHourlyExecutionManager:
                         "mode": batch.mode,
                         "legs": [leg.__dict__ for leg in batch.legs],
                         "target_shares": batch.target_shares,
+                        "target_notional_dollars": batch.target_notional_dollars,
                         "predicted_high_f": batch.predicted_high_f,
                         "created_ts": batch.created_ts,
                         "expires_ts": batch.expires_ts,
@@ -767,6 +777,9 @@ class KalshiHourlyExecutionManager:
                         for leg in row["legs"]
                     ),
                     target_shares=int(row["target_shares"]),
+                    target_notional_dollars=float(
+                        row.get("target_notional_dollars") or 0.0
+                    ),
                     predicted_high_f=float(row["predicted_high_f"]),
                     created_ts=float(row["created_ts"]),
                     expires_ts=float(row["expires_ts"]),

@@ -5,6 +5,7 @@ import json
 import time
 from datetime import date, datetime, timezone
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 from cryptography.hazmat.primitives import hashes
@@ -278,6 +279,20 @@ def test_depth_price_requires_full_one_to_one_quantity() -> None:
     assert depth_price(levels, 11, 0.85) is None
 
 
+def test_partial_contract_plan_caps_cost_at_target_notional() -> None:
+    trading = {
+        "min_buy_price": 0.01,
+        "max_buy_price": 0.85,
+    }
+    plan = trader.partial_contract_plan_for_notional(
+        [(0.08, 50), (0.12, 200)],
+        10.0,
+        trading,
+    )
+
+    assert plan == {"contracts": 83.0, "price": 0.12, "cost": 9.96}
+
+
 class _FakeFeed:
     def __init__(self, levels):
         self.levels = levels
@@ -451,6 +466,155 @@ def test_adjacent_single_leg_fill_places_balance_repair() -> None:
     assert repair["price"] == 0.55
     assert repair["time_in_force"] == "good_till_canceled"
     assert repair["expiration_time"] == int(batch.expires_ts)
+
+
+def test_single_manager_uses_remaining_notional_not_fixed_shares() -> None:
+    client = _FakeClient()
+    feed = _FakeFeed({"SINGLE": [(0.08, 200)]})
+    manager = _manager(client, feed)
+    batch = HourlyBatch(
+        batch_id="b",
+        window_key="2026-06-28:hour_12",
+        mode="single",
+        legs=(ManagedLeg("SINGLE", "YES"),),
+        target_shares=10,
+        target_notional_dollars=10.0,
+        predicted_high_f=90,
+        created_ts=time.time(),
+        expires_ts=time.time() + 2400,
+        acquired=[0],
+        total_cost=[0],
+    )
+
+    manager._manage_single(batch)
+
+    assert len(client.singles) == 1
+    order = client.singles[0]
+    assert order["ticker"] == "SINGLE"
+    assert order["count"] == 125
+    assert order["price"] == 0.08
+    assert order["time_in_force"] == "immediate_or_cancel"
+
+
+def test_run_cycle_single_interval_buys_partial_before_kalshi_manager(monkeypatch, tmp_path) -> None:
+    target_day = date(2026, 6, 29)
+    config = {
+        "kalshi": {
+            "series_ticker": "KXHIGHAUS",
+            "subaccount": 0,
+        },
+        "market": {
+            "target_date": target_day.isoformat(),
+            "expected_rules_text": "",
+        },
+        "observations": {
+            "station": "KAUS",
+            "timezone": "America/Chicago",
+        },
+        "trading": {
+            "live_enabled": True,
+            "dry_run": False,
+            "one_order_per_hour": True,
+            "default_contracts": 10,
+            "max_order_cost_dollars": 10.0,
+            "min_buy_price": 0.01,
+            "max_buy_price": 0.85,
+            "interval_snap_tolerance_f": 0.15,
+            "adjacent_yes_max_total_price": 0.90,
+            "time_in_force": "immediate_or_cancel",
+        },
+        "outputs": {
+            "state_json": str(tmp_path / "state.json"),
+            "trades_jsonl": str(tmp_path / "trades.jsonl"),
+        },
+    }
+    market = {
+        "ticker": "M98",
+        "event_ticker": "KXHIGHAUS-26JUN29",
+        "floor_strike": 98,
+        "cap_strike": 99,
+        "yes_ask_dollars": "0.08",
+        "no_ask_dollars": "0.92",
+        "rules_primary": "",
+    }
+
+    class Client:
+        def __init__(self):
+            self.orders = []
+
+        def get_open_markets(self, _series):
+            return [dict(market)]
+
+        def get_orderbook(self, _ticker, depth=100):
+            return {"yes_dollars": [], "no_dollars": [(0.92, 50)]}
+
+        def create_order(self, ticker, outcome_side, count, price, **kwargs):
+            self.orders.append(
+                {
+                    "ticker": ticker,
+                    "outcome_side": outcome_side,
+                    "count": count,
+                    "price": price,
+                    **kwargs,
+                }
+            )
+            return {
+                "order_id": "ioc-1",
+                "fill_count": str(count),
+                "remaining_count": "0.00",
+                "average_fill_price": price,
+            }
+
+    class Manager:
+        def __init__(self):
+            self.started = []
+
+        def has_window(self, _window_key):
+            return False
+
+        def start_batch(self, **kwargs):
+            self.started.append(kwargs)
+            return SimpleNamespace(
+                batch_id="batch-1",
+                legs=kwargs["legs"],
+            )
+
+    latest = trader.MetarRow(
+        daily_high_f="98.0",
+        station="KAUS",
+        valid_utc=datetime(2026, 6, 29, 18, 53, tzinfo=timezone.utc),
+        valid_text="2026-06-29T18:53:00+00:00",
+        metar="KAUS 291853Z 16010KT 10SM 37/22 A2992",
+    )
+    monkeypatch.setattr(
+        trader,
+        "build_feature_row",
+        lambda *_args, **_kwargs: (
+            {},
+            latest,
+            datetime(2026, 6, 29, 13, 53, tzinfo=timezone.utc),
+        ),
+    )
+    monkeypatch.setattr(trader, "predict", lambda *_args, **_kwargs: 98.5)
+    client = Client()
+    manager = Manager()
+
+    trader.run_cycle(
+        config,
+        client,
+        object(),
+        execution_manager=manager,
+        source_rows=[],
+    )
+
+    assert len(client.orders) == 1
+    assert client.orders[0]["ticker"] == "M98"
+    assert client.orders[0]["outcome_side"] == "yes"
+    assert client.orders[0]["count"] == 50
+    assert client.orders[0]["price"] == 0.08
+    assert len(manager.started) == 1
+    assert manager.started[0]["mode"] == "single"
+    assert manager.started[0]["target_notional_dollars"] == 6.0
 
 
 def test_websocket_unified_yes_scale_builds_yes_and_no_asks() -> None:

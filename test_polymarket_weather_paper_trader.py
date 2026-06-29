@@ -1,6 +1,7 @@
 import unittest
 import tempfile
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 import polymarket_weather_paper_trader as bot
@@ -104,6 +105,223 @@ class ClobPricingTest(unittest.TestCase):
         self.assertEqual("/prices", captured["path"])
         self.assertEqual([{"token_id": "asset-a", "side": "SELL"}, {"token_id": "asset-b", "side": "SELL"}], captured["payload"])
         self.assertEqual({"asset-a": 0.42, "asset-b": 0.53}, prices)
+
+
+class ModelAwcLiveSingleIntervalTest(unittest.TestCase):
+    def setUp(self):
+        self.config = bot.default_config()
+        self.config["trading"]["live_trading_enabled"] = True
+        self.config["trading"]["buy_notional_usdc"] = 10.0
+        self.config["outputs"]["trades_csv"] = "unused-trades.csv"
+        self.config["outputs"]["settled_trades_csv"] = "unused-settled.csv"
+        self.event = {
+            "id": "event-1",
+            "slug": "austin-high-june-29",
+            "_parsed_kind": "Highest",
+            "_parsed_event_date": "2026-06-29",
+        }
+        self.market = bot.TemperatureMarket(
+            event_id="event-1",
+            market_id="market-98-99",
+            condition_id="condition-1",
+            city="Austin",
+            kind="Highest",
+            event_date="2026-06-29",
+            event_title="Highest temperature in Austin on June 29",
+            market_question="Will the highest temperature in Austin be between 98-99F on June 29?",
+            polymarket_url="https://polymarket.com/event/austin-high-june-29",
+            yes_price=0.08,
+            rule_min=98.0,
+            rule_max=99.0,
+            unit="F",
+            raw_market_json='{"outcomes":["Yes","No"],"clobTokenIds":["yes-token","no-token"]}',
+        )
+        self.latest_utc = bot.datetime(2026, 6, 29, 18, 53, tzinfo=bot.timezone.utc)
+        self.latest_local = self.latest_utc.astimezone(bot.ZoneInfo("America/Chicago"))
+        self.latest_row = bot.FeatureMetarRow(
+            daily_high_f="98.0",
+            station="KAUS",
+            valid_utc=self.latest_utc,
+            valid_text="2026-06-29T18:53:00+00:00",
+            metar="KAUS 291853Z 16010KT 10SM 37/22 A2992",
+        )
+
+    def _run_with_fake_live_trader(self, predicted_high_f, best_price=0.08, partial_now=None):
+        fake_live_trader = SimpleNamespace(submissions=[], batches=[])
+
+        def submit_buy_trade(
+            config,
+            cycle_id,
+            market,
+            wu_source,
+            station,
+            side,
+            entry_price,
+            observed_high,
+            observed_low,
+            reason,
+            amount_usd=None,
+            shares=None,
+        ):
+            fake_live_trader.submissions.append({
+                "market_id": market.market_id,
+                "side": side,
+                "price": entry_price,
+                "amount_usd": amount_usd,
+                "shares": shares,
+                "reason": reason,
+            })
+            return SimpleNamespace(shares=125.0)
+
+        def start_model_awc_hourly_batch(*args, **kwargs):
+            fake_live_trader.batches.append((args, kwargs))
+            return "batch-1"
+
+        fake_live_trader.submit_buy_trade = submit_buy_trade
+        fake_live_trader.start_model_awc_hourly_batch = start_model_awc_hourly_batch
+
+        with mock.patch.object(bot, "get_live_trader", return_value=fake_live_trader), \
+            mock.patch.object(bot, "markets_for_event", return_value=[self.market]), \
+            mock.patch.object(bot, "read_trades", return_value=[]), \
+            mock.patch.object(bot, "write_csv"), \
+            mock.patch.object(bot, "write_performance_reports"), \
+            mock.patch.object(bot, "partial_buy_fillable_now", return_value=partial_now), \
+            mock.patch.object(bot, "best_buy_price", return_value=best_price):
+            trade = bot.process_model_awc_prediction(
+                self.config,
+                self.event,
+                "Austin",
+                "KAUS",
+                predicted_high_f,
+                self.latest_row,
+                self.latest_local,
+            )
+
+        return fake_live_trader, trade
+
+    def test_live_single_interval_buys_configured_notional_directly(self):
+        fake_live_trader, trade = self._run_with_fake_live_trader(98.51)
+
+        self.assertIsNotNone(trade)
+        self.assertEqual([], fake_live_trader.batches)
+        self.assertEqual(1, len(fake_live_trader.submissions))
+        submission = fake_live_trader.submissions[0]
+        self.assertEqual("market-98-99", submission["market_id"])
+        self.assertEqual("YES", submission["side"])
+        self.assertEqual(0.08, submission["price"])
+        self.assertIsNone(submission["amount_usd"])
+        self.assertIsNone(submission["shares"])
+
+    def test_live_boundary_snap_single_interval_buys_notional_directly(self):
+        fake_live_trader, trade = self._run_with_fake_live_trader(97.98)
+
+        self.assertIsNotNone(trade)
+        self.assertEqual([], fake_live_trader.batches)
+        self.assertEqual(1, len(fake_live_trader.submissions))
+        submission = fake_live_trader.submissions[0]
+        self.assertEqual("market-98-99", submission["market_id"])
+        self.assertEqual("YES", submission["side"])
+        self.assertIsNone(submission["amount_usd"])
+        self.assertIsNone(submission["shares"])
+        self.assertIn("boundary_snap_yes_market-98-99", submission["reason"])
+
+    def test_live_single_interval_insufficient_depth_starts_notional_manager(self):
+        fake_live_trader, trade = self._run_with_fake_live_trader(98.51, best_price=None)
+
+        self.assertIsNone(trade)
+        self.assertEqual([], fake_live_trader.submissions)
+        self.assertEqual(1, len(fake_live_trader.batches))
+        args, kwargs = fake_live_trader.batches[0]
+        self.assertEqual("Austin", args[0])
+        self.assertEqual("KAUS", args[1])
+        self.assertEqual((self.market,), args[4])
+        self.assertEqual(("YES",), args[5])
+        self.assertEqual(0.0, args[6])
+        self.assertEqual("single", args[8])
+        self.assertEqual(10.0, kwargs["target_notional_usd"])
+
+    def test_live_single_interval_buys_partial_before_notional_manager(self):
+        fake_live_trader, trade = self._run_with_fake_live_trader(
+            98.51,
+            best_price=None,
+            partial_now={"price": 0.08, "shares": 50.0, "amount_usd": 4.0},
+        )
+
+        self.assertIsNotNone(trade)
+        self.assertEqual(1, len(fake_live_trader.submissions))
+        submission = fake_live_trader.submissions[0]
+        self.assertEqual("market-98-99", submission["market_id"])
+        self.assertEqual("YES", submission["side"])
+        self.assertEqual(0.08, submission["price"])
+        self.assertEqual(4.0, submission["amount_usd"])
+        self.assertEqual(50.0, submission["shares"])
+        self.assertEqual(1, len(fake_live_trader.batches))
+        _args, kwargs = fake_live_trader.batches[0]
+        self.assertEqual(6.0, kwargs["target_notional_usd"])
+
+    def test_live_single_manager_buys_websocket_offer_by_notional(self):
+        manager = bot.LiveTradingManager(self.config)
+        manager.market_feed = SimpleNamespace(
+            get_price=lambda token: SimpleNamespace(best_ask=0.08, ask_size=200.0)
+        )
+        submissions = []
+
+        def submit_buy_trade(
+            config,
+            cycle_id,
+            market,
+            wu_source,
+            station,
+            side,
+            entry_price,
+            observed_high,
+            observed_low,
+            reason,
+            amount_usd=None,
+            shares=None,
+        ):
+            submissions.append({
+                "price": entry_price,
+                "amount_usd": amount_usd,
+                "shares": shares,
+                "reason": reason,
+            })
+            return SimpleNamespace(live_buy_order_id="order-1")
+
+        manager.submit_buy_trade = submit_buy_trade
+        batch = bot.ModelAwcHourlyBatch(
+            batch_id="Austin:KAUS:2026-06-29:hour_13:single",
+            city="Austin",
+            station="KAUS",
+            event_date="2026-06-29",
+            local_hour=13,
+            mode="single",
+            markets=(self.market,),
+            sides=("YES",),
+            token_ids=("yes-token",),
+            target_shares=0.0,
+            target_notional_usd=10.0,
+            predicted_high_f=98.51,
+            cycle_id="cycle-1",
+            reason="model_awc_managed_single_hour_13",
+            baseline_balances={"yes-token": 0.0},
+            acquired_shares={"yes-token": 0.0},
+            acquired_cost_usd={"yes-token": 0.0},
+            average_prices={"yes-token": 0.0},
+            open_order_ids={},
+            expires_ts=bot.time.time() + 60,
+        )
+
+        with mock.patch.object(bot, "read_trades", return_value=[]), \
+            mock.patch.object(bot, "write_csv"), \
+            mock.patch.object(bot, "write_performance_reports"):
+            manager._manage_single_hourly_batch(batch)
+
+        self.assertEqual(1, len(submissions))
+        self.assertEqual(0.08, submissions[0]["price"])
+        self.assertEqual(10.0, submissions[0]["amount_usd"])
+        self.assertEqual(125.0, submissions[0]["shares"])
+        self.assertEqual({"yes-token": "order-1"}, batch.open_order_ids)
 
 
 class MetarMomentumTest(unittest.TestCase):

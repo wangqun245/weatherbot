@@ -34,15 +34,16 @@
     "tgftp_poll_timeout_seconds": 300
   },
   "model": {
-    "path": "kalshi/models/rolling_6y_holdout_lag10_two_asos_context/lightgbm_metar_high_rolling_6y_best.pkl",
+    "path": "kalshi/models/rolling_6y_holdout_lag10_speci_two_asos_16stations_20260628/lightgbm_metar_high_rolling_6y_best.pkl",
     "buy_start_hour": 12,
     "buy_end_hour": 16
   },
   "trading": {
     "live_enabled": true,
     "dry_run": false,
+    "live_stations": ["KAUS", "KLAS", "KMIA"],
     "default_contracts": 10,
-    "max_order_cost_dollars": 5.00,
+    "max_order_cost_dollars": 10.00,
     "min_buy_price": 0.01,
     "max_buy_price": 0.85,
     "interval_snap_tolerance_f": 0.15,
@@ -56,6 +57,24 @@
     "poll_seconds": 60,
     "observation_loop_sleep_seconds": 0.5
   },
+  "cities": [
+    {"city": "Atlanta", "station": "KATL", "timezone": "America/New_York", "regular_observation_minute": 52, "series_ticker": "KXHIGHTATL"},
+    {"city": "Austin", "station": "KAUS", "timezone": "America/Chicago", "regular_observation_minute": 53, "series_ticker": "KXHIGHAUS", "expected_rules_text": "Austin Bergstrom"},
+    {"city": "Boston", "station": "KBOS", "timezone": "America/New_York", "regular_observation_minute": 54, "series_ticker": "KXHIGHTBOS"},
+    {"city": "Washington DC", "station": "KDCA", "timezone": "America/New_York", "regular_observation_minute": 52, "series_ticker": "KXHIGHTDC"},
+    {"city": "Dallas", "station": "KDFW", "timezone": "America/Chicago", "regular_observation_minute": 53, "series_ticker": "KXHIGHTDAL"},
+    {"city": "Las Vegas", "station": "KLAS", "timezone": "America/Los_Angeles", "regular_observation_minute": 56, "series_ticker": "KXHIGHTLV", "expected_rules_text": "Las Vegas"},
+    {"city": "Chicago", "station": "KMDW", "timezone": "America/Chicago", "regular_observation_minute": 51, "series_ticker": "KXHIGHCHI"},
+    {"city": "Miami", "station": "KMIA", "timezone": "America/New_York", "regular_observation_minute": 53, "series_ticker": "KXHIGHMIA", "expected_rules_text": "Miami"},
+    {"city": "Minneapolis", "station": "KMSP", "timezone": "America/Chicago", "regular_observation_minute": 53, "series_ticker": "KXHIGHTMIN"},
+    {"city": "NYC", "station": "KNYC", "timezone": "America/New_York", "regular_observation_minute": 51, "series_ticker": "KXHIGHNY"},
+    {"city": "Oklahoma City", "station": "KOKC", "timezone": "America/Chicago", "regular_observation_minute": 52, "series_ticker": "KXHIGHTOKC"},
+    {"city": "Philadelphia", "station": "KPHL", "timezone": "America/New_York", "regular_observation_minute": 54, "series_ticker": "KXHIGHPHIL"},
+    {"city": "Phoenix", "station": "KPHX", "timezone": "America/Phoenix", "regular_observation_minute": 51, "series_ticker": "KXHIGHTPHX"},
+    {"city": "San Antonio", "station": "KSAT", "timezone": "America/Chicago", "regular_observation_minute": 51, "series_ticker": "KXHIGHTSATX"},
+    {"city": "Seattle", "station": "KSEA", "timezone": "America/Los_Angeles", "regular_observation_minute": 53, "series_ticker": "KXHIGHTSEA"},
+    {"city": "San Francisco", "station": "KSFO", "timezone": "America/Los_Angeles", "regular_observation_minute": 56, "series_ticker": "KXHIGHTSFO"}
+  ],
   "outputs": {
     "state_json": "kalshi/runtime/state.json",
     "trades_jsonl": "kalshi/runtime/trades.jsonl",

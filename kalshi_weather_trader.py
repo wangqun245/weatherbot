@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import argparse
 import atexit
+import concurrent.futures
+import copy
 import json
 import logging
 import math
@@ -22,6 +24,7 @@ from dotenv import load_dotenv
 
 from featurize_metar_history import MetarRow, decode_metar, nearest_lag_value
 from kalshi.featurize_katt import parse_six_hour_extrema
+from kalshi.featurize_all_stations import STATION_IDS
 from kalshi_client import KalshiClient
 from kalshi_execution import (
     KalshiHourlyExecutionManager,
@@ -29,6 +32,7 @@ from kalshi_execution import (
     depth_price,
 )
 from kalshi_ws import KalshiWebSocketFeed
+from weather_telegram_notifier import TelegramNotifier
 
 
 DEFAULT_CONFIG = "kalshi_weather_config.json"
@@ -500,7 +504,9 @@ def build_feature_row(
         decode_metar(row, station, local_timezone) for row in rows
     ]
     features = decode_metar(latest, station, local_timezone)
-    features["station_id"] = 1
+    if station not in STATION_IDS:
+        raise ValueError(f"Station {station} is not present in the 16-station model")
+    features["station_id"] = STATION_IDS[station]
     features["local_week_of_year"] = float(latest_local.isocalendar().week)
     valid_times = [row.valid_utc for row in rows]
     temp_values = [decoded.get("temp_f") for decoded in decoded_rows]
@@ -848,6 +854,64 @@ def configured_timezone(config: dict[str, Any]) -> Any:
     return ZoneInfo(value)
 
 
+def configured_city_configs(config: dict[str, Any]) -> list[dict[str, Any]]:
+    """Expand the shared configuration into one isolated config per station."""
+    cities = config.get("cities")
+    if not isinstance(cities, list) or not cities:
+        return [config]
+    live_stations = {
+        str(value).upper()
+        for value in config.get("trading", {}).get("live_stations", [])
+    }
+    expanded = []
+    for city in cities:
+        if not isinstance(city, dict) or not city.get("station"):
+            continue
+        item = copy.deepcopy(config)
+        item["city"] = dict(city)
+        item["observations"].update(
+            {
+                "station": str(city["station"]).upper(),
+                "timezone": city["timezone"],
+                "regular_observation_minute": int(
+                    city["regular_observation_minute"]
+                ),
+            }
+        )
+        item["kalshi"]["series_ticker"] = city["series_ticker"]
+        item["market"]["expected_rules_text"] = str(
+            city.get("expected_rules_text") or ""
+        )
+        station = item["observations"]["station"]
+        is_live = station in live_stations
+        item["trading"]["live_enabled"] = is_live
+        item["trading"]["dry_run"] = not is_live
+        expanded.append(item)
+    return expanded
+
+
+def notify_kalshi_trade(
+    notifier: TelegramNotifier | None, record: dict[str, Any]
+) -> None:
+    """Send a platform-labelled Telegram notification for a Kalshi decision."""
+    if notifier is None:
+        return
+    mode = "PAPER" if record.get("dry_run") else "LIVE"
+    orders = record.get("orders") or []
+    order_text = ", ".join(
+        f"{order.get('outcome_side') or order.get('side')} "
+        f"{order.get('contracts') or record.get('target_shares_each', '')}x "
+        f"{order.get('market_ticker') or order.get('ticker', '')}"
+        for order in orders
+    )
+    notifier.send(
+        f"*Kalshi {mode} TRADE*\n"
+        f"Station: *{record.get('station', '')}*\n"
+        f"Prediction: *{float(record.get('prediction_f', 0.0)):.3f}F*\n"
+        f"Orders: {order_text or record.get('selection_reason', '')}"
+    )
+
+
 def target_date(config: dict[str, Any]) -> date:
     configured = str(config["market"].get("target_date", "today"))
     if configured.lower() == "today":
@@ -882,6 +946,7 @@ def run_cycle(
     model: Any,
     execution_manager: KalshiHourlyExecutionManager | None = None,
     source_rows: list[dict[str, Any]] | None = None,
+    notifier: TelegramNotifier | None = None,
 ) -> None:
     day = target_date(config)
     markets = [
@@ -944,7 +1009,8 @@ def run_cycle(
         return
     state_path = Path(config["outputs"]["state_json"])
     state = load_state(state_path)
-    window_key = f"{day}:hour_{latest_local.hour:02d}"
+    station = str(config["observations"]["station"]).upper()
+    window_key = f"{station}:{day}:hour_{latest_local.hour:02d}"
     if trading.get("one_order_per_hour", True) and (
         window_key in state.get("completed_windows", {})
         or (
@@ -1013,6 +1079,7 @@ def run_cycle(
         append_trade(Path(config["outputs"]["trades_jsonl"]), record)
         state.setdefault("completed_windows", {})[window_key] = record
         save_state(state_path, state)
+        notify_kalshi_trade(notifier, record)
         return
 
     max_buy_price = float(trading.get("max_buy_price", 0.85))
@@ -1105,6 +1172,7 @@ def run_cycle(
     append_trade(Path(config["outputs"]["trades_jsonl"]), record)
     state.setdefault("completed_windows", {})[window_key] = record
     save_state(state_path, state)
+    notify_kalshi_trade(notifier, record)
     LOGGER.info("Order recorded window=%s dry_run=%s", window_key, dry_run)
 
 
@@ -1118,24 +1186,33 @@ def main() -> None:
     setup_logging(config)
     client = make_client(config)
     model = joblib.load(config["model"]["path"])
+    city_configs = configured_city_configs(config)
+    notifier = TelegramNotifier()
     LOGGER.info(
-        "Loaded model=%s features=%d station=%s",
+        "Loaded model=%s features=%d stations=%s live_stations=%s",
         config["model"]["path"],
         len(model.feature_name_),
-        config["observations"]["station"],
+        [item["observations"]["station"] for item in city_configs],
+        config["trading"].get("live_stations", []),
     )
-    live = bool(config["trading"].get("live_enabled", False)) and not bool(
-        config["trading"].get("dry_run", True)
+    live = any(
+        bool(item["trading"].get("live_enabled", False))
+        and not bool(item["trading"].get("dry_run", True))
+        for item in city_configs
     )
     if live:
         balance = client.validate_credentials()
         LOGGER.info("Kalshi production credentials validated balance=%s", balance)
-    verify_series(config, client)
+    for item in city_configs:
+        verify_series(item, client)
     if args.command == "status":
         LOGGER.info(
             "Open markets=%d target_date=%s",
-            len(client.get_open_markets(config["kalshi"]["series_ticker"])),
-            target_date(config),
+            sum(
+                len(client.get_open_markets(item["kalshi"]["series_ticker"]))
+                for item in city_configs
+            ),
+            target_date(city_configs[0]),
         )
         if os.getenv(config["kalshi"]["api_key_id_env"]):
             LOGGER.info("Balance=%s", client.get_balance())
@@ -1197,25 +1274,54 @@ def main() -> None:
         execution_manager.start()
         atexit.register(execution_manager.stop)
     if args.command == "once":
-        run_cycle(config, client, model, execution_manager)
+        for item in city_configs:
+            run_cycle(
+                item,
+                client,
+                model,
+                execution_manager,
+                notifier=notifier,
+            )
         while (
             execution_manager is not None
             and execution_manager.active_batch_count() > 0
         ):
             time.sleep(1)
         return
-    metar_coordinator = KalshiMetarCoordinator(config)
+    coordinators = {
+        item["observations"]["station"]: KalshiMetarCoordinator(item)
+        for item in city_configs
+    }
+    configs_by_station = {
+        item["observations"]["station"]: item for item in city_configs
+    }
+    metar_executor = concurrent.futures.ThreadPoolExecutor(
+        max_workers=len(coordinators),
+        thread_name_prefix="kalshi-metar",
+    )
+    metar_futures: dict[str, concurrent.futures.Future[Any]] = {}
     while True:
         try:
-            source_rows = metar_coordinator.poll()
-            if source_rows is not None:
-                run_cycle(
-                    config,
-                    client,
-                    model,
-                    execution_manager,
-                    source_rows=source_rows,
-                )
+            for station, coordinator in coordinators.items():
+                future = metar_futures.get(station)
+                if future is None:
+                    metar_futures[station] = metar_executor.submit(
+                        coordinator.poll
+                    )
+                    continue
+                if not future.done():
+                    continue
+                metar_futures.pop(station, None)
+                source_rows = future.result()
+                if source_rows is not None:
+                    run_cycle(
+                        configs_by_station[station],
+                        client,
+                        model,
+                        execution_manager,
+                        source_rows=source_rows,
+                        notifier=notifier,
+                    )
         except Exception:
             LOGGER.exception("Kalshi trading cycle failed")
         time.sleep(

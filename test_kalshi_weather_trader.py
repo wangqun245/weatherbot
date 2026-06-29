@@ -382,7 +382,8 @@ def test_production_strategy_parameters_match_requested_policy() -> None:
     assert config["trading"]["interval_snap_tolerance_f"] == 0.15
     assert config["trading"]["adjacent_yes_max_total_price"] == 0.90
     assert config["trading"]["default_contracts"] == 10
-    assert config["trading"]["max_order_cost_dollars"] == 5.00
+    assert config["trading"]["max_order_cost_dollars"] == 10.00
+    assert config["trading"]["live_stations"] == ["KAUS", "KLAS", "KMIA"]
     assert config["trading"]["order_management_window_minutes"] == 40
     assert config["observations"]["awc_prefetch_hours"] == 11
     assert config["observations"]["awc_fallback_hours"] == 11
@@ -391,6 +392,41 @@ def test_production_strategy_parameters_match_requested_policy() -> None:
     assert config["observations"]["tgftp_start_delay_seconds"] == 60
     assert config["observations"]["tgftp_poll_interval_seconds"] == 2
     assert config["observations"]["tgftp_poll_timeout_seconds"] == 300
+
+
+def test_city_configs_only_enable_three_live_stations() -> None:
+    config = json.loads(Path("kalshi_weather_config.json").read_text(encoding="utf-8"))
+    city_configs = trader.configured_city_configs(config)
+
+    assert len(city_configs) == 16
+    live = {
+        item["observations"]["station"]
+        for item in city_configs
+        if item["trading"]["live_enabled"]
+        and not item["trading"]["dry_run"]
+    }
+    assert live == {"KAUS", "KLAS", "KMIA"}
+    assert all(
+        item["trading"]["dry_run"]
+        for item in city_configs
+        if item["observations"]["station"] not in live
+    )
+
+
+def test_kalshi_telegram_title_has_platform_prefix() -> None:
+    notifier = mock.Mock()
+    trader.notify_kalshi_trade(
+        notifier,
+        {
+            "dry_run": False,
+            "station": "KMIA",
+            "prediction_f": 90.25,
+            "orders": [{"outcome_side": "YES", "contracts": 10, "market_ticker": "M"}],
+        },
+    )
+
+    message = notifier.send.call_args.args[0]
+    assert message.startswith("*Kalshi LIVE TRADE*")
 
 
 def test_tgftp_request_is_no_cache_and_parses_latest_metar() -> None:

@@ -1,16 +1,21 @@
 [Unit]
-Description=Kalshi Austin weather trader
+Description=Kalshi multi-city weather trader
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=simple
-User=weatherbot
+User=ubuntu
 WorkingDirectory=/opt/weatherbot
 EnvironmentFile=/opt/weatherbot/.env
+Environment=PYTHONUNBUFFERED=1
 ExecStart=/opt/weatherbot/.venv/bin/python /opt/weatherbot/kalshi_weather_trader.py run --config /opt/weatherbot/kalshi_weather_config.json
-Restart=on-failure
+Restart=always
 RestartSec=10
+TimeoutStopSec=30
+# SIGINT lets Python unwind and run the registered execution-manager cleanup.
+KillSignal=SIGINT
+UMask=0077
 NoNewPrivileges=true
 PrivateTmp=true
 

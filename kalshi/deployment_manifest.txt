@@ -4,9 +4,12 @@ kalshi_execution.py
 kalshi_ws.py
 kalshi_weather_config.json
 featurize_metar_history.py
+weather_telegram_notifier.py
 kalshi/__init__.py
 kalshi/featurize_katt.py
-kalshi/models/rolling_6y_holdout_lag10_two_asos_context/lightgbm_metar_high_rolling_6y_best.pkl
+kalshi/featurize_all_stations.py
+kalshi/models/rolling_6y_holdout_lag10_speci_two_asos_16stations_20260628/lightgbm_metar_high_rolling_6y_best.pkl
 requirements-kalshi.txt
 kalshi.env.example
 kalshi/kalshi-weather.service.example
+kalshi/DEPLOYMENT.md

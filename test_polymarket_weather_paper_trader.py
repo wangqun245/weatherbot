@@ -279,12 +279,14 @@ class ModelAwcLiveSingleIntervalTest(unittest.TestCase):
             reason,
             amount_usd=None,
             shares=None,
+            notify_submitted=True,
         ):
             submissions.append({
                 "price": entry_price,
                 "amount_usd": amount_usd,
                 "shares": shares,
                 "reason": reason,
+                "notify_submitted": notify_submitted,
             })
             return SimpleNamespace(live_buy_order_id="order-1")
 
@@ -321,6 +323,7 @@ class ModelAwcLiveSingleIntervalTest(unittest.TestCase):
         self.assertEqual(0.08, submissions[0]["price"])
         self.assertEqual(10.0, submissions[0]["amount_usd"])
         self.assertEqual(125.0, submissions[0]["shares"])
+        self.assertFalse(submissions[0]["notify_submitted"])
         self.assertEqual({"yes-token": "order-1"}, batch.open_order_ids)
 
 

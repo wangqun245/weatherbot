@@ -4104,6 +4104,7 @@ class LiveTradingManager:
         reason: str,
         amount_usd: Optional[float] = None,
         shares: Optional[float] = None,
+        notify_submitted: bool = True,
     ) -> Optional[PaperTrade]:
         """Post a live buy order and return a BUY_PENDING trade row when accepted by the CLOB.
         
@@ -4205,7 +4206,8 @@ class LiveTradingManager:
             )
         )
         LOGGER.info("live buy pending trade=%s order=%s side=%s market=%s price=%s shares=%s neg_risk=%s", trade.trade_id, trade.live_buy_order_id, side, market.market_id, trade.yes_price, trade.shares, neg_risk)
-        notify_trade(config, trade, "BUY", "SUBMITTED", reason)
+        if notify_submitted:
+            notify_trade(config, trade, "BUY", "SUBMITTED", reason)
         return trade
 
     def start_model_awc_hourly_batch(
@@ -4472,6 +4474,7 @@ class LiveTradingManager:
             reason,
             amount_usd=round(order_shares * float(price), 2),
             shares=order_shares,
+            notify_submitted=False,
         )
         if trade is None:
             return None

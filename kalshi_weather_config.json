@@ -18,11 +18,20 @@
     "station": "KAUS",
     "timezone": "America/Chicago",
     "aviation_weather_url": "https://aviationweather.gov/api/data/metar",
-    "lookback_hours": 14,
+    "lookback_hours": 11,
     "regular_observation_minute": 53,
     "lag_tolerance_minutes": 30,
     "poll_delay_seconds": 180,
-    "poll_interval_seconds": 60
+    "poll_interval_seconds": 60,
+    "awc_prefetch_hours": 11,
+    "awc_fallback_hours": 11,
+    "awc_max_attempts": 3,
+    "awc_retry_interval_seconds": 3,
+    "tgftp_station_url": "https://tgftp.nws.noaa.gov/data/observations/metar/stations/{station}.TXT",
+    "tgftp_start_delay_seconds": 60,
+    "tgftp_poll_interval_seconds": 2,
+    "tgftp_request_timeout_seconds": 2,
+    "tgftp_poll_timeout_seconds": 300
   },
   "model": {
     "path": "kalshi/models/rolling_6y_holdout_lag10_two_asos_context/lightgbm_metar_high_rolling_6y_best.pkl",
@@ -44,7 +53,8 @@
   },
   "scheduler": {
     "run_once": false,
-    "poll_seconds": 60
+    "poll_seconds": 60,
+    "observation_loop_sleep_seconds": 0.5
   },
   "outputs": {
     "state_json": "kalshi/runtime/state.json",

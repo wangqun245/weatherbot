@@ -76,13 +76,17 @@ def parse_obs_time(value: Any) -> datetime | None:
     return parsed.replace(tzinfo=parsed.tzinfo or timezone.utc).astimezone(timezone.utc)
 
 
-def fetch_metars(config: dict[str, Any]) -> list[dict[str, Any]]:
+def fetch_metars(
+    config: dict[str, Any], hours: int | None = None
+) -> list[dict[str, Any]]:
     observations = config["observations"]
     response = requests.get(
         observations["aviation_weather_url"],
         params={
             "ids": observations["station"],
-            "hours": int(observations["lookback_hours"]),
+            "hours": int(
+                observations["lookback_hours"] if hours is None else hours
+            ),
             "format": "json",
         },
         headers={"User-Agent": "weatherbot-kalshi/1.0"},
@@ -91,6 +95,276 @@ def fetch_metars(config: dict[str, Any]) -> list[dict[str, Any]]:
     response.raise_for_status()
     payload = response.json()
     return payload if isinstance(payload, list) else []
+
+
+def fetch_metars_with_retry(
+    config: dict[str, Any], hours: int, reason: str
+) -> list[dict[str, Any]]:
+    """Fetch AWC history at most three times using the configured retry delay."""
+    observations = config["observations"]
+    attempts = max(1, int(observations.get("awc_max_attempts", 3)))
+    interval = max(
+        0.0, float(observations.get("awc_retry_interval_seconds", 3))
+    )
+    for attempt in range(1, attempts + 1):
+        try:
+            rows = fetch_metars(config, hours)
+            if rows:
+                LOGGER.info(
+                    "AWC METAR history ready station=%s hours=%s reason=%s rows=%s attempt=%s/%s",
+                    observations["station"],
+                    hours,
+                    reason,
+                    len(rows),
+                    attempt,
+                    attempts,
+                )
+                return rows
+            LOGGER.warning(
+                "AWC METAR history empty station=%s hours=%s reason=%s attempt=%s/%s",
+                observations["station"],
+                hours,
+                reason,
+                attempt,
+                attempts,
+            )
+        except Exception as exc:
+            LOGGER.warning(
+                "AWC METAR history failed station=%s hours=%s reason=%s attempt=%s/%s error=%s",
+                observations["station"],
+                hours,
+                reason,
+                attempt,
+                attempts,
+                exc,
+            )
+        if attempt < attempts and interval:
+            time.sleep(interval)
+    return []
+
+
+def parse_tgftp_metar(text: str) -> dict[str, Any] | None:
+    """Parse the timestamp and raw METAR from a TGFTP station TXT response."""
+    lines = [line.strip() for line in str(text or "").splitlines() if line.strip()]
+    if len(lines) < 2:
+        return None
+    try:
+        obs_dt = datetime.strptime(lines[0], "%Y/%m/%d %H:%M").replace(
+            tzinfo=timezone.utc
+        )
+    except ValueError:
+        return None
+    return {"obs_dt": obs_dt, "raw_ob": lines[1]}
+
+
+def fetch_tgftp_metar(config: dict[str, Any]) -> dict[str, Any] | None:
+    """Fetch the latest station METAR while bypassing intermediary caches."""
+    observations = config["observations"]
+    station = str(observations["station"]).upper()
+    base_url = str(
+        observations.get(
+            "tgftp_station_url",
+            "https://tgftp.nws.noaa.gov/data/observations/metar/stations/{station}.TXT",
+        )
+    ).format(station=station)
+    separator = "&" if "?" in base_url else "?"
+    response = requests.get(
+        f"{base_url}{separator}nocache={int(time.time() * 1000)}",
+        headers={
+            "User-Agent": "weatherbot-kalshi/1.0",
+            "Cache-Control": "no-cache, no-store, max-age=0",
+            "Pragma": "no-cache",
+        },
+        timeout=max(
+            0.5,
+            float(observations.get("tgftp_request_timeout_seconds", 2)),
+        ),
+    )
+    response.raise_for_status()
+    return parse_tgftp_metar(response.text)
+
+
+def merge_tgftp_metar(
+    awc_rows: list[dict[str, Any]], observation: dict[str, Any]
+) -> list[dict[str, Any]]:
+    """Merge TGFTP's newest report into AWC history without duplicate timestamps."""
+    obs_dt = observation.get("obs_dt")
+    raw_ob = str(observation.get("raw_ob") or "").strip()
+    merged = []
+    for row in awc_rows:
+        row_dt = parse_obs_time(
+            row.get("obsTime")
+            or row.get("reportTime")
+            or row.get("receiptTime")
+        )
+        row_raw = str(
+            row.get("rawOb") or row.get("raw") or row.get("metar") or ""
+        ).strip()
+        if row_dt == obs_dt or (raw_ob and row_raw == raw_ob):
+            continue
+        merged.append(row)
+    merged.append(
+        {
+            "obsTime": (
+                obs_dt.isoformat() if isinstance(obs_dt, datetime) else obs_dt
+            ),
+            "rawOb": raw_ob,
+            "_source": "tgftp",
+        }
+    )
+    return merged
+
+
+class KalshiMetarCoordinator:
+    """Prefetch AWC context, then poll only TGFTP until the hourly report arrives."""
+
+    def __init__(self, config: dict[str, Any]) -> None:
+        self.config = config
+        self.windows: dict[str, dict[str, Any]] = {}
+
+    def poll(self) -> list[dict[str, Any]] | None:
+        observations = self.config["observations"]
+        model = self.config["model"]
+        local_timezone = configured_timezone(self.config)
+        now_utc = datetime.now(timezone.utc)
+        now_local = now_utc.astimezone(local_timezone)
+        hour = now_local.hour
+        if not (
+            int(model["buy_start_hour"])
+            <= hour
+            <= int(model["buy_end_hour"])
+        ):
+            return None
+
+        minute = int(observations["regular_observation_minute"])
+        expected_local = now_local.replace(
+            hour=hour, minute=minute, second=0, microsecond=0
+        )
+        expected_utc = expected_local.astimezone(timezone.utc)
+        if now_utc < expected_utc:
+            return None
+
+        start_delay = max(
+            0.0, float(observations.get("tgftp_start_delay_seconds", 60))
+        )
+        tgftp_start = expected_utc + timedelta(seconds=start_delay)
+        timeout = max(
+            1.0, float(observations.get("tgftp_poll_timeout_seconds", 300))
+        )
+        deadline = tgftp_start + timedelta(seconds=timeout)
+        window_key = f"{now_local.date()}:hour_{hour:02d}"
+        state = self.windows.get(window_key)
+        if state is None:
+            if now_utc > deadline:
+                return None
+            history_hours = max(
+                1, int(observations.get("awc_prefetch_hours", 11))
+            )
+            state = {
+                "awc_rows": fetch_metars_with_retry(
+                    self.config,
+                    history_hours,
+                    "tgftp_prefetch",
+                ),
+                "next_tgftp_at": 0.0,
+                "ready_rows": None,
+                "next_delivery_at": 0.0,
+                "fallback_done": False,
+                "tgftp_attempts": 0,
+            }
+            self.windows[window_key] = state
+            LOGGER.info(
+                "METAR window initialized station=%s window=%s expected=%s tgftp_start=%s awc_rows=%s",
+                observations["station"],
+                window_key,
+                expected_utc.isoformat(),
+                tgftp_start.isoformat(),
+                len(state["awc_rows"]),
+            )
+
+        now_mono = time.monotonic()
+        ready_rows = state.get("ready_rows")
+        if ready_rows is not None:
+            if now_mono >= float(state.get("next_delivery_at", 0.0)):
+                state["next_delivery_at"] = now_mono + max(
+                    10.0,
+                    float(
+                        self.config["scheduler"].get("poll_seconds", 60)
+                    ),
+                )
+                return list(ready_rows)
+            return None
+
+        if now_utc < tgftp_start:
+            return None
+        if now_utc <= deadline:
+            if now_mono < float(state.get("next_tgftp_at", 0.0)):
+                return None
+            interval = max(
+                0.5,
+                float(observations.get("tgftp_poll_interval_seconds", 2)),
+            )
+            state["next_tgftp_at"] = now_mono + interval
+            state["tgftp_attempts"] = int(state.get("tgftp_attempts", 0)) + 1
+            try:
+                observation = fetch_tgftp_metar(self.config)
+            except Exception as exc:
+                if state["tgftp_attempts"] == 1 or state["tgftp_attempts"] % 15 == 0:
+                    LOGGER.warning(
+                        "TGFTP METAR poll failed station=%s window=%s attempt=%s error=%s",
+                        observations["station"],
+                        window_key,
+                        state["tgftp_attempts"],
+                        exc,
+                    )
+                return None
+            obs_dt = observation.get("obs_dt") if observation else None
+            if not isinstance(obs_dt, datetime):
+                return None
+            obs_local = obs_dt.astimezone(local_timezone)
+            if (
+                obs_dt < expected_utc - timedelta(minutes=10)
+                or obs_local.date() != now_local.date()
+                or obs_local.hour != hour
+                or obs_dt.minute != minute
+            ):
+                return None
+            combined = merge_tgftp_metar(
+                list(state.get("awc_rows") or []), observation
+            )
+            state["ready_rows"] = combined
+            state["next_delivery_at"] = now_mono + max(
+                10.0,
+                float(self.config["scheduler"].get("poll_seconds", 60)),
+            )
+            LOGGER.info(
+                "TGFTP METAR accepted station=%s window=%s observation=%s combined_rows=%s raw=%r",
+                observations["station"],
+                window_key,
+                obs_dt.isoformat(),
+                len(combined),
+                observation.get("raw_ob"),
+            )
+            return combined
+
+        if not state.get("fallback_done"):
+            state["fallback_done"] = True
+            fallback_hours = max(
+                1, int(observations.get("awc_fallback_hours", 11))
+            )
+            rows = fetch_metars_with_retry(
+                self.config,
+                fallback_hours,
+                "tgftp_timeout_fallback",
+            )
+            if rows:
+                state["ready_rows"] = rows
+                state["next_delivery_at"] = now_mono + max(
+                    10.0,
+                    float(self.config["scheduler"].get("poll_seconds", 60)),
+                )
+                return rows
+        return None
 
 
 def parse_metar_rows(
@@ -607,6 +881,7 @@ def run_cycle(
     client: KalshiClient,
     model: Any,
     execution_manager: KalshiHourlyExecutionManager | None = None,
+    source_rows: list[dict[str, Any]] | None = None,
 ) -> None:
     day = target_date(config)
     markets = [
@@ -634,7 +909,12 @@ def run_cycle(
             raise RuntimeError(message)
         LOGGER.warning("%s; continuing with configured station=%s", message, config["observations"]["station"])
 
-    built = build_feature_row(config, model, fetch_metars(config), day)
+    built = build_feature_row(
+        config,
+        model,
+        fetch_metars(config) if source_rows is None else source_rows,
+        day,
+    )
     if built is None:
         LOGGER.info("No eligible KATT observation window for %s", day)
         return
@@ -924,12 +1204,30 @@ def main() -> None:
         ):
             time.sleep(1)
         return
+    metar_coordinator = KalshiMetarCoordinator(config)
     while True:
         try:
-            run_cycle(config, client, model, execution_manager)
+            source_rows = metar_coordinator.poll()
+            if source_rows is not None:
+                run_cycle(
+                    config,
+                    client,
+                    model,
+                    execution_manager,
+                    source_rows=source_rows,
+                )
         except Exception:
             LOGGER.exception("Kalshi trading cycle failed")
-        time.sleep(max(10, int(config["scheduler"]["poll_seconds"])))
+        time.sleep(
+            max(
+                0.1,
+                float(
+                    config["scheduler"].get(
+                        "observation_loop_sleep_seconds", 0.5
+                    )
+                ),
+            )
+        )
 
 
 if __name__ == "__main__":

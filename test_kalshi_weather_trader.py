@@ -3,8 +3,9 @@ from __future__ import annotations
 import base64
 import json
 import time
-from datetime import date
+from datetime import date, datetime, timezone
 from pathlib import Path
+from unittest import mock
 
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.asymmetric import padding, rsa
@@ -17,6 +18,7 @@ from kalshi_execution import (
     depth_price,
 )
 from kalshi_ws import KalshiWebSocketFeed
+import kalshi_weather_trader as trader
 from kalshi_weather_trader import (
     contract_count_for_order,
     event_date_from_ticker,
@@ -382,3 +384,70 @@ def test_production_strategy_parameters_match_requested_policy() -> None:
     assert config["trading"]["default_contracts"] == 10
     assert config["trading"]["max_order_cost_dollars"] == 5.00
     assert config["trading"]["order_management_window_minutes"] == 40
+    assert config["observations"]["awc_prefetch_hours"] == 11
+    assert config["observations"]["awc_fallback_hours"] == 11
+    assert config["observations"]["awc_max_attempts"] == 3
+    assert config["observations"]["awc_retry_interval_seconds"] == 3
+    assert config["observations"]["tgftp_start_delay_seconds"] == 60
+    assert config["observations"]["tgftp_poll_interval_seconds"] == 2
+    assert config["observations"]["tgftp_poll_timeout_seconds"] == 300
+
+
+def test_tgftp_request_is_no_cache_and_parses_latest_metar() -> None:
+    config = json.loads(Path("kalshi_weather_config.json").read_text(encoding="utf-8"))
+    response = mock.Mock()
+    response.text = (
+        "2026/06/28 18:53\n"
+        "KAUS 281853Z 17012KT 10SM 35/22 A2990 RMK AO2 T03500222"
+    )
+    response.raise_for_status.return_value = None
+    with mock.patch.object(trader.requests, "get", return_value=response) as get:
+        observation = trader.fetch_tgftp_metar(config)
+
+    assert observation["obs_dt"] == datetime(
+        2026, 6, 28, 18, 53, tzinfo=timezone.utc
+    )
+    assert observation["raw_ob"].startswith("KAUS 281853Z")
+    url = get.call_args.args[0]
+    headers = get.call_args.kwargs["headers"]
+    assert "/KAUS.TXT?nocache=" in url
+    assert headers["Cache-Control"] == "no-cache, no-store, max-age=0"
+    assert headers["Pragma"] == "no-cache"
+
+
+def test_tgftp_merge_replaces_same_awc_timestamp() -> None:
+    observation = {
+        "obs_dt": datetime(2026, 6, 28, 18, 53, tzinfo=timezone.utc),
+        "raw_ob": "KAUS 281853Z 17012KT 10SM 35/22 A2990",
+    }
+    rows = [
+        {
+            "obsTime": "2026-06-28T17:53:00+00:00",
+            "rawOb": "KAUS 281753Z 17012KT 10SM 34/22 A2990",
+        },
+        {
+            "obsTime": "2026-06-28T18:53:00+00:00",
+            "rawOb": "KAUS 281853Z 17012KT 10SM 34/22 A2990",
+        },
+    ]
+
+    merged = trader.merge_tgftp_metar(rows, observation)
+
+    assert len(merged) == 2
+    assert sum(row.get("_source") == "tgftp" for row in merged) == 1
+    assert merged[-1]["rawOb"] == observation["raw_ob"]
+
+
+def test_awc_history_stops_after_three_attempts() -> None:
+    config = json.loads(Path("kalshi_weather_config.json").read_text(encoding="utf-8"))
+    config["observations"]["awc_retry_interval_seconds"] = 0
+    with mock.patch.object(
+        trader,
+        "fetch_metars",
+        side_effect=[RuntimeError("one"), RuntimeError("two"), [{"rawOb": "ok"}]],
+    ) as fetch:
+        rows = trader.fetch_metars_with_retry(config, 11, "test")
+
+    assert rows == [{"rawOb": "ok"}]
+    assert fetch.call_count == 3
+    fetch.assert_called_with(config, 11)

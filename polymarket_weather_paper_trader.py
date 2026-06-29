@@ -372,7 +372,7 @@ def default_config() -> dict[str, Any]:
         "depth_price_extra_levels": 0,
         "model_awc_enabled": True,
         "model_awc_model_path": "models/lightgbm_rolling_6y_holdout_24h_lag10_speci_context_regular_20260626/lightgbm_metar_high_rolling_6y_best.pkl",
-        "model_awc_live_stations": ["KMIA", "KLAX", "KSFO", "KSEA", "KHOU", "KAUS", "KATL"],
+        "model_awc_live_stations": ["KMIA", "KLAX", "KSFO", "KSEA", "KHOU", "KAUS", "KATL", "KDAL"],
         "model_awc_buy_start_hour": 12,
         "model_awc_buy_end_hour": 16,
         "model_awc_metar_lookback_hours": 11,

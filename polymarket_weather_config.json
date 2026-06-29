@@ -115,7 +115,8 @@
                         "KSEA",
                         "KHOU",
                         "KAUS",
-                        "KATL"
+                        "KATL",
+                        "KDAL"
                     ]
                     ,"model_awc_buy_start_hour": 12
                     ,"model_awc_buy_end_hour": 16
@@ -278,7 +279,8 @@
                                                "KSEA",
                                                "KHOU",
                                                "KAUS",
-                                               "KATL"
+                                               "KATL",
+                                               "KDAL"
                                            ]
                                            ,"model_awc_buy_start_hour": 12
                                            ,"model_awc_buy_end_hour": 16

@@ -281,11 +281,13 @@ class ModelAwcHourlyBatch:
     sides: tuple[str, ...]
     token_ids: tuple[str, ...]
     target_shares: float
+    target_notional_usd: float
     predicted_high_f: float
     cycle_id: str
     reason: str
     baseline_balances: dict[str, float]
     acquired_shares: dict[str, float]
+    acquired_cost_usd: dict[str, float]
     average_prices: dict[str, float]
     open_order_ids: dict[str, str]
     expires_ts: float
@@ -1677,6 +1679,79 @@ def best_buy_offer(
     return min(offers, key=lambda item: item[0])
 
 
+def partial_buy_fillable_now(
+    config: dict[str, Any],
+    market: TemperatureMarket,
+    side: str,
+    target_notional: float,
+) -> Optional[dict[str, float]]:
+    """Return the most notional immediately fillable below the max buy price."""
+    if target_notional <= 0:
+        return None
+    normalized = side.strip().upper()
+    direct_asset_id = asset_id_for_market_side(market, normalized)
+    complement_asset_id = asset_id_for_market_side(
+        market, opposite_side(normalized)
+    )
+    if not direct_asset_id:
+        return None
+    max_price = configured_max_buy_price(config)
+    direct_bids, direct_asks = clob_book_levels(config, direct_asset_id)
+    complement_bids, _complement_asks = clob_book_levels(
+        config, complement_asset_id
+    )
+
+    def build_candidate(levels: Iterable[tuple[float, float]]) -> Optional[dict[str, float]]:
+        shares = 0.0
+        amount = 0.0
+        limit_price = 0.0
+        for price, size in sorted(levels, key=lambda item: item[0]):
+            if price <= 0 or price > max_price or size <= 0:
+                continue
+            remaining = target_notional - amount
+            if remaining <= 0:
+                break
+            take = min(float(size), remaining / float(price))
+            if take <= 0:
+                continue
+            shares += take
+            amount += take * float(price)
+            limit_price = max(limit_price, float(price))
+        if shares < 1 or amount <= 0 or limit_price <= 0:
+            return None
+        order_shares = int(min(shares, target_notional / limit_price))
+        if order_shares < 1:
+            return None
+        return {
+            "price": round(limit_price, 2),
+            "shares": float(order_shares),
+            "amount_usd": round(float(order_shares) * limit_price, 2),
+        }
+
+    complement_buy_levels = []
+    for bid, size in complement_bids:
+        price = clamp_price(1.0 - bid)
+        if price is not None:
+            complement_buy_levels.append((float(price), float(size)))
+    candidates = [
+        candidate
+        for candidate in (
+            build_candidate(direct_asks),
+            build_candidate(complement_buy_levels),
+        )
+        if candidate is not None
+    ]
+    if not candidates:
+        return None
+    return max(
+        candidates,
+        key=lambda item: (
+            float(item["amount_usd"]),
+            -float(item["price"]),
+        ),
+    )
+
+
 def best_buy_price(
     config: dict[str, Any],
     market: TemperatureMarket,
@@ -2771,7 +2846,13 @@ def process_model_awc_prediction(
     latest_row: FeatureMetarRow,
     latest_local: datetime,
 ) -> Optional[PaperTrade]:
-    """Choose the cheapest model-implied YES/NO asset and persist/submit one buy."""
+    """Choose and persist/submit the model-implied buy.
+
+    A prediction that maps cleanly to one market first tries to buy the
+    configured notional directly. If current depth is insufficient, the hourly
+    manager tracks the same notional target from websocket books. The adjacent
+    two-market fallback uses share targets because it must balance both legs.
+    """
     if str(event.get("_parsed_kind") or "") != "Highest":
         return None
     event_date = str(event.get("_parsed_event_date") or "")
@@ -2836,50 +2917,75 @@ def process_model_awc_prediction(
         )
         return trade
 
+    def start_single_notional_manager(market: TemperatureMarket, reason: str) -> Optional[PaperTrade]:
+        if not live_trader:
+            return None
+        target_notional = float(config["trading"].get("buy_notional_usdc", 10.0))
+        partial = partial_buy_fillable_now(config, market, "YES", target_notional)
+        partial_trade = None
+        remaining_notional = target_notional
+        if partial is not None:
+            partial_trade = submit_model_awc_trade(
+                market,
+                "YES",
+                float(partial["price"]),
+                f"model_awc_high_single_partial_before_manager_{market.market_id}_{reason}_local_hour_{local_hour:02d}",
+                amount_usd=float(partial["amount_usd"]),
+                shares=float(partial["shares"]),
+            )
+            remaining_notional = max(
+                0.0,
+                target_notional - float(partial["amount_usd"]),
+            )
+            LOGGER.info(
+                "model awc single interval bought immediate partial before "
+                "manager market=%s price=%.4f shares=%s amount_usd=%.2f "
+                "remaining_notional_usd=%.2f reason=%s",
+                market.market_id,
+                float(partial["price"]),
+                float(partial["shares"]),
+                float(partial["amount_usd"]),
+                remaining_notional,
+                reason,
+            )
+        if remaining_notional < 0.01:
+            return partial_trade
+        batch_id = live_trader.start_model_awc_hourly_batch(
+            city,
+            station,
+            event_date,
+            local_hour,
+            (market,),
+            ("YES",),
+            0.0,
+            predicted_high_f,
+            "single",
+            target_notional_usd=remaining_notional,
+        )
+        LOGGER.info(
+            "model awc single interval delegated to notional websocket manager "
+            "batch=%s market=%s target_notional_usd=%.2f reason=%s",
+            batch_id,
+            market.market_id,
+            remaining_notional,
+            reason,
+        )
+        return partial_trade
+
     predicted_yes_market = model_awc_predicted_yes_market(markets, predicted_high_f, event_unit)
     if predicted_yes_market is not None:
         if duplicate_window:
             LOGGER.info("model awc skip duplicate city=%s station=%s event_date=%s local_hour=%s", city, station, event_date, local_hour)
             return None
-        if live_trader:
-            yes_offer = best_buy_offer(
-                config, predicted_yes_market, "YES"
-            )
-            managed_target_shares = float(
-                config["trading"].get("model_awc_adjacent_yes_shares", 10)
-            )
-            if (
-                yes_offer is None
-                or yes_offer[0] > configured_max_buy_price(config)
-                or yes_offer[1] < managed_target_shares
-            ):
-                batch_id = live_trader.start_model_awc_hourly_batch(
-                    city,
-                    station,
-                    event_date,
-                    local_hour,
-                    (predicted_yes_market,),
-                    ("YES",),
-                    managed_target_shares,
-                    predicted_high_f,
-                    "single",
-                )
-                LOGGER.info(
-                    "model awc single interval delegated to 0.85 limit "
-                    "manager batch=%s market=%s current_offer=%s",
-                    batch_id,
-                    predicted_yes_market.market_id,
-                    yes_offer,
-                )
-                return None
         candidates = []
         for market in markets:
             candidate = model_awc_market_candidate(config, market, predicted_high_f, event_unit, predicted_yes_market.market_id)
             if candidate:
                 candidates.append(candidate)
         if not candidates:
+            partial_trade = start_single_notional_manager(predicted_yes_market, "insufficient_current_depth")
             LOGGER.info("model awc skip no priced candidates city=%s station=%s predicted_high_f=%r", city, station, predicted_high_f)
-            return None
+            return partial_trade
         candidates.sort(key=lambda item: (float(item["price"]), str(item["market"].market_id), str(item["side"])))
         selected = candidates[0]
         market = selected["market"]
@@ -2894,30 +3000,9 @@ def process_model_awc_prediction(
             LOGGER.info("model awc skip duplicate city=%s station=%s event_date=%s local_hour=%s", city, station, event_date, local_hour)
             return None
         snap_market, snap_distance = snapped
-        if live_trader:
-            snap_offer = best_buy_offer(config, snap_market, "YES")
-            managed_target_shares = float(
-                config["trading"].get("model_awc_adjacent_yes_shares", 10)
-            )
-            if (
-                snap_offer is None
-                or snap_offer[0] > configured_max_buy_price(config)
-                or snap_offer[1] < managed_target_shares
-            ):
-                live_trader.start_model_awc_hourly_batch(
-                    city,
-                    station,
-                    event_date,
-                    local_hour,
-                    (snap_market,),
-                    ("YES",),
-                    managed_target_shares,
-                    predicted_high_f,
-                    "single",
-                )
-                return None
         yes_price = best_buy_price(config, snap_market, "YES")
         if yes_price is None or yes_price <= 0:
+            partial_trade = start_single_notional_manager(snap_market, "snap_insufficient_current_depth")
             LOGGER.info(
                 "model awc skip snapped interval missing yes price city=%s station=%s event_date=%s local_hour=%s predicted_high_f=%r market=%s distance=%r%s",
                 city,
@@ -2929,7 +3014,7 @@ def process_model_awc_prediction(
                 snap_distance,
                 event_unit,
             )
-            return None
+            return partial_trade
         price = round(float(yes_price), 2)
         tolerance_f = float(config["trading"].get("model_awc_interval_snap_tolerance_f", 0.15))
         reason = (
@@ -4134,6 +4219,7 @@ class LiveTradingManager:
         target_shares: float,
         predicted_high_f: float,
         mode: str,
+        target_notional_usd: float = 0.0,
     ) -> str:
         """Replace the prior city/hour target and begin websocket order management."""
         if not self.executor or not self.market_feed:
@@ -4176,6 +4262,7 @@ class LiveTradingManager:
             sides=sides,
             token_ids=token_ids,
             target_shares=float(target_shares),
+            target_notional_usd=float(target_notional_usd or 0.0),
             predicted_high_f=float(predicted_high_f),
             cycle_id=(
                 f"{datetime.now().strftime('%Y%m%dT%H%M%S')}:"
@@ -4185,6 +4272,7 @@ class LiveTradingManager:
             reason=f"model_awc_managed_{mode}_hour_{local_hour:02d}",
             baseline_balances=baseline,
             acquired_shares={token_id: 0.0 for token_id in token_ids},
+            acquired_cost_usd={token_id: 0.0 for token_id in token_ids},
             average_prices={token_id: 0.0 for token_id in token_ids},
             open_order_ids={},
             expires_ts=time.time()
@@ -4204,11 +4292,12 @@ class LiveTradingManager:
         self._market_wakeup.set()
         LOGGER.info(
             "model awc hourly batch started batch=%s mode=%s tokens=%s "
-            "target_shares=%s predicted_high_f=%r window_minutes=%s",
+            "target_shares=%s target_notional_usd=%s predicted_high_f=%r window_minutes=%s",
             batch_id,
             mode,
             [token[:16] for token in token_ids],
             target_shares,
+            target_notional_usd,
             predicted_high_f,
             self.config["trading"].get(
                 "model_awc_order_management_window_minutes", 40
@@ -4311,6 +4400,50 @@ class LiveTradingManager:
         if pending is not None:
             self._mark_order_cancelled(pending, reason, cancelled)
 
+    def _record_managed_buy_fill(
+        self, pending: LivePendingOrder, result: Any
+    ) -> None:
+        """Update hourly batch fill accounting for a managed BUY order."""
+        if pending.order_id not in self._managed_order_ids:
+            return
+        shares = float(_result_value(result, "shares", 0.0) or 0.0)
+        amount = float(
+            _result_value(
+                result,
+                "amount_usd",
+                shares * float(_result_value(result, "price", pending.price) or pending.price),
+            )
+            or 0.0
+        )
+        status = str(_result_value(result, "status", "") or "").upper()
+        shares_remaining = float(_result_value(result, "shares_remaining", 0.0) or 0.0)
+        with self._lock:
+            batches = list(self._hourly_batches.values())
+        for batch in batches:
+            for token_id, order_id in list(batch.open_order_ids.items()):
+                if order_id != pending.order_id:
+                    continue
+                batch.acquired_shares[token_id] = (
+                    batch.acquired_shares.get(token_id, 0.0) + shares
+                )
+                batch.acquired_cost_usd[token_id] = (
+                    batch.acquired_cost_usd.get(token_id, 0.0) + amount
+                )
+                if status == "FILLED" or shares_remaining < 1:
+                    batch.open_order_ids.pop(token_id, None)
+                    with self._lock:
+                        self._managed_order_ids.discard(pending.order_id)
+                LOGGER.info(
+                    "model awc managed fill batch=%s token=%s shares=%s amount_usd=%.4f acquired_cost_usd=%.4f target_notional_usd=%.4f",
+                    batch.batch_id,
+                    token_id[:16],
+                    shares,
+                    amount,
+                    batch.acquired_cost_usd.get(token_id, 0.0),
+                    batch.target_notional_usd,
+                )
+                return
+
     def _submit_batch_order(
         self,
         batch: ModelAwcHourlyBatch,
@@ -4385,6 +4518,28 @@ class LiveTradingManager:
         self, batch: ModelAwcHourlyBatch
     ) -> None:
         token = batch.token_ids[0]
+        if batch.target_notional_usd > 0:
+            spent = batch.acquired_cost_usd.get(token, 0.0)
+            remaining_notional = max(0.0, batch.target_notional_usd - spent)
+            if remaining_notional < 0.01:
+                self._close_hourly_batch(batch, "target_filled")
+                return
+            if token in batch.open_order_ids:
+                return
+            max_price = configured_max_buy_price(self.config)
+            offer = self._live_offer(token)
+            if offer is not None and offer[0] <= max_price:
+                price = float(offer[0])
+                shares = min(float(offer[1]), remaining_notional / price)
+                reason = f"{batch.reason}_single_websocket_offer"
+            else:
+                price = max_price
+                shares = remaining_notional / price
+                reason = f"{batch.reason}_single_limit_085"
+            self._submit_batch_order(batch, 0, shares, price, reason)
+            batch.next_action_ts = time.time() + 2.0
+            return
+
         acquired = batch.acquired_shares[token]
         remaining = max(0, int(batch.target_shares - acquired))
         if remaining < 1:
@@ -4745,6 +4900,8 @@ class LiveTradingManager:
         Returns:
             None: This function is executed for its side effects.
         """
+        if pending.kind == "BUY":
+            self._record_managed_buy_fill(pending, result)
         trades = read_trades(self.config["outputs"]["trades_csv"])
         changed = False
         for trade in trades:

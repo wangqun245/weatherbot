@@ -6,6 +6,7 @@ import threading
 import time
 from collections.abc import Callable
 from typing import Any
+from urllib.parse import urlparse
 
 import websocket
 
@@ -154,6 +155,14 @@ class KalshiWebSocketFeed:
                 with self._lock:
                     self._snapshots.difference_update(tickers)
                 headers = self.client.websocket_auth_headers()
+                parsed_url = urlparse(self.url)
+                key_tail = self.client.api_key_id[-4:] if self.client.api_key_id else "none"
+                LOGGER.info(
+                    "Kalshi websocket handshake url=%s key_suffix=%s content_type=%s",
+                    f"{parsed_url.scheme}://{parsed_url.netloc}{parsed_url.path}",
+                    key_tail,
+                    headers.get("Content-Type", ""),
+                )
                 ws = websocket.create_connection(
                     self.url,
                     header=[f"{key}: {value}" for key, value in headers.items()],

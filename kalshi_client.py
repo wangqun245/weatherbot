@@ -74,9 +74,9 @@ class KalshiClient:
 
     def websocket_auth_headers(self) -> dict[str, str]:
         timestamp = str(int(time.time() * 1000))
-        return self._signed_headers(
-            timestamp, "GET", "/trade-api/ws/v2"
-        )
+        headers = self._signed_headers(timestamp, "GET", "/trade-api/ws/v2")
+        headers["Content-Type"] = "application/json"
+        return headers
 
     def request(
         self,

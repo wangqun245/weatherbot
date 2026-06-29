@@ -20,6 +20,7 @@ from kalshi_execution import (
 from kalshi_ws import KalshiWebSocketFeed
 import kalshi_weather_trader as trader
 from kalshi_weather_trader import (
+    build_feature_row,
     contract_count_for_order,
     event_date_from_ticker,
     market_contains_temperature,
@@ -63,6 +64,26 @@ def test_auth_signature_uses_method_and_path_without_query(monkeypatch) -> None:
         hashes.SHA256(),
     )
     assert headers["KALSHI-ACCESS-KEY"] == "key"
+
+
+def test_websocket_auth_signature_uses_ws_path(monkeypatch) -> None:
+    private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    client = KalshiClient("https://example.test/trade-api/v2", api_key_id="key")
+    client._private_key = private_key
+    monkeypatch.setattr("kalshi_client.time.time", lambda: 1234.567)
+    headers = client.websocket_auth_headers()
+    message = b"1234567GET/trade-api/ws/v2"
+    private_key.public_key().verify(
+        base64.b64decode(headers["KALSHI-ACCESS-SIGNATURE"]),
+        message,
+        padding.PSS(
+            mgf=padding.MGF1(hashes.SHA256()),
+            salt_length=padding.PSS.DIGEST_LENGTH,
+        ),
+        hashes.SHA256(),
+    )
+    assert headers["KALSHI-ACCESS-KEY"] == "key"
+    assert headers["Content-Type"] == "application/json"
 
 
 def _config() -> dict:
@@ -134,6 +155,86 @@ def test_prediction_in_middle_gap_buys_adjacent_yes_pair_when_cheaper() -> None:
         ("HIGH", "YES"),
     ]
     assert reason.startswith("adjacent_yes_pair")
+
+
+class _FeatureModel:
+    feature_name_ = [
+        "temp_f_lag_1h",
+        "metar_obs_max_temp_f_past_6h",
+        "metar_obs_min_temp_f_past_6h",
+        "metar_obs_latest_temp_f_past_6h",
+        "metar_obs_temp_range_f_past_6h",
+        "extra_metar_count_past_6h",
+        "has_extra_metar_past_6h",
+    ]
+
+
+def test_build_feature_row_adds_rolling_metar_context() -> None:
+    config = {
+        "observations": {
+            "station": "KMIA",
+            "timezone": "America/New_York",
+            "regular_observation_minute": 53,
+            "lag_tolerance_minutes": 30,
+        },
+        "model": {
+            "buy_start_hour": 12,
+            "buy_end_hour": 16,
+        },
+    }
+    rows = [
+        {
+            "obsTime": "2026-06-29T05:53:00+00:00",
+            "rawOb": "METAR KMIA 290553Z 09007KT 10SM FEW027 28/23 A3002 RMK AO2 SLP164 T02830228 10284 20278 $",
+        },
+        {
+            "obsTime": "2026-06-29T10:53:00+00:00",
+            "rawOb": "METAR KMIA 291053Z 11004KT 10SM SCT025 28/23 A3003 RMK AO2 SLP168 T02830233 $",
+        },
+        {
+            "obsTime": "2026-06-29T11:53:00+00:00",
+            "rawOb": "METAR KMIA 291153Z 11005KT 10SM FEW027 29/24 A3004 RMK AO2 SLP172 T02940239 10294 20283 $",
+        },
+        {
+            "obsTime": "2026-06-29T12:53:00+00:00",
+            "rawOb": "METAR KMIA 291253Z VRB04KT 10SM SCT028 31/24 A3006 RMK AO2 SLP178 T03110239 $",
+        },
+        {
+            "obsTime": "2026-06-29T13:53:00+00:00",
+            "rawOb": "METAR KMIA 291353Z 16004KT 10SM FEW036 31/24 A3007 RMK AO2 SLP183 T03110239 $",
+        },
+        {
+            "obsTime": "2026-06-29T14:53:00+00:00",
+            "rawOb": "METAR KMIA 291453Z 08007KT 10SM SCT035 SCT050 SCT250 32/24 A3008 RMK AO2 SLP185 T03220239 $",
+        },
+        {
+            "obsTime": "2026-06-29T15:53:00+00:00",
+            "rawOb": "METAR KMIA 291553Z 09007KT 10SM SCT034TCU BKN050 32/24 A3008 RMK AO2 SLP186 TCU E T03220239 $",
+        },
+        {
+            "obsTime": "2026-06-29T16:53:00+00:00",
+            "rawOb": "METAR KMIA 291653Z 09013G19KT 10SM SCT033TCU BKN046 BKN250 32/24 A3008 RMK AO2 SLP186 T03170239 $",
+        },
+    ]
+
+    built = build_feature_row(config, _FeatureModel(), rows, date(2026, 6, 29))
+
+    assert built is not None
+    features, latest, latest_local = built
+    assert latest.valid_utc == datetime(2026, 6, 29, 16, 53, tzinfo=timezone.utc)
+    assert latest_local.hour == 12
+    assert features["temp_f"] == 89.06
+    assert features["metar_obs_count_past_6h"] == 7
+    assert features["metar_obs_max_temp_f_past_6h"] == 89.96000000000001
+    assert features["metar_obs_min_temp_f_past_6h"] == 82.94
+    assert features["metar_obs_latest_temp_f_past_6h"] == 89.06
+    assert features["metar_obs_temp_range_f_past_6h"] == 7.02000000000001
+    assert features["extra_metar_count_past_6h"] == 0
+    assert features["has_extra_metar_past_6h"] == 0
+    assert features["asos_6h_max_temp_f"] == 84.91999999999999
+    assert features["asos_6h_extrema_age_minutes"] == 300.0
+    assert features["asos_previous_6h_max_temp_f"] == 83.12
+    assert features["asos_previous_6h_extrema_age_minutes"] == 660.0
 
 
 def test_kalshi_no_order_uses_ask_and_yes_scale_price(monkeypatch) -> None:
@@ -385,8 +486,9 @@ def test_production_strategy_parameters_match_requested_policy() -> None:
     assert config["trading"]["max_order_cost_dollars"] == 10.00
     assert config["trading"]["live_stations"] == ["KAUS", "KLAS", "KMIA"]
     assert config["trading"]["order_management_window_minutes"] == 40
-    assert config["observations"]["awc_prefetch_hours"] == 11
-    assert config["observations"]["awc_fallback_hours"] == 11
+    assert config["observations"]["lookback_hours"] == 24
+    assert config["observations"]["awc_prefetch_hours"] == 24
+    assert config["observations"]["awc_fallback_hours"] == 24
     assert config["observations"]["awc_max_attempts"] == 3
     assert config["observations"]["awc_retry_interval_seconds"] == 3
     assert config["observations"]["tgftp_start_delay_seconds"] == 60

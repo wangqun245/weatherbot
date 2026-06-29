@@ -22,7 +22,14 @@ import joblib
 import requests
 from dotenv import load_dotenv
 
-from featurize_metar_history import MetarRow, decode_metar, nearest_lag_value
+from featurize_metar_history import (
+    MetarRow,
+    add_observation_context_features,
+    decode_metar,
+    is_extra_metar_report,
+    nearest_lag_value,
+    regular_observation_minutes_by_year,
+)
 from kalshi.featurize_katt import parse_six_hour_extrema
 from kalshi.featurize_all_stations import STATION_IDS
 from kalshi_client import KalshiClient
@@ -416,7 +423,8 @@ def required_lag_hours(model: Any) -> int:
 def add_asos_extrema_context(
     features: dict[str, Any], rows: list[MetarRow], latest: MetarRow
 ) -> None:
-    history: deque[tuple[datetime, float, float]] = deque(maxlen=3)
+    max_age_minutes = 390
+    history: deque[tuple[datetime, float, float]] = deque(maxlen=2)
     for row in rows:
         if row.valid_utc > latest.valid_utc:
             break
@@ -426,31 +434,30 @@ def add_asos_extrema_context(
 
     specs = [
         (
-            -1,
+            history[-1] if history else None,
             "asos_6h",
             "current_temp_minus_asos_6h_min_f",
             "has_asos_6h_extrema_context",
+            max_age_minutes,
         ),
         (
-            -2,
+            history[-2] if len(history) >= 2 else None,
             "asos_previous_6h",
             "current_temp_minus_asos_previous_6h_min_f",
             "has_asos_previous_6h_extrema_context",
-        ),
-        (
-            -3,
-            "asos_third_6h",
-            "current_temp_minus_asos_third_6h_min_f",
-            "has_asos_third_6h_extrema_context",
+            max_age_minutes * 2,
         ),
     ]
     temp_f = features.get("temp_f")
-    for history_index, prefix, current_minus_name, flag_name in specs:
-        if len(history) < abs(history_index):
+    for context, prefix, current_minus_name, flag_name, allowed_age in specs:
+        if context is None:
             features[flag_name] = 0
             continue
-        extrema_time, max_f, min_f = history[history_index]
+        extrema_time, max_f, min_f = context
         age_minutes = (latest.valid_utc - extrema_time).total_seconds() / 60.0
+        if age_minutes < 0 or age_minutes > allowed_age:
+            features[flag_name] = 0
+            continue
         features.update(
             {
                 f"{prefix}_max_temp_f": max_f,
@@ -525,6 +532,20 @@ def build_feature_row(
             if current_temp is None or lag_value is None
             else float(current_temp) - float(lag_value)
         )
+    regular_minutes_by_year = regular_observation_minutes_by_year(rows)
+    extra_flags = [
+        is_extra_metar_report(row, regular_minutes_by_year) for row in rows
+    ]
+    latest_index = rows.index(latest)
+    add_observation_context_features(
+        features=features,
+        row=latest,
+        row_idx=latest_index,
+        valid_times=valid_times,
+        temp_values=temp_values,
+        extra_flags=extra_flags,
+        window=timedelta(hours=6),
+    )
     add_asos_extrema_context(features, rows, latest)
     return features, latest, latest_local
 

@@ -139,6 +139,14 @@
                     ,"model_awc_poll_delay_seconds": 180
                     ,"model_awc_poll_interval_seconds": 60
                     ,"model_awc_poll_attempts": 5
+                    ,"model_awc_tgftp_enabled": true
+                    ,"model_awc_tgftp_start_delay_seconds": 60
+                    ,"model_awc_tgftp_poll_interval_seconds": 2
+                    ,"model_awc_tgftp_request_timeout_seconds": 2
+                    ,"model_awc_tgftp_poll_timeout_seconds": 300
+                    ,"model_awc_tgftp_awc_history_hours": 11
+                    ,"model_awc_awc_max_attempts": 3
+                    ,"model_awc_awc_retry_interval_seconds": 3
                     ,"model_awc_adjacent_yes_max_total_price": 0.9
                     ,"model_awc_adjacent_yes_shares": 10
                     ,"model_awc_order_management_window_minutes": 40
@@ -294,6 +302,14 @@
                                            ,"model_awc_poll_delay_seconds": 180
                                            ,"model_awc_poll_interval_seconds": 60
                                            ,"model_awc_poll_attempts": 5
+                                           ,"model_awc_tgftp_enabled": true
+                                           ,"model_awc_tgftp_start_delay_seconds": 60
+                                           ,"model_awc_tgftp_poll_interval_seconds": 2
+                                           ,"model_awc_tgftp_request_timeout_seconds": 2
+                                           ,"model_awc_tgftp_poll_timeout_seconds": 300
+                                           ,"model_awc_tgftp_awc_history_hours": 11
+                                           ,"model_awc_awc_max_attempts": 3
+                                           ,"model_awc_awc_retry_interval_seconds": 3
                                            ,"model_awc_adjacent_yes_max_total_price": 0.9
                                            ,"model_awc_adjacent_yes_shares": 10
                                            ,"model_awc_order_management_window_minutes": 40

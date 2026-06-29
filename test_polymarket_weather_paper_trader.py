@@ -1,6 +1,7 @@
 import unittest
 import tempfile
 from pathlib import Path
+from unittest import mock
 
 import polymarket_weather_paper_trader as bot
 
@@ -278,6 +279,61 @@ class MetarMomentumTest(unittest.TestCase):
         self.assertFalse(bot.tgftp_observation_changed(previous, same))
         self.assertTrue(bot.tgftp_observation_changed(previous, newer_time))
         self.assertTrue(bot.tgftp_observation_changed(previous, newer_temp))
+
+    def test_tgftp_request_uses_cache_buster_and_no_cache_headers(self):
+        response = mock.Mock()
+        response.text = (
+            "2026/06/08 17:53\n"
+            "KAUS 081753Z 16015KT 10SM 31/24 A2994 RMK AO2 T03110239"
+        )
+        response.raise_for_status.return_value = None
+        with mock.patch.object(bot.requests, "get", return_value=response) as get:
+            row = bot.tgftp_metar_observation("kaus")
+
+        self.assertEqual(31.1, row["temp_c"])
+        url = get.call_args.args[0]
+        headers = get.call_args.kwargs["headers"]
+        self.assertRegex(url, r"/KAUS\.TXT\?nocache=\d+$")
+        self.assertEqual("no-cache, no-store, max-age=0", headers["Cache-Control"])
+        self.assertEqual("no-cache", headers["Pragma"])
+
+    def test_merge_tgftp_replaces_delayed_awc_row_at_same_observation_time(self):
+        old = {
+            "obsTime": "2026-06-08T17:53:00+00:00",
+            "rawOb": "KAUS 081753Z 16015KT 10SM 30/24 A2994",
+            "temp": 30.0,
+        }
+        context = {
+            "obsTime": "2026-06-08T16:53:00+00:00",
+            "rawOb": "KAUS 081653Z 16015KT 10SM 29/24 A2994",
+            "temp": 29.0,
+        }
+        obs = {
+            "obs_dt": bot.datetime(2026, 6, 8, 17, 53, tzinfo=bot.timezone.utc),
+            "temp_c": 31.1,
+            "raw_ob": "KAUS 081753Z 16015KT 10SM 31/24 A2994 RMK AO2 T03110239",
+        }
+
+        merged = bot.merge_tgftp_into_aviation_rows([context, old], obs)
+
+        self.assertEqual(2, len(merged))
+        self.assertEqual(1, sum(row.get("_source") == "tgftp" for row in merged))
+        self.assertEqual(obs["raw_ob"], merged[-1]["rawOb"])
+
+    def test_model_awc_history_retries_at_most_three_times(self):
+        config = bot.default_config()
+        config["trading"]["model_awc_awc_max_attempts"] = 3
+        config["trading"]["model_awc_awc_retry_interval_seconds"] = 0
+        with mock.patch.object(
+            bot,
+            "aviation_metar_observations",
+            side_effect=[RuntimeError("one"), RuntimeError("two"), [{"rawOb": "third"}]],
+        ) as fetch:
+            rows = bot.model_awc_fetch_history_with_retry(config, "KSEA", 10, "test")
+
+        self.assertEqual([{"rawOb": "third"}], rows)
+        self.assertEqual(3, fetch.call_count)
+        fetch.assert_called_with("KSEA", 10)
 
     def test_station_report_window_uses_expected_next_obs_time(self):
         config = bot.default_config()

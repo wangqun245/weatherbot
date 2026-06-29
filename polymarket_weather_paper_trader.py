@@ -395,6 +395,14 @@ def default_config() -> dict[str, Any]:
         "model_awc_poll_delay_seconds": 180,
         "model_awc_poll_interval_seconds": 60,
         "model_awc_poll_attempts": 5,
+        "model_awc_tgftp_enabled": True,
+        "model_awc_tgftp_start_delay_seconds": 60,
+        "model_awc_tgftp_poll_interval_seconds": 2,
+        "model_awc_tgftp_request_timeout_seconds": 2,
+        "model_awc_tgftp_poll_timeout_seconds": 300,
+        "model_awc_tgftp_awc_history_hours": 11,
+        "model_awc_awc_max_attempts": 3,
+        "model_awc_awc_retry_interval_seconds": 3,
         "model_awc_adjacent_yes_max_total_price": 0.9,
         "model_awc_adjacent_yes_shares": 10,
         "model_awc_order_management_window_minutes": 40,
@@ -2169,6 +2177,45 @@ def aviation_metar_observations(station: str, hours: int = 24) -> list[dict[str,
     return payload if isinstance(payload, list) else []
 
 
+def model_awc_fetch_history_with_retry(
+    config: dict[str, Any],
+    station: str,
+    hours: int,
+    reason: str,
+) -> list[dict[str, Any]]:
+    """Fetch AWC model history with the configured bounded retry policy."""
+    trading = config["trading"]
+    max_attempts = max(1, int(trading.get("model_awc_awc_max_attempts", 3)))
+    retry_interval = max(0.0, float(trading.get("model_awc_awc_retry_interval_seconds", 3)))
+    for attempt in range(1, max_attempts + 1):
+        try:
+            rows = aviation_metar_observations(station, hours)
+            append_aviation_metar_history(config, station, rows, reason)
+            if rows:
+                return rows
+            LOGGER.warning(
+                "model awc history empty station=%s hours=%s reason=%s attempt=%s/%s",
+                station,
+                hours,
+                reason,
+                attempt,
+                max_attempts,
+            )
+        except Exception as exc:
+            LOGGER.warning(
+                "model awc history fetch failed station=%s hours=%s reason=%s attempt=%s/%s error=%s",
+                station,
+                hours,
+                reason,
+                attempt,
+                max_attempts,
+                exc,
+            )
+        if attempt < max_attempts and retry_interval > 0:
+            time.sleep(retry_interval)
+    return []
+
+
 def append_aviation_metar_history(config: dict[str, Any], station: str, rows: list[dict[str, Any]], reason: str) -> None:
     """Raw AviationWeather audit writes are disabled to keep disk usage low.
     
@@ -3436,7 +3483,7 @@ def parse_tgftp_metar(text: str) -> Optional[dict[str, Any]]:
     return {"obs_dt": obs_dt, "raw_ob": raw_ob, "temp_c": temp_c}
 
 
-def tgftp_metar_observation(station: str) -> Optional[dict[str, Any]]:
+def tgftp_metar_observation(station: str, timeout_seconds: float = 15) -> Optional[dict[str, Any]]:
     """Fetch and parse the latest NOAA TGFTP station METAR.
     
     Args:
@@ -3451,9 +3498,38 @@ def tgftp_metar_observation(station: str) -> Optional[dict[str, Any]]:
     url = f"https://tgftp.nws.noaa.gov/data/observations/metar/stations/{station.upper()}.TXT?nocache={int(time.time() * 1000)}"
     headers = dict(HEADERS)
     headers.update({"Cache-Control": "no-cache, no-store, max-age=0", "Pragma": "no-cache"})
-    r = requests.get(url, headers=headers, timeout=15)
+    r = requests.get(url, headers=headers, timeout=max(0.5, float(timeout_seconds)))
     r.raise_for_status()
     return parse_tgftp_metar(r.text)
+
+
+def tgftp_observation_as_aviation_row(obs: dict[str, Any]) -> dict[str, Any]:
+    """Convert a parsed TGFTP observation to the AWC row shape used by the model."""
+    obs_dt = obs.get("obs_dt")
+    return {
+        "rawOb": str(obs.get("raw_ob") or ""),
+        "obsTime": obs_dt.isoformat() if isinstance(obs_dt, datetime) else obs_dt,
+        "temp": obs.get("temp_c"),
+        "_source": "tgftp",
+    }
+
+
+def merge_tgftp_into_aviation_rows(
+    rows: list[dict[str, Any]],
+    obs: dict[str, Any],
+) -> list[dict[str, Any]]:
+    """Return AWC history with the newest TGFTP report replacing the same observation."""
+    obs_dt = obs.get("obs_dt")
+    raw_ob = str(obs.get("raw_ob") or "").strip()
+    merged = []
+    for row in rows:
+        row_dt = parse_aviation_obs_time(row.get("obsTime") or row.get("reportTime") or row.get("receiptTime"))
+        row_raw = str(row.get("rawOb") or row.get("raw") or row.get("metar") or "").strip()
+        if (isinstance(obs_dt, datetime) and row_dt == obs_dt) or (raw_ob and row_raw == raw_ob):
+            continue
+        merged.append(row)
+    merged.append(tgftp_observation_as_aviation_row(obs))
+    return merged
 
 
 def tgftp_observation_changed(previous: Optional[dict[str, Any]], current: Optional[dict[str, Any]]) -> bool:
@@ -7263,6 +7339,157 @@ def start_aviation_thread(config: dict[str, Any]) -> threading.Thread:
     return thread
 
 
+def model_awc_run_prediction_rows(
+    config: dict[str, Any],
+    city: str,
+    station: str,
+    event_date: str,
+    local_hour: int,
+    expected_utc: datetime,
+    events_for_date: list[dict[str, Any]],
+    rows: list[dict[str, Any]],
+    source: str,
+) -> bool:
+    """Build and trade the current hourly prediction from a supplied METAR history."""
+    got_latest_metar = False
+    for event in events_for_date:
+        built = model_awc_feature_row(config, city, station, rows, event_date)
+        if built is None:
+            continue
+        features, latest_row, latest_local = built
+        if latest_local.hour != local_hour or latest_row.valid_utc < expected_utc - timedelta(minutes=10):
+            LOGGER.info(
+                "model awc latest metar not current window source=%s city=%s station=%s latest=%s latest_local=%s expected=%s",
+                source,
+                city,
+                station,
+                latest_row.valid_utc.isoformat(),
+                latest_local.isoformat(),
+                expected_utc.isoformat(),
+            )
+            continue
+        got_latest_metar = True
+        predicted_high_f = model_awc_predict_high(config, features)
+        process_model_awc_prediction(config, event, city, station, predicted_high_f, latest_row, latest_local)
+    return got_latest_metar
+
+
+def model_awc_tgftp_window_worker(
+    config: dict[str, Any],
+    city: str,
+    station: str,
+    event_date: str,
+    local_hour: int,
+    expected_utc: datetime,
+    tgftp_start_utc: datetime,
+    events_for_date: list[dict[str, Any]],
+    lookback_hours: int,
+) -> None:
+    """Poll TGFTP every few seconds and run the model as soon as the hourly METAR appears."""
+    trading = config["trading"]
+    interval = max(0.5, float(trading.get("model_awc_tgftp_poll_interval_seconds", 2)))
+    request_timeout = max(0.5, float(trading.get("model_awc_tgftp_request_timeout_seconds", 2)))
+    timeout = max(interval, float(trading.get("model_awc_tgftp_poll_timeout_seconds", 300)))
+    history_hours = max(1, int(trading.get("model_awc_tgftp_awc_history_hours", 11)))
+    history_rows = model_awc_fetch_history_with_retry(
+        config,
+        station,
+        history_hours,
+        "model_awc_tgftp_prefetch",
+    )
+    wait_seconds = (tgftp_start_utc - datetime.now(timezone.utc)).total_seconds()
+    if wait_seconds > 0:
+        time.sleep(wait_seconds)
+    deadline = time.monotonic() + timeout
+    attempts = 0
+    LOGGER.info(
+        "model awc tgftp polling started city=%s station=%s event_date=%s local_hour=%s expected=%s tgftp_start=%s awc_history_hours=%s awc_rows=%s interval_seconds=%s timeout_seconds=%s",
+        city,
+        station,
+        event_date,
+        local_hour,
+        expected_utc.isoformat(),
+        tgftp_start_utc.isoformat(),
+        history_hours,
+        len(history_rows),
+        interval,
+        timeout,
+    )
+    while time.monotonic() <= deadline:
+        attempts += 1
+        started = time.monotonic()
+        try:
+            obs = tgftp_metar_observation(station, request_timeout)
+            obs_dt = obs.get("obs_dt") if obs else None
+            if isinstance(obs_dt, datetime) and obs_dt >= expected_utc - timedelta(minutes=10):
+                rows = merge_tgftp_into_aviation_rows(history_rows, obs)
+                if model_awc_run_prediction_rows(
+                    config,
+                    city,
+                    station,
+                    event_date,
+                    local_hour,
+                    expected_utc,
+                    events_for_date,
+                    rows,
+                    "tgftp",
+                ):
+                    update_cached_tgftp_observation(station, obs)
+                    LOGGER.info(
+                        "model awc tgftp observation accepted city=%s station=%s obs_utc=%s attempts=%s raw=%r",
+                        city,
+                        station,
+                        obs_dt.isoformat(),
+                        attempts,
+                        obs.get("raw_ob"),
+                    )
+                    return
+        except Exception as exc:
+            if attempts == 1 or attempts % 15 == 0:
+                LOGGER.warning(
+                    "model awc tgftp poll failed city=%s station=%s event_date=%s local_hour=%s attempt=%s error=%s",
+                    city,
+                    station,
+                    event_date,
+                    local_hour,
+                    attempts,
+                    exc,
+                )
+        remaining = interval - (time.monotonic() - started)
+        if remaining > 0:
+            time.sleep(remaining)
+
+    LOGGER.warning(
+        "model awc tgftp window timeout city=%s station=%s event_date=%s local_hour=%s expected=%s attempts=%s",
+        city,
+        station,
+        event_date,
+        local_hour,
+        expected_utc.isoformat(),
+        attempts,
+    )
+    rows = model_awc_fetch_history_with_retry(
+        config,
+        station,
+        lookback_hours,
+        "model_awc_timeout_fallback",
+    )
+    try:
+        model_awc_run_prediction_rows(
+            config,
+            city,
+            station,
+            event_date,
+            local_hour,
+            expected_utc,
+            events_for_date,
+            rows,
+            "awc_timeout_fallback",
+        )
+    except Exception:
+        LOGGER.exception("model awc timeout fallback failed city=%s station=%s local_hour=%s", city, station, local_hour)
+
+
 def model_awc_supervisor(config: dict[str, Any]) -> None:
     """Poll AWC METAR after expected observation windows and trade model predictions."""
     try:
@@ -7275,7 +7502,16 @@ def model_awc_supervisor(config: dict[str, Any]) -> None:
         return
 
     fallback_poll_seconds = max(10, int(config["trading"].get("aviation_poll_interval_seconds", 60)))
-    poll_delay_seconds = max(0, int(config["trading"].get("model_awc_poll_delay_seconds", 180)))
+    tgftp_enabled = bool(config["trading"].get("model_awc_tgftp_enabled", True))
+    poll_delay_seconds = max(
+        0,
+        int(
+            config["trading"].get(
+                "model_awc_tgftp_start_delay_seconds" if tgftp_enabled else "model_awc_poll_delay_seconds",
+                60 if tgftp_enabled else 180,
+            )
+        ),
+    )
     poll_interval_seconds = max(10, int(config["trading"].get("model_awc_poll_interval_seconds", 60)))
     poll_attempts = max(1, int(config["trading"].get("model_awc_poll_attempts", 5)))
     required_history_hours = model_awc_required_lag_hours(config) + 1
@@ -7290,16 +7526,16 @@ def model_awc_supervisor(config: dict[str, Any]) -> None:
     window_state: dict[str, dict[str, Any]] = {}
     event_refresh_at = 0.0
     LOGGER.info(
-        "model awc supervisor started live_station=%s local_hours=%s-%s poll_delay_seconds=%s poll_interval_seconds=%s poll_attempts_per_window=%s lookback_hours=%s station_observation_minutes=%s station_stagger_seconds=%s",
+        "model awc supervisor started live_station=%s local_hours=%s-%s source=%s poll_delay_seconds=%s poll_interval_seconds=%s poll_attempts_per_window=%s lookback_hours=%s station_observation_minutes=%s",
         model_awc_live_station(config),
         start_hour,
         end_hour,
+        "tgftp" if tgftp_enabled else "awc",
         poll_delay_seconds,
         poll_interval_seconds,
         poll_attempts,
         lookback_hours,
         config["trading"].get("model_awc_station_observation_minutes", {}),
-        config["trading"].get("model_awc_station_poll_stagger_seconds", 5),
     )
     while True:
         try:
@@ -7335,7 +7571,6 @@ def model_awc_supervisor(config: dict[str, Any]) -> None:
                 tz = city_timezone(config, city)
                 now_local = now_utc.astimezone(tz)
                 observation_minute = model_awc_station_observation_minute(config, station)
-                station_stagger_seconds = model_awc_station_stagger_seconds(config, station)
                 events_by_date: dict[str, list[dict[str, Any]]] = {}
                 for event in list(group["events"]):
                     event_date = str(event.get("_parsed_event_date") or "")
@@ -7359,8 +7594,15 @@ def model_awc_supervisor(config: dict[str, Any]) -> None:
                             tzinfo=tz,
                         )
                         expected_utc = expected_local.astimezone(timezone.utc)
-                        poll_start_utc = expected_utc + timedelta(seconds=poll_delay_seconds + station_stagger_seconds)
-                        poll_end_utc = poll_start_utc + timedelta(seconds=poll_interval_seconds * poll_attempts)
+                        tgftp_start_utc = expected_utc + timedelta(seconds=poll_delay_seconds)
+                        poll_start_utc = expected_utc if tgftp_enabled else tgftp_start_utc
+                        poll_end_utc = tgftp_start_utc + timedelta(
+                            seconds=(
+                                float(config["trading"].get("model_awc_tgftp_poll_timeout_seconds", 300))
+                                if tgftp_enabled
+                                else poll_interval_seconds * poll_attempts
+                            )
+                        )
                         if now_utc < poll_start_utc:
                             continue
                         window_key = f"{city}:{station}:{event_date}:hour_{local_hour:02d}:model_awc"
@@ -7375,7 +7617,31 @@ def model_awc_supervisor(config: dict[str, Any]) -> None:
                         )
                         if state.get("done"):
                             continue
-                        if int(state.get("attempts", 0)) >= poll_attempts or now_utc > poll_end_utc:
+                        if now_utc > poll_end_utc:
+                            state["done"] = True
+                            continue
+                        if tgftp_enabled:
+                            state["done"] = True
+                            state["attempts"] = 1
+                            thread = threading.Thread(
+                                target=model_awc_tgftp_window_worker,
+                                args=(
+                                    config,
+                                    city,
+                                    station,
+                                    event_date,
+                                    local_hour,
+                                    expected_utc,
+                                    tgftp_start_utc,
+                                    list(events_for_date),
+                                    lookback_hours,
+                                ),
+                                name=f"model-tgftp-{station}-{event_date}-{local_hour:02d}",
+                                daemon=True,
+                            )
+                            thread.start()
+                            continue
+                        if int(state.get("attempts", 0)) >= poll_attempts:
                             state["done"] = True
                             continue
                         next_poll_dt = datetime.fromtimestamp(float(state.get("next_poll_at", 0.0)), timezone.utc)
@@ -7428,7 +7694,7 @@ def model_awc_supervisor(config: dict[str, Any]) -> None:
             for key in list(window_state):
                 if not any(key.startswith(prefix) for prefix in active_prefixes):
                     window_state.pop(key, None)
-            time.sleep(min(30.0, fallback_poll_seconds))
+            time.sleep(1.0 if tgftp_enabled else min(30.0, fallback_poll_seconds))
         except Exception:
             LOGGER.exception("model awc supervisor loop failed")
             time.sleep(min(30.0, fallback_poll_seconds))

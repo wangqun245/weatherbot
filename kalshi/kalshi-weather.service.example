@@ -6,10 +6,10 @@ Wants=network-online.target
 [Service]
 Type=simple
 User=ubuntu
-WorkingDirectory=/opt/weatherbot
-EnvironmentFile=/opt/weatherbot/.env
+WorkingDirectory=/home/ubuntu/trade/weatherbot
+EnvironmentFile=/home/ubuntu/trade/weatherbot/.env
 Environment=PYTHONUNBUFFERED=1
-ExecStart=/opt/weatherbot/.venv/bin/python /opt/weatherbot/kalshi_weather_trader.py run --config /opt/weatherbot/kalshi_weather_config.json
+ExecStart=/home/ubuntu/trade/weatherbot/.venv/bin/python /home/ubuntu/trade/weatherbot/kalshi_weather_trader.py run --config /home/ubuntu/trade/weatherbot/kalshi_weather_config.json
 Restart=always
 RestartSec=10
 TimeoutStopSec=30

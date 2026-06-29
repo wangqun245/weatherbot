@@ -16,6 +16,7 @@ from kalshi_execution import (
     HourlyBatch,
     KalshiHourlyExecutionManager,
     ManagedLeg,
+    ManagedOrder,
     depth_price,
 )
 from kalshi_ws import KalshiWebSocketFeed
@@ -743,6 +744,86 @@ def test_kalshi_telegram_title_has_platform_prefix() -> None:
 
     message = notifier.send.call_args.args[0]
     assert message.startswith("*Kalshi LIVE TRADE*")
+
+
+def test_kalshi_execution_fill_sends_telegram_notification() -> None:
+    notifier = mock.Mock()
+    trader.notify_kalshi_execution_event(
+        notifier,
+        {
+            "type": "order_update",
+            "window_key": "KMIA:2026-06-29:hour_13",
+            "order_id": "order-1",
+            "ticker": "KXHIGHMIA-26JUN29-B90",
+            "outcome_side": "YES",
+            "price": 0.08,
+            "delta_filled": 25,
+        },
+    )
+
+    message = notifier.send.call_args.args[0]
+    assert message.startswith("*Kalshi LIVE BUY FILLED*")
+    assert "Station: *KMIA*" in message
+    assert "Contracts: 25" in message
+    assert "Amount: $2.00" in message
+
+
+def test_kalshi_managed_user_order_event_includes_fill_delta() -> None:
+    events = []
+    client = _FakeClient()
+    feed = _FakeFeed({"M": []})
+    manager = KalshiHourlyExecutionManager(
+        client=client,
+        feed=feed,
+        trading={
+            "max_buy_price": 0.85,
+            "min_buy_price": 0.01,
+            "adjacent_yes_max_total_price": 0.90,
+            "order_management_window_minutes": 40,
+        },
+        subaccount=0,
+        event_callback=events.append,
+    )
+    batch = HourlyBatch(
+        batch_id="batch-1",
+        window_key="KMIA:2026-06-29:hour_13",
+        mode="single",
+        legs=(ManagedLeg("M", "YES"),),
+        target_shares=10,
+        predicted_high_f=90,
+        created_ts=time.time(),
+        expires_ts=time.time() + 2400,
+        acquired=[0],
+        total_cost=[0],
+        orders={
+            "order-1": ManagedOrder(
+                order_id="order-1",
+                leg_index=0,
+                requested=10,
+                price=0.08,
+                filled=0,
+                remaining=10,
+                time_in_force="good_till_canceled",
+            )
+        },
+    )
+    manager._batches[batch.batch_id] = batch
+
+    manager._apply_user_order(
+        {
+            "order_id": "order-1",
+            "fill_count": "4",
+            "remaining_count": "6",
+            "status": "resting",
+        }
+    )
+
+    assert events[-1]["type"] == "order_update"
+    assert events[-1]["window_key"] == "KMIA:2026-06-29:hour_13"
+    assert events[-1]["ticker"] == "M"
+    assert events[-1]["outcome_side"] == "YES"
+    assert events[-1]["price"] == 0.08
+    assert events[-1]["delta_filled"] == 4
 
 
 def test_tgftp_request_is_no_cache_and_parses_latest_metar() -> None:

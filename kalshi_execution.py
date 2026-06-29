@@ -636,9 +636,14 @@ class KalshiHourlyExecutionManager:
             {
                 "type": "order_update",
                 "batch_id": batch.batch_id,
+                "window_key": batch.window_key,
                 "order_id": order_id,
+                "ticker": batch.legs[order.leg_index].ticker,
+                "outcome_side": batch.legs[order.leg_index].outcome_side,
+                "price": order.price,
                 "status": status,
                 "filled": order.filled,
+                "delta_filled": delta,
                 "remaining": order.remaining,
             }
         )
@@ -664,13 +669,15 @@ class KalshiHourlyExecutionManager:
             return
         if trade_id:
             self._seen_fill_ids.add(trade_id)
-        batch, _order = pair
+        batch, order = pair
+        reconciled = False
         # The create-order response may already contain this immediate fill.
         # Reconcile against Kalshi's cumulative order totals to avoid counting
         # the same fill once from REST and again from the websocket.
         try:
             current = self.client.get_order(order_id)
             self._apply_user_order(current)
+            reconciled = True
         except Exception:
             LOGGER.exception(
                 "Kalshi fill reconciliation failed order=%s", order_id
@@ -679,11 +686,16 @@ class KalshiHourlyExecutionManager:
             {
                 "type": "fill",
                 "batch_id": batch.batch_id,
+                "window_key": batch.window_key,
                 "order_id": order_id,
                 "trade_id": trade_id,
+                "ticker": batch.legs[order.leg_index].ticker,
+                "outcome_side": batch.legs[order.leg_index].outcome_side,
+                "price": order.price,
                 "quantity": float(
                     payload.get("count_fp") or payload.get("count") or 0
                 ),
+                "reconciled": reconciled,
             }
         )
         self._persist()

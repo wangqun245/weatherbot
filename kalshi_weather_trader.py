@@ -981,6 +981,39 @@ def notify_kalshi_trade(
     )
 
 
+def notify_kalshi_execution_event(
+    notifier: TelegramNotifier | None, event: dict[str, Any]
+) -> None:
+    """Send Telegram notification for a real Kalshi managed-order fill."""
+    if notifier is None:
+        return
+    event_type = str(event.get("type") or "")
+    if event_type == "order_submitted":
+        filled = float(event.get("filled") or 0.0)
+    elif event_type == "order_update":
+        filled = float(event.get("delta_filled") or 0.0)
+    elif event_type == "fill" and not bool(event.get("reconciled", False)):
+        filled = float(event.get("quantity") or 0.0)
+    else:
+        return
+    if filled <= 0:
+        return
+    price = float(event.get("price") or 0.0)
+    amount = filled * price
+    window_key = str(event.get("window_key") or "")
+    station = window_key.split(":", 1)[0] if window_key else ""
+    notifier.send(
+        f"*Kalshi LIVE BUY FILLED*\n"
+        f"Station: *{station}*\n"
+        f"Side: *{event.get('outcome_side', '')}*\n"
+        f"Ticker: `{event.get('ticker', '')}`\n"
+        f"Contracts: {filled:.4g}\n"
+        f"Price: ${price:.4f}\n"
+        f"Amount: ${amount:.2f}\n"
+        f"Order: `{event.get('order_id', '')}`"
+    )
+
+
 def target_date(config: dict[str, Any]) -> date:
     configured = str(config["market"].get("target_date", "today"))
     if configured.lower() == "today":
@@ -1349,6 +1382,12 @@ def main() -> None:
     model = joblib.load(config["model"]["path"])
     city_configs = configured_city_configs(config)
     notifier = TelegramNotifier()
+    if notifier.enabled:
+        LOGGER.info("Telegram notifications enabled chat_id=%s", notifier.chat_id)
+    else:
+        LOGGER.warning(
+            "Telegram notifications disabled; set TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID"
+        )
     LOGGER.info(
         "Loaded model=%s features=%d stations=%s live_stations=%s",
         config["model"]["path"],
@@ -1402,6 +1441,7 @@ def main() -> None:
                     ),
                     event,
                 )
+            notify_kalshi_execution_event(notifier, event)
 
         feed = KalshiWebSocketFeed(
             client=client,

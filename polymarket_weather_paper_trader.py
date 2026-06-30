@@ -376,12 +376,17 @@ def default_config() -> dict[str, Any]:
         "depth_price_extra_levels": 0,
         "model_awc_enabled": True,
         "model_awc_model_path": "models/lightgbm_rolling_6y_holdout_24h_lag10_speci_context_regular_prevday_20260630/lightgbm_metar_high_rolling_6y_best.pkl",
-        "model_awc_live_stations": ["KMIA", "KLAX", "KSFO", "KSEA", "KHOU", "KAUS", "KATL", "KDAL"],
+        "model_awc_live_stations": [
+            "KATL", "KAUS", "KDAL", "KBKF", "KHOU", "KLAX",
+            "KLGA", "KMIA", "KORD", "KSEA", "KSFO",
+        ],
         "model_awc_buy_start_hour": 12,
         "model_awc_buy_end_hour": 16,
         "model_awc_station_buy_hours": {
             "KATL": [13, 16],
             "KDAL": [13, 16],
+            "KBKF": [13, 16],
+            "KLGA": [13, 16],
             "KLAX": [10, 14],
             "KMIA": [10, 14],
         },

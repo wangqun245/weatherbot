@@ -527,6 +527,7 @@ def test_run_cycle_single_interval_buys_partial_before_kalshi_manager(monkeypatc
         "outputs": {
             "state_json": str(tmp_path / "state.json"),
             "trades_jsonl": str(tmp_path / "trades.jsonl"),
+            "order_events_jsonl": str(tmp_path / "order_events.jsonl"),
         },
     }
     market = {
@@ -599,6 +600,7 @@ def test_run_cycle_single_interval_buys_partial_before_kalshi_manager(monkeypatc
     monkeypatch.setattr(trader, "predict", lambda *_args, **_kwargs: 98.5)
     client = Client()
     manager = Manager()
+    notifier = mock.Mock()
 
     trader.run_cycle(
         config,
@@ -606,6 +608,7 @@ def test_run_cycle_single_interval_buys_partial_before_kalshi_manager(monkeypatc
         object(),
         execution_manager=manager,
         source_rows=[],
+        notifier=notifier,
     )
 
     assert len(client.orders) == 1
@@ -616,6 +619,15 @@ def test_run_cycle_single_interval_buys_partial_before_kalshi_manager(monkeypatc
     assert len(manager.started) == 1
     assert manager.started[0]["mode"] == "single"
     assert manager.started[0]["target_notional_dollars"] == 6.0
+    messages = [call.args[0] for call in notifier.send.call_args_list]
+    assert any(message.startswith("*Kalshi LIVE BUY FILLED*") for message in messages)
+    assert any("Contracts: 50" in message for message in messages)
+    events = [
+        json.loads(line)
+        for line in (tmp_path / "order_events.jsonl").read_text().splitlines()
+    ]
+    assert events[0]["source"] == "single_interval_immediate_ioc"
+    assert events[0]["filled"] == 50
 
 
 def test_websocket_unified_yes_scale_builds_yes_and_no_asks() -> None:

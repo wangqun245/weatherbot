@@ -1014,6 +1014,30 @@ def notify_kalshi_execution_event(
     )
 
 
+def record_kalshi_execution_event(
+    config: dict[str, Any],
+    notifier: TelegramNotifier | None,
+    event: dict[str, Any],
+) -> dict[str, Any]:
+    """Persist and notify a real Kalshi execution event from any order path."""
+    recorded = {
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        **event,
+    }
+    with ORDER_EVENT_LOCK:
+        append_trade(
+            Path(
+                config["outputs"].get(
+                    "order_events_jsonl",
+                    "kalshi/runtime/order_events.jsonl",
+                )
+            ),
+            recorded,
+        )
+    notify_kalshi_execution_event(notifier, recorded)
+    return recorded
+
+
 def target_date(config: dict[str, Any]) -> date:
     configured = str(config["market"].get("target_date", "today"))
     if configured.lower() == "today":
@@ -1203,6 +1227,28 @@ def run_cycle(
                     spent_notional,
                     target_notional,
                 )
+                if filled > 0:
+                    record_kalshi_execution_event(
+                        config,
+                        notifier,
+                        {
+                            "type": "order_submitted",
+                            "source": "single_interval_immediate_ioc",
+                            "window_key": window_key,
+                            "order_id": str(result.get("order_id") or ""),
+                            "ticker": str(market["ticker"]),
+                            "outcome_side": side,
+                            "requested": contracts,
+                            "price": spent_notional / filled,
+                            "filled": filled,
+                            "remaining": float(
+                                result.get("remaining_count_fp")
+                                or result.get("remaining_count")
+                                or 0.0
+                            ),
+                            "time_in_force": "immediate_or_cancel",
+                        },
+                    )
             remaining_notional = max(0.0, target_notional - spent_notional)
             min_buy_price = float(trading.get("min_buy_price", 0.01))
             if remaining_notional < min_buy_price:
@@ -1427,21 +1473,7 @@ def main() -> None:
                 manager.on_websocket_message(message)
 
         def execution_event(event: dict[str, Any]) -> None:
-            event = {
-                "created_at": datetime.now(timezone.utc).isoformat(),
-                **event,
-            }
-            with ORDER_EVENT_LOCK:
-                append_trade(
-                    Path(
-                        config["outputs"].get(
-                            "order_events_jsonl",
-                            "kalshi/runtime/order_events.jsonl",
-                        )
-                    ),
-                    event,
-                )
-            notify_kalshi_execution_event(notifier, event)
+            record_kalshi_execution_event(config, notifier, event)
 
         feed = KalshiWebSocketFeed(
             client=client,

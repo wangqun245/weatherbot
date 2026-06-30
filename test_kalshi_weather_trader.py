@@ -11,6 +11,7 @@ from unittest import mock
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.asymmetric import padding, rsa
 
+import kalshi_ws
 from kalshi_client import KalshiClient
 from kalshi_execution import (
     HourlyBatch,
@@ -693,6 +694,51 @@ def test_websocket_connect_falls_back_and_promotes_url(monkeypatch) -> None:
     assert "Content-Type: application/json" in calls[1][1]
 
 
+def test_websocket_idle_timeout_sends_ping_without_reconnect(monkeypatch) -> None:
+    class IdleThenClosed:
+        def __init__(self):
+            self.calls = 0
+            self.pings = 0
+            self.timeout = None
+
+        def settimeout(self, value):
+            self.timeout = value
+
+        def send(self, _payload):
+            return None
+
+        def recv(self):
+            self.calls += 1
+            if self.calls == 1:
+                raise kalshi_ws.websocket.WebSocketTimeoutException("idle")
+            return ""
+
+        def ping(self):
+            self.pings += 1
+
+    ws = IdleThenClosed()
+    feed = KalshiWebSocketFeed(
+        client=_WsAuthClient(),
+        url="wss://example.test",
+        on_message=lambda _message: None,
+        read_timeout_seconds=30,
+    )
+    feed._running = True
+    monkeypatch.setattr(feed, "_connect", lambda: ws)
+    monkeypatch.setattr(feed, "_subscription_commands", lambda _tickers: [])
+    feed._tickers = {"M"}
+    monkeypatch.setattr(feed, "reconnect_seconds", 0)
+
+    def stop_after_close(_seconds):
+        feed._running = False
+
+    monkeypatch.setattr("kalshi_ws.time.sleep", stop_after_close)
+    feed._run()
+
+    assert ws.timeout == 30
+    assert ws.pings == 1
+
+
 def test_production_strategy_parameters_match_requested_policy() -> None:
     config = json.loads(Path("kalshi_weather_config.json").read_text(encoding="utf-8"))
     assert config["model"]["buy_start_hour"] == 12
@@ -704,6 +750,7 @@ def test_production_strategy_parameters_match_requested_policy() -> None:
     assert config["kalshi"]["websocket_fallback_urls"] == [
         "wss://external-api-ws.kalshi.com/trade-api/ws/v2"
     ]
+    assert config["kalshi"]["websocket_read_timeout_seconds"] == 30
     assert config["observations"]["station"] == "KAUS"
     assert config["observations"]["timezone"] == "America/Chicago"
     assert config["trading"]["max_buy_price"] == 0.85

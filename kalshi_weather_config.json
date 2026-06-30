@@ -6,6 +6,7 @@
       "wss://external-api-ws.kalshi.com/trade-api/ws/v2"
     ],
     "websocket_reconnect_seconds": 2,
+    "websocket_read_timeout_seconds": 30,
     "series_ticker": "KXHIGHAUS",
     "api_key_id_env": "KALSHI_API_KEY_ID",
     "private_key_path_env": "KALSHI_PRIVATE_KEY_PATH",

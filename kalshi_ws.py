@@ -26,6 +26,7 @@ class KalshiWebSocketFeed:
         on_message: Callable[[dict[str, Any]], None],
         reconnect_seconds: float = 2.0,
         fallback_urls: list[str] | None = None,
+        read_timeout_seconds: float = 30.0,
     ) -> None:
         self.client = client
         urls = [url, *(fallback_urls or [])]
@@ -35,6 +36,7 @@ class KalshiWebSocketFeed:
         self.url = self.urls[0]
         self.on_message = on_message
         self.reconnect_seconds = reconnect_seconds
+        self.read_timeout_seconds = max(5.0, float(read_timeout_seconds))
         self._lock = threading.RLock()
         self._books: dict[str, dict[str, dict[float, float]]] = {}
         self._snapshots: set[str] = set()
@@ -191,15 +193,27 @@ class KalshiWebSocketFeed:
                 with self._lock:
                     self._snapshots.difference_update(tickers)
                 ws = self._connect()
+                ws.settimeout(self.read_timeout_seconds)
                 with self._lock:
                     self._ws = ws
                 for command in self._subscription_commands(tickers):
                     ws.send(json.dumps(command))
                 LOGGER.info(
-                    "Kalshi websocket connected tickers=%s", tickers
+                    "Kalshi websocket connected tickers=%s read_timeout_seconds=%s",
+                    tickers,
+                    self.read_timeout_seconds,
                 )
                 while self._running:
-                    raw = ws.recv()
+                    try:
+                        raw = ws.recv()
+                    except websocket.WebSocketTimeoutException:
+                        # An idle Kalshi market may legitimately publish no
+                        # messages for many seconds. Keep the snapshot and
+                        # connection alive instead of treating idleness as a
+                        # disconnect that starves the execution manager.
+                        ws.ping()
+                        LOGGER.debug("Kalshi websocket idle; ping sent")
+                        continue
                     if not raw:
                         raise ConnectionError("Kalshi websocket closed")
                     message = json.loads(raw)

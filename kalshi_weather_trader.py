@@ -1489,6 +1489,11 @@ def main() -> None:
                     "websocket_reconnect_seconds", 2
                 )
             ),
+            read_timeout_seconds=float(
+                config["kalshi"].get(
+                    "websocket_read_timeout_seconds", 30
+                )
+            ),
             fallback_urls=[
                 str(url)
                 for url in config["kalshi"].get("websocket_fallback_urls", [])

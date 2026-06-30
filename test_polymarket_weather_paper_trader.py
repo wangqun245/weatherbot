@@ -345,6 +345,42 @@ class ModelAwcLiveSingleIntervalTest(unittest.TestCase):
         self.assertFalse(submissions[0]["notify_submitted"])
         self.assertEqual({"yes-token": "order-1"}, batch.open_order_ids)
 
+    def test_managed_balance_does_not_regress_confirmed_websocket_fills(self):
+        manager = bot.LiveTradingManager(self.config)
+        manager.executor = SimpleNamespace(
+            _get_token_balance_optional=lambda _token, refresh=False: 0.0
+        )
+        batch = SimpleNamespace(
+            acquired_shares={"yes-token": 15.0},
+            baseline_balances={"yes-token": 0.0},
+        )
+
+        self.assertEqual(15.0, manager._batch_token_balance(batch, "yes-token"))
+
+    def test_adjacent_repair_never_chases_beyond_per_leg_target(self):
+        manager = bot.LiveTradingManager(self.config)
+        submissions = []
+        manager._submit_batch_order = lambda batch, leg_index, shares, price, reason: submissions.append(
+            (leg_index, shares, price, reason)
+        )
+        manager._cancel_batch_order = lambda *_args, **_kwargs: None
+        batch = SimpleNamespace(
+            batch_id="Chicago:KORD:2026-06-30:hour_12:adjacent",
+            token_ids=("left", "right"),
+            acquired_shares={"left": 18.0, "right": 0.0},
+            average_prices={"left": 0.66, "right": 0.19},
+            open_order_ids={},
+            target_shares=10.0,
+            reason="model_awc_managed_adjacent_hour_12",
+            repair_token_id="",
+            next_action_ts=0.0,
+        )
+
+        manager._manage_adjacent_hourly_batch(batch)
+
+        self.assertEqual(1, len(submissions))
+        self.assertEqual(10, submissions[0][1])
+
 
 class MetarMomentumTest(unittest.TestCase):
     def test_websocket_message_prices_extracts_nested_changes(self):

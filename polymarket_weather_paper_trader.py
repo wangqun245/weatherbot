@@ -4423,9 +4423,16 @@ class LiveTradingManager:
         # cached balance is only a reconciliation fallback; forcing a refresh
         # on every market tick caused balance-allowance request storms.
         current = self.executor._get_token_balance_optional(token, refresh=False)
+        confirmed = batch.acquired_shares.get(token, 0.0)
         if current is None:
-            return batch.acquired_shares.get(token, 0.0)
-        return max(0.0, float(current) - batch.baseline_balances.get(token, 0.0))
+            return confirmed
+        reconciled = max(
+            0.0,
+            float(current) - batch.baseline_balances.get(token, 0.0),
+        )
+        # Cached balances can lag websocket fill confirmations. Never let a
+        # stale cache erase confirmed fills and cause the manager to rebuy.
+        return max(confirmed, reconciled)
 
     def _cancel_batch_order(
         self,
@@ -4623,6 +4630,10 @@ class LiveTradingManager:
         left, right = batch.token_ids
         left_qty = batch.acquired_shares[left]
         right_qty = batch.acquired_shares[right]
+        target = max(0.0, batch.target_shares)
+        if left_qty >= target and right_qty >= target:
+            self._close_hourly_batch(batch, "target_filled")
+            return
         epsilon = 0.5
         if abs(left_qty - right_qty) >= epsilon:
             richer = left if left_qty > right_qty else right
@@ -4631,7 +4642,11 @@ class LiveTradingManager:
                 self._cancel_batch_order(
                     batch, token, reason="adjacent_imbalance_reprice"
                 )
-            deficit = int(abs(left_qty - right_qty))
+            richer_qty = batch.acquired_shares[richer]
+            poorer_qty = batch.acquired_shares[poorer]
+            # Repair only up to the configured per-leg target. If one leg
+            # somehow overshoots, do not amplify it by chasing that excess.
+            deficit = int(max(0.0, min(richer_qty, target) - poorer_qty))
             if deficit < 1 or poorer in batch.open_order_ids:
                 return
             other_price = batch.average_prices.get(richer, 0.0)

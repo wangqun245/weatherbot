@@ -44,7 +44,9 @@ import websocket
 from featurize_metar_history import (
     MetarRow as FeatureMetarRow,
     STATION_IDS as FEATURE_STATION_IDS,
+    add_daily_temperature_context_features,
     add_observation_context_features,
+    daily_temperature_context_series,
     decode_metar,
     nearest_lag_value,
 )
@@ -373,11 +375,11 @@ def default_config() -> dict[str, Any]:
         "depth_price_notional_multiplier": 1.0,
         "depth_price_extra_levels": 0,
         "model_awc_enabled": True,
-        "model_awc_model_path": "models/lightgbm_rolling_6y_holdout_24h_lag10_speci_context_regular_20260626/lightgbm_metar_high_rolling_6y_best.pkl",
+        "model_awc_model_path": "models/lightgbm_rolling_6y_holdout_24h_lag10_speci_context_regular_prevday_20260630/lightgbm_metar_high_rolling_6y_best.pkl",
         "model_awc_live_stations": ["KMIA", "KLAX", "KSFO", "KSEA", "KHOU", "KAUS", "KATL", "KDAL"],
         "model_awc_buy_start_hour": 12,
         "model_awc_buy_end_hour": 16,
-        "model_awc_metar_lookback_hours": 11,
+        "model_awc_metar_lookback_hours": 48,
         "model_awc_observation_minute": 53,
         "model_awc_station_observation_minutes": {
             "KORD": 51,
@@ -402,7 +404,7 @@ def default_config() -> dict[str, Any]:
         "model_awc_tgftp_poll_interval_seconds": 2,
         "model_awc_tgftp_request_timeout_seconds": 2,
         "model_awc_tgftp_poll_timeout_seconds": 300,
-        "model_awc_tgftp_awc_history_hours": 11,
+        "model_awc_tgftp_awc_history_hours": 48,
         "model_awc_awc_max_attempts": 3,
         "model_awc_awc_retry_interval_seconds": 3,
         "model_awc_adjacent_yes_max_total_price": 0.9,
@@ -2497,6 +2499,28 @@ def model_awc_required_context_hours(config: dict[str, Any]) -> int:
     return max(context_hours, default=6)
 
 
+def model_awc_requires_previous_day_context(config: dict[str, Any]) -> bool:
+    """Return whether the loaded model expects previous/current local-day context columns."""
+    model = model_awc_load_model(config)
+    feature_names = {str(name) for name in getattr(model, "feature_name_", [])}
+    return bool(
+        {
+            "previous_local_day_high_f",
+            "previous_local_day_low_f",
+            "current_local_day_min_temp_f_so_far",
+        }
+        & feature_names
+    )
+
+
+def model_awc_required_history_hours(config: dict[str, Any]) -> int:
+    """Return the minimum AWC lookback needed by the loaded model features."""
+    required = max(model_awc_required_lag_hours(config), model_awc_required_context_hours(config)) + 1
+    if model_awc_requires_previous_day_context(config):
+        required = max(required, 48)
+    return required
+
+
 def model_awc_parse_row(row: dict[str, Any], station: str) -> Optional[FeatureMetarRow]:
     """Convert one AviationWeather JSON row into the feature pipeline row shape."""
     raw_metar = str(row.get("rawOb") or row.get("raw") or row.get("metar") or "").strip()
@@ -2566,13 +2590,15 @@ def model_awc_feature_row(
     """Build one current model feature row from recent AWC METAR rows."""
     station = station.upper()
     tz = city_timezone(config, city)
+    target_date = date.fromisoformat(event_date)
+    previous_date = target_date - timedelta(days=1)
     parsed = []
     for row in rows:
         item = model_awc_parse_row(row, station)
         if item is None:
             continue
         local_dt = item.valid_utc.astimezone(tz)
-        if local_dt.date().isoformat() != event_date:
+        if local_dt.date() not in {previous_date, target_date}:
             continue
         parsed.append(item)
     parsed.sort(key=lambda item: item.valid_utc)
@@ -2581,7 +2607,11 @@ def model_awc_feature_row(
 
     regular_minute = model_awc_station_observation_minute(config, station)
     extra_flags = [model_awc_is_extra_metar_row(item, regular_minute) for item in parsed]
-    regular_inputs = [item for item, is_extra in zip(parsed, extra_flags) if not is_extra]
+    regular_inputs = [
+        item
+        for item, is_extra in zip(parsed, extra_flags)
+        if not is_extra and item.valid_utc.astimezone(tz).date() == target_date
+    ]
     if not regular_inputs:
         LOGGER.info("model awc skip no regular input rows station=%s rows=%s regular_minute=%s", station, len(parsed), regular_minute)
         return None
@@ -2600,6 +2630,7 @@ def model_awc_feature_row(
     valid_times = [item.valid_utc for item in parsed]
     decoded_rows = [decode_metar(item, station, tz) for item in parsed]
     temp_values = [decoded.get("temp_f") for decoded in decoded_rows]
+    previous_highs, previous_lows, current_mins = daily_temperature_context_series(parsed, temp_values, tz)
     tolerance = timedelta(minutes=int(config["trading"].get("model_awc_lag_tolerance_minutes", 30)))
     current_temp = features.get("temp_f")
     for hours in range(1, model_awc_required_lag_hours(config) + 1):
@@ -2609,6 +2640,7 @@ def model_awc_feature_row(
             None if current_temp is None or lag_value is None else float(current_temp) - float(lag_value)
         )
     latest_idx = parsed.index(latest)
+    add_daily_temperature_context_features(features, latest_idx, previous_highs, previous_lows, current_mins)
     context_hours = model_awc_required_context_hours(config)
     add_observation_context_features(
         features=features,
@@ -7550,7 +7582,8 @@ def model_awc_tgftp_window_worker(
     interval = max(0.5, float(trading.get("model_awc_tgftp_poll_interval_seconds", 2)))
     request_timeout = max(0.5, float(trading.get("model_awc_tgftp_request_timeout_seconds", 2)))
     timeout = max(interval, float(trading.get("model_awc_tgftp_poll_timeout_seconds", 300)))
-    history_hours = max(1, int(trading.get("model_awc_tgftp_awc_history_hours", 11)))
+    required_history_hours = model_awc_required_history_hours(config)
+    history_hours = max(required_history_hours, int(trading.get("model_awc_tgftp_awc_history_hours", required_history_hours)))
     history_rows = model_awc_fetch_history_with_retry(
         config,
         station,
@@ -7674,7 +7707,7 @@ def model_awc_supervisor(config: dict[str, Any]) -> None:
     )
     poll_interval_seconds = max(10, int(config["trading"].get("model_awc_poll_interval_seconds", 60)))
     poll_attempts = max(1, int(config["trading"].get("model_awc_poll_attempts", 5)))
-    required_history_hours = model_awc_required_lag_hours(config) + 1
+    required_history_hours = model_awc_required_history_hours(config)
     lookback_hours = max(
         required_history_hours,
         int(config["trading"].get("model_awc_metar_lookback_hours", required_history_hours)),

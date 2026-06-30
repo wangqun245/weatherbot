@@ -107,7 +107,7 @@
                     "weather_record_receive_window_seconds":  300,
                     "tgftp_window_max_inflight_per_station":  10
                     ,"model_awc_enabled": true
-                    ,"model_awc_model_path": "models/lightgbm_rolling_6y_holdout_24h_lag10_speci_context_regular_20260626/lightgbm_metar_high_rolling_6y_best.pkl"
+                    ,"model_awc_model_path": "models/lightgbm_rolling_6y_holdout_24h_lag10_speci_context_regular_prevday_20260630/lightgbm_metar_high_rolling_6y_best.pkl"
                     ,"model_awc_live_stations": [
                         "KMIA",
                         "KLAX",
@@ -120,7 +120,7 @@
                     ]
                     ,"model_awc_buy_start_hour": 12
                     ,"model_awc_buy_end_hour": 16
-                    ,"model_awc_metar_lookback_hours": 11
+                    ,"model_awc_metar_lookback_hours": 48
                     ,"model_awc_observation_minute": 53
                     ,"model_awc_station_observation_minutes": {
                         "KORD": 51,
@@ -145,7 +145,7 @@
                     ,"model_awc_tgftp_poll_interval_seconds": 2
                     ,"model_awc_tgftp_request_timeout_seconds": 2
                     ,"model_awc_tgftp_poll_timeout_seconds": 300
-                    ,"model_awc_tgftp_awc_history_hours": 11
+                    ,"model_awc_tgftp_awc_history_hours": 48
                     ,"model_awc_awc_max_attempts": 3
                     ,"model_awc_awc_retry_interval_seconds": 3
                     ,"model_awc_adjacent_yes_max_total_price": 0.9
@@ -271,7 +271,7 @@
                                            "weather_record_receive_window_seconds":  300,
                                            "tgftp_window_max_inflight_per_station":  10
                                            ,"model_awc_enabled": true
-                                           ,"model_awc_model_path": "models/lightgbm_rolling_6y_holdout_24h_lag10_speci_context_regular_20260626/lightgbm_metar_high_rolling_6y_best.pkl"
+                                           ,"model_awc_model_path": "models/lightgbm_rolling_6y_holdout_24h_lag10_speci_context_regular_prevday_20260630/lightgbm_metar_high_rolling_6y_best.pkl"
                                            ,"model_awc_live_stations": [
                                                "KMIA",
                                                "KLAX",
@@ -284,7 +284,7 @@
                                            ]
                                            ,"model_awc_buy_start_hour": 12
                                            ,"model_awc_buy_end_hour": 16
-                                           ,"model_awc_metar_lookback_hours": 11
+                                           ,"model_awc_metar_lookback_hours": 48
                                            ,"model_awc_observation_minute": 53
                                            ,"model_awc_station_observation_minutes": {
                                                "KORD": 51,
@@ -309,7 +309,7 @@
                                            ,"model_awc_tgftp_poll_interval_seconds": 2
                                            ,"model_awc_tgftp_request_timeout_seconds": 2
                                            ,"model_awc_tgftp_poll_timeout_seconds": 300
-                                           ,"model_awc_tgftp_awc_history_hours": 11
+                                           ,"model_awc_tgftp_awc_history_hours": 48
                                            ,"model_awc_awc_max_attempts": 3
                                            ,"model_awc_awc_retry_interval_seconds": 3
                                            ,"model_awc_adjacent_yes_max_total_price": 0.9

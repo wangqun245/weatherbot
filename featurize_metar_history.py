@@ -427,6 +427,9 @@ BASE_FEATURE_COLUMNS = [
     "wx_token_count",
     *[f"wx_{code.lower()}" for code in WX_CODES],
     "is_extra_metar_report",
+    "previous_local_day_high_f",
+    "previous_local_day_low_f",
+    "current_local_day_min_temp_f_so_far",
 ]
 
 
@@ -545,6 +548,54 @@ def is_extra_metar_report(row: MetarRow, regular_minutes_by_year: dict[int, int]
     return row.valid_utc.minute != regular_minute or " COR " in f" {row.metar} "
 
 
+def daily_temperature_context_series(
+    rows: list[MetarRow],
+    temp_values: list[object | None],
+    tz: ZoneInfo,
+) -> tuple[list[float | None], list[float | None], list[float | None]]:
+    """Return previous local day high/low and same-day min-so-far for each row."""
+    local_dates = [row.valid_utc.astimezone(tz).date() for row in rows]
+    local_day_values: dict[object, list[float]] = {}
+    numeric_temp_values: list[float | None] = []
+    for local_date, value in zip(local_dates, temp_values):
+        try:
+            numeric_value = None if value in (None, "") else float(value)
+        except (TypeError, ValueError):
+            numeric_value = None
+        numeric_temp_values.append(numeric_value)
+        if numeric_value is not None:
+            local_day_values.setdefault(local_date, []).append(numeric_value)
+
+    previous_highs: list[float | None] = []
+    previous_lows: list[float | None] = []
+    current_mins: list[float | None] = []
+    running_min_by_day: dict[object, float] = {}
+
+    for local_date, numeric_value in zip(local_dates, numeric_temp_values):
+        previous_values = local_day_values.get(local_date - timedelta(days=1), [])
+        previous_highs.append(max(previous_values) if previous_values else None)
+        previous_lows.append(min(previous_values) if previous_values else None)
+
+        if numeric_value is not None:
+            running_min = running_min_by_day.get(local_date)
+            running_min_by_day[local_date] = numeric_value if running_min is None else min(running_min, numeric_value)
+        current_mins.append(running_min_by_day.get(local_date))
+
+    return previous_highs, previous_lows, current_mins
+
+
+def add_daily_temperature_context_features(
+    features: dict[str, object | None],
+    row_idx: int,
+    previous_highs: list[float | None],
+    previous_lows: list[float | None],
+    current_mins: list[float | None],
+) -> None:
+    features["previous_local_day_high_f"] = previous_highs[row_idx]
+    features["previous_local_day_low_f"] = previous_lows[row_idx]
+    features["current_local_day_min_temp_f_so_far"] = current_mins[row_idx]
+
+
 def add_observation_context_features(
     features: dict[str, object | None],
     row: MetarRow,
@@ -661,6 +712,7 @@ def write_station_features(
         features["station_id"] = STATION_IDS[station_icao]
     valid_times = [row.valid_utc for row in rows]
     temp_values = [features.get("temp_f") for features in decoded]
+    previous_highs, previous_lows, current_mins = daily_temperature_context_series(rows, temp_values, tz)
     regular_minutes_by_year = regular_observation_minutes_by_year(rows)
     extra_flags = [is_extra_metar_report(row, regular_minutes_by_year) for row in rows]
     extra_window = timedelta(hours=context_hours)
@@ -681,6 +733,7 @@ def write_station_features(
                 continue
 
             temp_f = features.get("temp_f")
+            add_daily_temperature_context_features(features, row_idx, previous_highs, previous_lows, current_mins)
             for hours in range(1, max_lag_hours + 1):
                 lag_value = nearest_lag_value(
                     row.valid_utc - timedelta(hours=hours),

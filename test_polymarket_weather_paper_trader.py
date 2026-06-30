@@ -33,12 +33,14 @@ class ClobPricingTest(unittest.TestCase):
         config = bot.default_config()
 
         self.assertEqual((13, 16), bot.model_awc_station_buy_hours(config, "KATL"))
+        self.assertEqual((13, 16), bot.model_awc_station_buy_hours(config, "KAUS"))
+        self.assertEqual((13, 16), bot.model_awc_station_buy_hours(config, "KORD"))
         self.assertEqual((13, 16), bot.model_awc_station_buy_hours(config, "KDAL"))
         self.assertEqual((13, 16), bot.model_awc_station_buy_hours(config, "KBKF"))
         self.assertEqual((13, 16), bot.model_awc_station_buy_hours(config, "KLGA"))
-        self.assertEqual((10, 14), bot.model_awc_station_buy_hours(config, "KLAX"))
-        self.assertEqual((10, 14), bot.model_awc_station_buy_hours(config, "KMIA"))
-        self.assertEqual((12, 16), bot.model_awc_station_buy_hours(config, "KAUS"))
+        self.assertEqual((11, 15), bot.model_awc_station_buy_hours(config, "KLAX"))
+        self.assertEqual((11, 15), bot.model_awc_station_buy_hours(config, "KMIA"))
+        self.assertEqual((12, 16), bot.model_awc_station_buy_hours(config, "KHOU"))
 
     def test_model_awc_all_model_stations_are_live_by_default(self):
         config = bot.default_config()

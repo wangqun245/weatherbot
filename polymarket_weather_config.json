@@ -125,11 +125,13 @@
                     ,"model_awc_buy_end_hour": 16
                     ,"model_awc_station_buy_hours": {
                         "KATL": [13, 16],
+                        "KAUS": [13, 16],
+                        "KORD": [13, 16],
                         "KDAL": [13, 16],
                         "KBKF": [13, 16],
                         "KLGA": [13, 16],
-                        "KLAX": [10, 14],
-                        "KMIA": [10, 14]
+                        "KLAX": [11, 15],
+                        "KMIA": [11, 15]
                     }
                     ,"model_awc_metar_lookback_hours": 48
                     ,"model_awc_observation_minute": 53
@@ -300,11 +302,13 @@
                                            ,"model_awc_buy_end_hour": 16
                                            ,"model_awc_station_buy_hours": {
                                                "KATL": [13, 16],
+                                               "KAUS": [13, 16],
+                                               "KORD": [13, 16],
                                                "KDAL": [13, 16],
                                                "KBKF": [13, 16],
                                                "KLGA": [13, 16],
-                                               "KLAX": [10, 14],
-                                               "KMIA": [10, 14]
+                                               "KLAX": [11, 15],
+                                               "KMIA": [11, 15]
                                            }
                                            ,"model_awc_metar_lookback_hours": 48
                                            ,"model_awc_observation_minute": 53

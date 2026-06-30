@@ -379,6 +379,12 @@ def default_config() -> dict[str, Any]:
         "model_awc_live_stations": ["KMIA", "KLAX", "KSFO", "KSEA", "KHOU", "KAUS", "KATL", "KDAL"],
         "model_awc_buy_start_hour": 12,
         "model_awc_buy_end_hour": 16,
+        "model_awc_station_buy_hours": {
+            "KATL": [13, 16],
+            "KDAL": [13, 16],
+            "KLAX": [10, 14],
+            "KMIA": [10, 14],
+        },
         "model_awc_metar_lookback_hours": 48,
         "model_awc_observation_minute": 53,
         "model_awc_station_observation_minutes": {
@@ -2552,6 +2558,20 @@ def model_awc_station_observation_minute(config: dict[str, Any], station: str) -
     return min(59, max(0, fallback))
 
 
+def model_awc_station_buy_hours(config: dict[str, Any], station: str) -> tuple[int, int]:
+    """Return the inclusive local-hour trading window for a station."""
+    trading = config.get("trading", {})
+    start_hour = int(trading.get("model_awc_buy_start_hour", 12))
+    end_hour = int(trading.get("model_awc_buy_end_hour", 16))
+    overrides = trading.get("model_awc_station_buy_hours", {})
+    station_hours = overrides.get(station.upper()) if isinstance(overrides, dict) else None
+    if isinstance(station_hours, (list, tuple)) and len(station_hours) == 2:
+        start_hour, end_hour = int(station_hours[0]), int(station_hours[1])
+    if not 0 <= start_hour <= end_hour <= 23:
+        raise ValueError(f"invalid model AWC buy hours for {station}: {start_hour}-{end_hour}")
+    return start_hour, end_hour
+
+
 def model_awc_station_stagger_seconds(config: dict[str, Any], station: str) -> int:
     """Stagger stations sharing the same observation minute to reduce API bursts."""
     station = station.upper()
@@ -2618,8 +2638,7 @@ def model_awc_feature_row(
 
     latest = regular_inputs[-1]
     latest_local = latest.valid_utc.astimezone(tz)
-    start_hour = int(config["trading"].get("model_awc_buy_start_hour", 12))
-    end_hour = int(config["trading"].get("model_awc_buy_end_hour", 16))
+    start_hour, end_hour = model_awc_station_buy_hours(config, station)
     if latest_local.hour < start_hour or latest_local.hour > end_hour:
         return None
 
@@ -7719,10 +7738,11 @@ def model_awc_supervisor(config: dict[str, Any]) -> None:
     window_state: dict[str, dict[str, Any]] = {}
     event_refresh_at = 0.0
     LOGGER.info(
-        "model awc supervisor started live_station=%s local_hours=%s-%s source=%s poll_delay_seconds=%s poll_interval_seconds=%s poll_attempts_per_window=%s lookback_hours=%s station_observation_minutes=%s",
+        "model awc supervisor started live_station=%s default_local_hours=%s-%s station_local_hours=%s source=%s poll_delay_seconds=%s poll_interval_seconds=%s poll_attempts_per_window=%s lookback_hours=%s station_observation_minutes=%s",
         model_awc_live_station(config),
         start_hour,
         end_hour,
+        config["trading"].get("model_awc_station_buy_hours", {}),
         "tgftp" if tgftp_enabled else "awc",
         poll_delay_seconds,
         poll_interval_seconds,
@@ -7770,6 +7790,7 @@ def model_awc_supervisor(config: dict[str, Any]) -> None:
                     if event_date:
                         events_by_date.setdefault(event_date, []).append(event)
 
+                start_hour, end_hour = model_awc_station_buy_hours(config, station)
                 for event_date, events_for_date in events_by_date.items():
                     try:
                         target_date = date.fromisoformat(event_date)

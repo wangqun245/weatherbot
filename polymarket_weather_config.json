@@ -120,6 +120,12 @@
                     ]
                     ,"model_awc_buy_start_hour": 12
                     ,"model_awc_buy_end_hour": 16
+                    ,"model_awc_station_buy_hours": {
+                        "KATL": [13, 16],
+                        "KDAL": [13, 16],
+                        "KLAX": [10, 14],
+                        "KMIA": [10, 14]
+                    }
                     ,"model_awc_metar_lookback_hours": 48
                     ,"model_awc_observation_minute": 53
                     ,"model_awc_station_observation_minutes": {

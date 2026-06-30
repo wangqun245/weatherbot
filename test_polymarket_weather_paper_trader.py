@@ -29,6 +29,15 @@ class ClobPricingTest(unittest.TestCase):
         self.original_clob_get = bot.clob_get
         self.original_clob_post = bot.clob_post
 
+    def test_model_awc_station_buy_hours_use_overrides_and_default(self):
+        config = bot.default_config()
+
+        self.assertEqual((13, 16), bot.model_awc_station_buy_hours(config, "KATL"))
+        self.assertEqual((13, 16), bot.model_awc_station_buy_hours(config, "KDAL"))
+        self.assertEqual((10, 14), bot.model_awc_station_buy_hours(config, "KLAX"))
+        self.assertEqual((10, 14), bot.model_awc_station_buy_hours(config, "KMIA"))
+        self.assertEqual((12, 16), bot.model_awc_station_buy_hours(config, "KAUS"))
+
     def tearDown(self):
         bot.clob_get = self.original_clob_get
         bot.clob_post = self.original_clob_post

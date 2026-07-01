@@ -73,6 +73,23 @@ def setup_logging(config: dict[str, Any]) -> None:
     )
 
 
+def station_buy_hours(config: dict[str, Any]) -> tuple[int, int]:
+    """Return the inclusive local-hour trading window for the configured station."""
+    model = config["model"]
+    start_hour = int(model["buy_start_hour"])
+    end_hour = int(model["buy_end_hour"])
+    station = str(config["observations"]["station"]).upper()
+    overrides = model.get("station_buy_hours", {})
+    station_hours = overrides.get(station) if isinstance(overrides, dict) else None
+    if isinstance(station_hours, (list, tuple)) and len(station_hours) == 2:
+        start_hour, end_hour = int(station_hours[0]), int(station_hours[1])
+    if not 0 <= start_hour <= end_hour <= 23:
+        raise ValueError(
+            f"Invalid Kalshi trading hours for {station}: {start_hour}-{end_hour}"
+        )
+    return start_hour, end_hour
+
+
 def parse_obs_time(value: Any) -> datetime | None:
     if isinstance(value, (int, float)):
         return datetime.fromtimestamp(float(value), tz=timezone.utc)
@@ -236,16 +253,12 @@ class KalshiMetarCoordinator:
 
     def poll(self) -> list[dict[str, Any]] | None:
         observations = self.config["observations"]
-        model = self.config["model"]
         local_timezone = configured_timezone(self.config)
         now_utc = datetime.now(timezone.utc)
         now_local = now_utc.astimezone(local_timezone)
         hour = now_local.hour
-        if not (
-            int(model["buy_start_hour"])
-            <= hour
-            <= int(model["buy_end_hour"])
-        ):
+        start_hour, end_hour = station_buy_hours(self.config)
+        if not start_hour <= hour <= end_hour:
             return None
 
         minute = int(observations["regular_observation_minute"])
@@ -501,11 +514,8 @@ def build_feature_row(
         return None
     latest = regular[-1]
     latest_local = latest.valid_utc.astimezone(local_timezone)
-    if not (
-        int(config["model"]["buy_start_hour"])
-        <= latest_local.hour
-        <= int(config["model"]["buy_end_hour"])
-    ):
+    start_hour, end_hour = station_buy_hours(config)
+    if not start_hour <= latest_local.hour <= end_hour:
         return None
 
     decoded_rows = [

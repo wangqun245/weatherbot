@@ -40,7 +40,24 @@
   "model": {
     "path": "kalshi/models/rolling_6y_holdout_lag10_speci_two_asos_16stations_20260628/lightgbm_metar_high_rolling_6y_best.pkl",
     "buy_start_hour": 12,
-    "buy_end_hour": 16
+    "buy_end_hour": 16,
+    "station_buy_hours": {
+      "KATL": [14, 16],
+      "KAUS": [14, 17],
+      "KBOS": [14, 17],
+      "KDCA": [14, 17],
+      "KDFW": [16, 17],
+      "KLAS": [13, 16],
+      "KMDW": [14, 16],
+      "KMIA": [12, 16],
+      "KMSP": [14, 16],
+      "KOKC": [14, 17],
+      "KPHL": [14, 17],
+      "KPHX": [14, 16],
+      "KSAT": [14, 17],
+      "KSEA": [14, 17],
+      "KSFO": [14, 17]
+    }
   },
   "trading": {
     "live_enabled": true,

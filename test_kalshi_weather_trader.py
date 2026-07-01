@@ -743,6 +743,23 @@ def test_production_strategy_parameters_match_requested_policy() -> None:
     config = json.loads(Path("kalshi_weather_config.json").read_text(encoding="utf-8"))
     assert config["model"]["buy_start_hour"] == 12
     assert config["model"]["buy_end_hour"] == 16
+    assert config["model"]["station_buy_hours"] == {
+        "KATL": [14, 16],
+        "KAUS": [14, 17],
+        "KBOS": [14, 17],
+        "KDCA": [14, 17],
+        "KDFW": [16, 17],
+        "KLAS": [13, 16],
+        "KMDW": [14, 16],
+        "KMIA": [12, 16],
+        "KMSP": [14, 16],
+        "KOKC": [14, 17],
+        "KPHL": [14, 17],
+        "KPHX": [14, 16],
+        "KSAT": [14, 17],
+        "KSEA": [14, 17],
+        "KSFO": [14, 17],
+    }
     assert (
         config["kalshi"]["websocket_url"]
         == "wss://api.elections.kalshi.com/trade-api/ws/v2"
@@ -768,6 +785,18 @@ def test_production_strategy_parameters_match_requested_policy() -> None:
     assert config["observations"]["tgftp_start_delay_seconds"] == 60
     assert config["observations"]["tgftp_poll_interval_seconds"] == 2
     assert config["observations"]["tgftp_poll_timeout_seconds"] == 300
+
+
+def test_station_buy_hours_use_station_overrides_and_default() -> None:
+    config = json.loads(Path("kalshi_weather_config.json").read_text(encoding="utf-8"))
+    expected = dict(config["model"]["station_buy_hours"])
+    for station, hours in expected.items():
+        item = json.loads(json.dumps(config))
+        item["observations"]["station"] = station
+        assert trader.station_buy_hours(item) == tuple(hours)
+
+    config["observations"]["station"] = "KNYC"
+    assert trader.station_buy_hours(config) == (12, 16)
 
 
 def test_city_configs_only_enable_three_live_stations() -> None:

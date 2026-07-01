@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import json
+import math
 import time
 from datetime import date, datetime, timezone
 from pathlib import Path
@@ -488,7 +489,35 @@ def test_adjacent_single_leg_fill_places_balance_repair() -> None:
     assert repair["count"] == 5
     assert repair["price"] == 0.55
     assert repair["time_in_force"] == "good_till_canceled"
-    assert repair["expiration_time"] == int(batch.expires_ts)
+    assert repair["expiration_time"] == math.ceil(batch.expires_ts)
+
+
+def test_manager_does_not_submit_gtc_order_at_expiration_boundary() -> None:
+    client = _FakeClient()
+    feed = _FakeFeed({"SINGLE": []})
+    manager = _manager(client, feed)
+    batch = HourlyBatch(
+        batch_id="expiring",
+        window_key="2026-06-28:hour_12",
+        mode="single",
+        legs=(ManagedLeg("SINGLE", "YES"),),
+        target_shares=10,
+        predicted_high_f=90,
+        created_ts=time.time() - 2399,
+        expires_ts=time.time() + 1,
+        acquired=[0],
+        total_cost=[0],
+    )
+
+    created = manager._submit_orders(
+        batch,
+        [(0, 10, 0.85)],
+        "good_till_canceled",
+    )
+
+    assert created == []
+    assert client.singles == []
+    assert batch.closed
 
 
 def test_single_manager_uses_remaining_notional_not_fixed_shares() -> None:

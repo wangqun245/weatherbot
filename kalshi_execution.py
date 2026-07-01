@@ -479,8 +479,17 @@ class KalshiHourlyExecutionManager:
         requests: list[tuple[int, int, float]],
         time_in_force: str,
     ) -> list[ManagedOrder]:
+        # Do not race the exchange at the end of the management window.
+        # The REST expiration is second-granularity and the request itself
+        # consumes part of the remaining lifetime.
+        if (
+            time_in_force == "good_till_canceled"
+            and time.time() >= batch.expires_ts - 2.0
+        ):
+            self.close_batch(batch, "management_window_expiring")
+            return []
         expiration = (
-            int(batch.expires_ts)
+            math.ceil(batch.expires_ts)
             if time_in_force == "good_till_canceled"
             else None
         )

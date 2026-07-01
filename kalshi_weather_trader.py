@@ -489,6 +489,29 @@ def add_asos_extrema_context(
         )
 
 
+def observed_local_day_high_f_so_far(
+    rows: list[MetarRow],
+    temp_values: list[object | None],
+    local_timezone: Any,
+    as_of_utc: datetime,
+) -> float | None:
+    """Return the factual local-day METAR high through the trigger observation."""
+    target_date = as_of_utc.astimezone(local_timezone).date()
+    observed: list[float] = []
+    for row, value in zip(rows, temp_values):
+        if (
+            row.valid_utc > as_of_utc
+            or row.valid_utc.astimezone(local_timezone).date() != target_date
+        ):
+            continue
+        try:
+            if value not in (None, ""):
+                observed.append(float(value))
+        except (TypeError, ValueError):
+            continue
+    return max(observed) if observed else None
+
+
 def build_feature_row(
     config: dict[str, Any],
     model: Any,
@@ -528,6 +551,14 @@ def build_feature_row(
     features["local_week_of_year"] = float(latest_local.isocalendar().week)
     valid_times = [row.valid_utc for row in rows]
     temp_values = [decoded.get("temp_f") for decoded in decoded_rows]
+    features["_observed_local_day_high_f_so_far"] = (
+        observed_local_day_high_f_so_far(
+            rows,
+            temp_values,
+            local_timezone,
+            latest.valid_utc,
+        )
+    )
     tolerance = timedelta(minutes=int(observations["lag_tolerance_minutes"]))
     current_temp = features.get("temp_f")
     for hours in range(1, required_lag_hours(model) + 1):
@@ -571,7 +602,25 @@ def predict(model: Any, features: dict[str, Any]) -> float:
             row.append(float("nan"))
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
-        return float(model.predict([row], num_iteration=model.best_iteration_)[0])
+        raw_prediction = float(
+            model.predict([row], num_iteration=model.best_iteration_)[0]
+        )
+    observed_high = features.get("_observed_local_day_high_f_so_far")
+    try:
+        factual_floor = (
+            None if observed_high in (None, "") else float(observed_high)
+        )
+    except (TypeError, ValueError):
+        factual_floor = None
+    if factual_floor is not None and raw_prediction < factual_floor:
+        LOGGER.info(
+            "Kalshi model prediction raised to observed high "
+            "raw_prediction_f=%r observed_high_f=%r",
+            raw_prediction,
+            factual_floor,
+        )
+        return factual_floor
+    return raw_prediction
 
 
 def event_date_from_ticker(event_ticker: str) -> date | None:

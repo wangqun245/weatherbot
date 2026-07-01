@@ -172,6 +172,26 @@ class _FeatureModel:
     ]
 
 
+class _LowPredictionModel:
+    feature_name_ = ["temp_f"]
+    best_iteration_ = None
+
+    def predict(self, rows, num_iteration=None):
+        return [91.81379838220865]
+
+
+def test_prediction_cannot_be_below_observed_local_day_high() -> None:
+    prediction = trader.predict(
+        _LowPredictionModel(),
+        {
+            "temp_f": 91.04,
+            "_observed_local_day_high_f_so_far": 91.94,
+        },
+    )
+
+    assert prediction == 91.94
+
+
 def test_build_feature_row_adds_rolling_metar_context() -> None:
     config = {
         "observations": {
@@ -232,6 +252,7 @@ def test_build_feature_row_adds_rolling_metar_context() -> None:
     assert features["metar_obs_min_temp_f_past_6h"] == 82.94
     assert features["metar_obs_latest_temp_f_past_6h"] == 89.06
     assert features["metar_obs_temp_range_f_past_6h"] == 7.02000000000001
+    assert features["_observed_local_day_high_f_so_far"] == 89.96000000000001
     assert features["extra_metar_count_past_6h"] == 0
     assert features["has_extra_metar_past_6h"] == 0
     assert features["asos_6h_max_temp_f"] == 84.91999999999999

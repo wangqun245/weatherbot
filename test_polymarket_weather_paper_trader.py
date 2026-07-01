@@ -56,6 +56,22 @@ class ClobPricingTest(unittest.TestCase):
             bot.model_awc_live_stations(config),
         )
 
+    def test_model_awc_prediction_cannot_be_below_observed_high(self):
+        model = SimpleNamespace(
+            feature_name_=["temp_f"],
+            best_iteration_=None,
+            predict=lambda rows, num_iteration=None: [91.81379838220865],
+        )
+        features = {
+            "temp_f": 91.04,
+            "_observed_local_day_high_f_so_far": 91.94,
+        }
+
+        with mock.patch.object(bot, "model_awc_load_model", return_value=model):
+            prediction = bot.model_awc_predict_high(self.config, features)
+
+        self.assertEqual(91.94, prediction)
+
     def tearDown(self):
         bot.clob_get = self.original_clob_get
         bot.clob_post = self.original_clob_post
@@ -265,6 +281,29 @@ class ModelAwcLiveSingleIntervalTest(unittest.TestCase):
         self.assertEqual(("YES",), args[5])
         self.assertEqual(0.0, args[6])
         self.assertEqual("single", args[8])
+        self.assertEqual(10.0, kwargs["target_notional_usd"])
+
+    def test_live_single_interval_price_above_cap_starts_resting_notional_manager(self):
+        fake_live_trader, trade = self._run_with_fake_live_trader(98.51, best_price=0.96)
+
+        self.assertIsNone(trade)
+        self.assertEqual([], fake_live_trader.submissions)
+        self.assertEqual(1, len(fake_live_trader.batches))
+        args, kwargs = fake_live_trader.batches[0]
+        self.assertEqual((self.market,), args[4])
+        self.assertEqual(("YES",), args[5])
+        self.assertEqual("single", args[8])
+        self.assertEqual(10.0, kwargs["target_notional_usd"])
+
+    def test_live_boundary_snap_price_above_cap_starts_resting_notional_manager(self):
+        fake_live_trader, trade = self._run_with_fake_live_trader(97.98, best_price=0.96)
+
+        self.assertIsNone(trade)
+        self.assertEqual([], fake_live_trader.submissions)
+        self.assertEqual(1, len(fake_live_trader.batches))
+        args, kwargs = fake_live_trader.batches[0]
+        self.assertEqual((self.market,), args[4])
+        self.assertEqual(("YES",), args[5])
         self.assertEqual(10.0, kwargs["target_notional_usd"])
 
     def test_live_single_interval_buys_partial_before_notional_manager(self):

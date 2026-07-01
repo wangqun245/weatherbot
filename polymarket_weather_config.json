@@ -122,16 +122,16 @@
                         "KSFO"
                     ]
                     ,"model_awc_buy_start_hour": 12
-                    ,"model_awc_buy_end_hour": 16
+                    ,"model_awc_buy_end_hour": 17
                     ,"model_awc_station_buy_hours": {
-                        "KATL": [13, 16],
-                        "KAUS": [13, 16],
-                        "KORD": [13, 16],
-                        "KDAL": [13, 16],
-                        "KBKF": [13, 16],
-                        "KLGA": [13, 16],
-                        "KLAX": [11, 15],
-                        "KMIA": [11, 15]
+                        "KATL": [13, 17],
+                        "KAUS": [13, 17],
+                        "KORD": [13, 17],
+                        "KDAL": [13, 17],
+                        "KBKF": [13, 17],
+                        "KLGA": [13, 17],
+                        "KLAX": [11, 16],
+                        "KMIA": [11, 16]
                     }
                     ,"model_awc_metar_lookback_hours": 48
                     ,"model_awc_observation_minute": 53
@@ -299,16 +299,16 @@
                                                "KSFO"
                                            ]
                                            ,"model_awc_buy_start_hour": 12
-                                           ,"model_awc_buy_end_hour": 16
+                                           ,"model_awc_buy_end_hour": 17
                                            ,"model_awc_station_buy_hours": {
-                                               "KATL": [13, 16],
-                                               "KAUS": [13, 16],
-                                               "KORD": [13, 16],
-                                               "KDAL": [13, 16],
-                                               "KBKF": [13, 16],
-                                               "KLGA": [13, 16],
-                                               "KLAX": [11, 15],
-                                               "KMIA": [11, 15]
+                                               "KATL": [13, 17],
+                                               "KAUS": [13, 17],
+                                               "KORD": [13, 17],
+                                               "KDAL": [13, 17],
+                                               "KBKF": [13, 17],
+                                               "KLGA": [13, 17],
+                                               "KLAX": [11, 16],
+                                               "KMIA": [11, 16]
                                            }
                                            ,"model_awc_metar_lookback_hours": 48
                                            ,"model_awc_observation_minute": 53

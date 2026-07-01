@@ -32,15 +32,21 @@ class ClobPricingTest(unittest.TestCase):
     def test_model_awc_station_buy_hours_use_overrides_and_default(self):
         config = bot.default_config()
 
-        self.assertEqual((13, 17), bot.model_awc_station_buy_hours(config, "KATL"))
-        self.assertEqual((13, 17), bot.model_awc_station_buy_hours(config, "KAUS"))
-        self.assertEqual((13, 17), bot.model_awc_station_buy_hours(config, "KORD"))
-        self.assertEqual((13, 17), bot.model_awc_station_buy_hours(config, "KDAL"))
-        self.assertEqual((13, 17), bot.model_awc_station_buy_hours(config, "KBKF"))
-        self.assertEqual((13, 17), bot.model_awc_station_buy_hours(config, "KLGA"))
-        self.assertEqual((11, 16), bot.model_awc_station_buy_hours(config, "KLAX"))
-        self.assertEqual((11, 16), bot.model_awc_station_buy_hours(config, "KMIA"))
-        self.assertEqual((12, 17), bot.model_awc_station_buy_hours(config, "KHOU"))
+        expected = {
+            "KATL": (14, 17),
+            "KAUS": (14, 17),
+            "KHOU": (14, 17),
+            "KORD": (14, 17),
+            "KDAL": (15, 17),
+            "KBKF": (15, 17),
+            "KLGA": (14, 17),
+            "KLAX": (12, 16),
+            "KSEA": (14, 17),
+            "KSFO": (13, 16),
+            "KMIA": (12, 16),
+        }
+        for station, hours in expected.items():
+            self.assertEqual(hours, bot.model_awc_station_buy_hours(config, station))
 
     def test_model_awc_all_model_stations_are_live_by_default(self):
         config = bot.default_config()

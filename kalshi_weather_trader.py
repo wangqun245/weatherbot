@@ -894,11 +894,22 @@ def select_order_plan(
 
 
 def contract_count_for_order(price: float, trading: dict[str, Any]) -> int:
-    """Request the configured share count without exceeding per-order notional."""
+    """Request base contracts, increasing quantity to satisfy minimum notional."""
+    if price <= 0:
+        return 0
     requested = max(1, int(trading.get("default_contracts", 10)))
     max_cost = max(0.01, float(trading.get("max_order_cost_dollars", 5.0)))
-    affordable = int(math.floor((max_cost + 1e-9) / price)) if price > 0 else 0
-    return max(0, min(requested, affordable))
+    min_cost = max(
+        0.0,
+        float(trading.get("min_order_cost_dollars", 1.0)),
+    )
+    minimum_contracts = max(
+        1,
+        int(math.ceil((min_cost - 1e-9) / price)),
+    )
+    target = max(requested, minimum_contracts)
+    affordable = int(math.floor((max_cost + 1e-9) / price))
+    return target if target <= affordable else 0
 
 
 def partial_contract_plan_for_notional(
@@ -995,11 +1006,18 @@ def configured_city_configs(config: dict[str, Any]) -> list[dict[str, Any]]:
     for city in cities:
         if not isinstance(city, dict) or not city.get("station"):
             continue
+        station = str(city["station"]).upper()
+        if station not in STATION_IDS:
+            LOGGER.warning(
+                "Skipping station absent from model station IDs station=%s",
+                station,
+            )
+            continue
         item = copy.deepcopy(config)
         item["city"] = dict(city)
         item["observations"].update(
             {
-                "station": str(city["station"]).upper(),
+                "station": station,
                 "timezone": city["timezone"],
                 "regular_observation_minute": int(
                     city["regular_observation_minute"]
@@ -1010,7 +1028,6 @@ def configured_city_configs(config: dict[str, Any]) -> list[dict[str, Any]]:
         item["market"]["expected_rules_text"] = str(
             city.get("expected_rules_text") or ""
         )
-        station = item["observations"]["station"]
         is_live = station in live_stations
         item["trading"]["live_enabled"] = is_live
         item["trading"]["dry_run"] = not is_live

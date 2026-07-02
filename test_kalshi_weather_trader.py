@@ -276,11 +276,25 @@ def test_kalshi_no_order_uses_ask_and_yes_scale_price(monkeypatch) -> None:
     assert captured["json_body"]["price"] == "0.7300"
 
 
-def test_default_ten_contracts_respects_five_dollar_cap() -> None:
-    trading = {"default_contracts": 10, "max_order_cost_dollars": 5}
-    assert contract_count_for_order(0.29, trading) == 10
-    assert contract_count_for_order(0.40, trading) == 10
-    assert contract_count_for_order(0.75, trading) == 6
+def test_default_five_contracts_respects_five_dollar_cap() -> None:
+    trading = {
+        "default_contracts": 5,
+        "max_order_cost_dollars": 5,
+        "min_order_cost_dollars": 1,
+    }
+    assert contract_count_for_order(0.29, trading) == 5
+    assert contract_count_for_order(0.40, trading) == 5
+
+
+def test_contract_count_increases_to_one_dollar_minimum() -> None:
+    trading = {
+        "default_contracts": 5,
+        "max_order_cost_dollars": 5,
+        "min_order_cost_dollars": 1,
+    }
+    assert contract_count_for_order(0.05, trading) == 20
+    assert contract_count_for_order(0.01, trading) == 100
+    assert contract_count_for_order(0.75, trading) == 5
     assert contract_count_for_order(1.00, trading) == 5
 
 
@@ -823,9 +837,10 @@ def test_production_strategy_parameters_match_requested_policy() -> None:
     assert config["trading"]["max_buy_price"] == 0.85
     assert config["trading"]["interval_snap_tolerance_f"] == 0.15
     assert config["trading"]["adjacent_yes_max_total_price"] == 0.90
-    assert config["trading"]["default_contracts"] == 10
-    assert config["trading"]["max_order_cost_dollars"] == 10.00
-    assert config["trading"]["live_stations"] == ["KAUS", "KLAS", "KMIA"]
+    assert config["trading"]["default_contracts"] == 5
+    assert config["trading"]["max_order_cost_dollars"] == 5.00
+    assert config["trading"]["min_order_cost_dollars"] == 1.00
+    assert set(config["trading"]["live_stations"]) == set(trader.STATION_IDS)
     assert config["trading"]["order_management_window_minutes"] == 40
     assert config["observations"]["lookback_hours"] == 24
     assert config["observations"]["awc_prefetch_hours"] == 24
@@ -849,7 +864,7 @@ def test_station_buy_hours_use_station_overrides_and_default() -> None:
     assert trader.station_buy_hours(config) == (12, 16)
 
 
-def test_city_configs_only_enable_three_live_stations() -> None:
+def test_city_configs_enable_all_model_stations_live() -> None:
     config = json.loads(Path("kalshi_weather_config.json").read_text(encoding="utf-8"))
     city_configs = trader.configured_city_configs(config)
 
@@ -860,12 +875,9 @@ def test_city_configs_only_enable_three_live_stations() -> None:
         if item["trading"]["live_enabled"]
         and not item["trading"]["dry_run"]
     }
-    assert live == {"KAUS", "KLAS", "KMIA"}
-    assert all(
-        item["trading"]["dry_run"]
-        for item in city_configs
-        if item["observations"]["station"] not in live
-    )
+    assert live == set(trader.STATION_IDS)
+    assert not any(item["trading"]["dry_run"] for item in city_configs)
+    assert {"KDEN", "KHOU", "KLAX", "KMSY"}.isdisjoint(live)
 
 
 def test_kalshi_telegram_title_has_platform_prefix() -> None:

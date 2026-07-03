@@ -1,0 +1,143 @@
+{
+  "events": {
+    "target_dates": ["today"],
+    "allowed_cities": [
+      "Ankara",
+      "Helsinki",
+      "Kuala Lumpur",
+      "Madrid",
+      "Munich",
+      "Seoul",
+      "Shanghai",
+      "Singapore",
+      "Tokyo",
+      "Warsaw"
+    ],
+    "city_timezones": {
+      "Ankara": "Europe/Istanbul",
+      "Helsinki": "Europe/Helsinki",
+      "Kuala Lumpur": "Asia/Kuala_Lumpur",
+      "Madrid": "Europe/Madrid",
+      "Munich": "Europe/Berlin",
+      "Seoul": "Asia/Seoul",
+      "Shanghai": "Asia/Shanghai",
+      "Singapore": "Asia/Singapore",
+      "Tokyo": "Asia/Tokyo",
+      "Warsaw": "Europe/Warsaw"
+    },
+    "city_stations": {
+      "Ankara": "LTAC",
+      "Helsinki": "EFHK",
+      "Kuala Lumpur": "WMKK",
+      "Madrid": "LEMD",
+      "Munich": "EDDM",
+      "Seoul": "RKSI",
+      "Shanghai": "ZSPD",
+      "Singapore": "WSSS",
+      "Tokyo": "RJTT",
+      "Warsaw": "EPWA"
+    }
+  },
+  "trading": {
+    "strategy_name": "model_awc_high_nonus_c",
+    "strategy_mode": "model_awc_high",
+    "allowed_cities": [
+      "Ankara",
+      "Helsinki",
+      "Kuala Lumpur",
+      "Madrid",
+      "Munich",
+      "Seoul",
+      "Shanghai",
+      "Singapore",
+      "Tokyo",
+      "Warsaw"
+    ],
+    "live_trading_enabled": true,
+    "live_trading_dry_run": false,
+    "model_awc_enabled": true,
+    "model_awc_model_unit": "C",
+    "model_awc_model_path": "NONUS/newC/independent_model_c/nonus_daily_high_c_lightgbm.pkl",
+    "model_awc_live_stations": [
+      "EDDM",
+      "EFHK",
+      "EPWA",
+      "LEMD",
+      "LTAC",
+      "RJTT",
+      "RKSI",
+      "WMKK",
+      "WSSS",
+      "ZSPD"
+    ],
+    "model_awc_station_ids": {
+      "RJTT": 101,
+      "RKSI": 102,
+      "ZSPD": 103,
+      "LEMD": 104,
+      "WSSS": 105,
+      "LTAC": 106,
+      "EDDM": 108,
+      "WMKK": 109,
+      "EFHK": 110,
+      "EPWA": 111
+    },
+    "model_awc_station_buy_hours": {
+      "EDDM": [15, 18],
+      "EFHK": [16, 19],
+      "LEMD": [16, 19],
+      "EPWA": [15, 18],
+      "LTAC": [15, 18],
+      "RJTT": [14, 17],
+      "RKSI": [14, 17],
+      "WMKK": [14, 17],
+      "WSSS": [13, 17],
+      "ZSPD": [13, 16]
+    },
+    "model_awc_station_observation_minutes": {
+      "EDDM": [20, 50],
+      "EFHK": [20, 50],
+      "EPWA": [0, 30],
+      "LEMD": [0, 30],
+      "LTAC": [20, 50],
+      "RJTT": [0, 30],
+      "RKSI": [0, 30],
+      "WMKK": [0, 30],
+      "WSSS": [0, 30],
+      "ZSPD": [0, 30]
+    },
+    "model_awc_metar_lookback_hours": 48,
+    "model_awc_tgftp_awc_history_hours": 48,
+    "model_awc_lag_tolerance_minutes": 15,
+    "model_awc_interval_snap_tolerance_c": 0.30625,
+    "buy_notional_usdc": 5,
+    "model_awc_adjacent_yes_shares": 5,
+    "model_awc_adjacent_yes_max_total_price": 0.9,
+    "model_awc_order_management_window_minutes": 25
+  },
+  "outputs": {
+    "trades_csv": "NONUS/live/polymarket_weather_trades_nonus_c.csv",
+    "positions_json": "NONUS/live/polymarket_weather_positions_nonus_c.json",
+    "settled_trades_csv": "NONUS/live/polymarket_weather_trades_settled_nonus_c.csv",
+    "performance_by_cycle_csv": "NONUS/live/polymarket_weather_performance_by_cycle_nonus_c.csv",
+    "performance_by_event_csv": "NONUS/live/polymarket_weather_performance_by_event_nonus_c.csv",
+    "state_json": "NONUS/live/polymarket_weather_state_nonus_c.json",
+    "aviation_metar_history_jsonl": "NONUS/live/aviation_metar_history_nonus_c.jsonl",
+    "price_window_ticks_jsonl": "NONUS/live/price_window_ticks_nonus_c.jsonl",
+    "price_window_raw_jsonl": "NONUS/live/price_window_raw_nonus_c.jsonl",
+    "log_file": "NONUS/live/polymarket_weather_nonus_c.log"
+  },
+  "strategies": [
+    {
+      "name": "model_awc_high_nonus_c",
+      "enabled": true,
+      "events": {
+        "target_dates": ["today"]
+      },
+      "trading": {
+        "strategy_name": "model_awc_high_nonus_c",
+        "strategy_mode": "model_awc_high"
+      }
+    }
+  ]
+}

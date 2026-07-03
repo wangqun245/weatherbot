@@ -72,6 +72,15 @@ class ClobPricingTest(unittest.TestCase):
 
         self.assertEqual(91.94, prediction)
 
+    def test_nonus_celsius_half_hour_schedule_and_snap_tolerance(self):
+        config = bot.load_config("polymarket_weather_nonus_config.json")
+        self.assertEqual((20, 50), bot.model_awc_station_observation_minutes(config, "EDDM"))
+        self.assertEqual((0, 30), bot.model_awc_station_observation_minutes(config, "RJTT"))
+        self.assertEqual((15, 18), bot.model_awc_station_buy_hours(config, "EDDM"))
+        self.assertAlmostEqual(0.30625, bot.model_awc_interval_snap_tolerance(config, "C"))
+        self.assertEqual(5.0, float(config["trading"]["buy_notional_usdc"]))
+        self.assertEqual(5.0, float(config["trading"]["model_awc_adjacent_yes_shares"]))
+
     def tearDown(self):
         bot.clob_get = self.original_clob_get
         bot.clob_post = self.original_clob_post

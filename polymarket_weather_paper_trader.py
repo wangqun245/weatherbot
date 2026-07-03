@@ -584,6 +584,11 @@ def setup_logging(config: dict[str, Any]) -> None:
         None: This function is executed for its side effects.
     """
     outputs = config["outputs"]
+    for output_path in outputs.values():
+        if isinstance(output_path, str) and output_path:
+            parent = os.path.dirname(os.path.abspath(output_path))
+            if parent:
+                os.makedirs(parent, exist_ok=True)
     level = getattr(logging, str(outputs.get("log_level", "INFO")).upper(), logging.INFO)
     max_bytes = max(1, int(outputs.get("log_max_mb", 150))) * 1024 * 1024
     file_count = max(1, int(outputs.get("log_file_count", 3)))
@@ -2489,6 +2494,23 @@ def model_awc_load_model(config: dict[str, Any]) -> Any:
     return MODEL_AWC_MODEL
 
 
+def model_awc_model_unit(config: dict[str, Any]) -> str:
+    """Return the temperature unit produced by the configured model."""
+    configured = str(config.get("trading", {}).get("model_awc_model_unit") or "").upper()
+    if configured in {"C", "F"}:
+        return configured
+    feature_names = {str(name) for name in getattr(model_awc_load_model(config), "feature_name_", [])}
+    return "C" if "temp_c" in feature_names and "temp_f" not in feature_names else "F"
+
+
+def model_awc_station_id(config: dict[str, Any], station: str) -> Optional[int]:
+    """Resolve the numeric station category used during model training."""
+    configured = config.get("trading", {}).get("model_awc_station_ids", {})
+    if isinstance(configured, dict) and station.upper() in configured:
+        return int(configured[station.upper()])
+    return FEATURE_STATION_IDS.get(station.upper())
+
+
 def model_awc_required_lag_hours(config: dict[str, Any]) -> int:
     """Return the largest hourly temperature lag required by the loaded model."""
     model = model_awc_load_model(config)
@@ -2496,7 +2518,7 @@ def model_awc_required_lag_hours(config: dict[str, Any]) -> int:
     lag_hours = [
         int(match.group(1))
         for name in feature_names
-        for match in [re.fullmatch(r"temp_f_lag_(\d+)h", str(name))]
+        for match in [re.fullmatch(r"temp_[fc]_lag_(\d+)h", str(name))]
         if match
     ]
     return max(lag_hours, default=3)
@@ -2524,6 +2546,9 @@ def model_awc_requires_previous_day_context(config: dict[str, Any]) -> bool:
             "previous_local_day_high_f",
             "previous_local_day_low_f",
             "current_local_day_min_temp_f_so_far",
+            "previous_local_day_high_c",
+            "previous_local_day_low_c",
+            "current_local_day_min_temp_c_so_far",
         }
         & feature_names
     )
@@ -2555,17 +2580,25 @@ def model_awc_parse_row(row: dict[str, Any], station: str) -> Optional[FeatureMe
     )
 
 
-def model_awc_station_observation_minute(config: dict[str, Any], station: str) -> int:
-    """Return the configured hourly METAR observation minute for a station."""
+def model_awc_station_observation_minutes(config: dict[str, Any], station: str) -> tuple[int, ...]:
+    """Return configured regular METAR minutes for a station."""
     station = station.upper()
     fallback = int(config["trading"].get("model_awc_observation_minute", 53))
     station_minutes = config["trading"].get("model_awc_station_observation_minutes", {})
     if isinstance(station_minutes, dict):
         try:
-            return min(59, max(0, int(station_minutes.get(station, fallback))))
+            raw = station_minutes.get(station, fallback)
+            values = raw if isinstance(raw, (list, tuple, set)) else [raw]
+            minutes = tuple(sorted({min(59, max(0, int(value))) for value in values}))
+            return minutes or (min(59, max(0, fallback)),)
         except (TypeError, ValueError):
-            return min(59, max(0, fallback))
-    return min(59, max(0, fallback))
+            pass
+    return (min(59, max(0, fallback)),)
+
+
+def model_awc_station_observation_minute(config: dict[str, Any], station: str) -> int:
+    """Return the first configured METAR observation minute (legacy helper)."""
+    return model_awc_station_observation_minutes(config, station)[0]
 
 
 def model_awc_station_buy_hours(config: dict[str, Any], station: str) -> tuple[int, int]:
@@ -2605,9 +2638,10 @@ def model_awc_station_stagger_seconds(config: dict[str, Any], station: str) -> i
     return same_minute.index(station) * stagger
 
 
-def model_awc_is_extra_metar_row(row: FeatureMetarRow, regular_minute: int) -> bool:
+def model_awc_is_extra_metar_row(row: FeatureMetarRow, regular_minute: int | Iterable[int]) -> bool:
     """Return whether a parsed AWC row should be used only as context, not as a model trigger row."""
-    return row.valid_utc.minute != regular_minute or " COR " in f" {row.metar} "
+    regular_minutes = {int(regular_minute)} if isinstance(regular_minute, int) else {int(v) for v in regular_minute}
+    return row.valid_utc.minute not in regular_minutes or " COR " in f" {row.metar} "
 
 
 def model_awc_observed_high_f_so_far(
@@ -2655,15 +2689,15 @@ def model_awc_feature_row(
     if not parsed:
         return None
 
-    regular_minute = model_awc_station_observation_minute(config, station)
-    extra_flags = [model_awc_is_extra_metar_row(item, regular_minute) for item in parsed]
+    regular_minutes = model_awc_station_observation_minutes(config, station)
+    extra_flags = [model_awc_is_extra_metar_row(item, regular_minutes) for item in parsed]
     regular_inputs = [
         item
         for item, is_extra in zip(parsed, extra_flags)
         if not is_extra and item.valid_utc.astimezone(tz).date() == target_date
     ]
     if not regular_inputs:
-        LOGGER.info("model awc skip no regular input rows station=%s rows=%s regular_minute=%s", station, len(parsed), regular_minute)
+        LOGGER.info("model awc skip no regular input rows station=%s rows=%s regular_minutes=%s", station, len(parsed), regular_minutes)
         return None
 
     latest = regular_inputs[-1]
@@ -2673,13 +2707,22 @@ def model_awc_feature_row(
         return None
 
     features = decode_metar(latest, station, tz)
-    features["station_id"] = FEATURE_STATION_IDS.get(station)
+    model_unit = model_awc_model_unit(config)
+    features["station_id"] = model_awc_station_id(config, station)
+    if model_unit == "C":
+        features["temp_c_equivalent"] = features.get("temp_c")
+        features["dewpoint_c_equivalent"] = features.get("dewpoint_c")
+        heat_index_f = features.get("heat_index_f")
+        wind_chill_f = features.get("wind_chill_f")
+        features["heat_index_c"] = None if heat_index_f is None else (float(heat_index_f) - 32.0) * 5.0 / 9.0
+        features["wind_chill_c"] = None if wind_chill_f is None else (float(wind_chill_f) - 32.0) * 5.0 / 9.0
     iso = latest_local.isocalendar()
     features["local_week_of_year"] = float(iso.week)
     valid_times = [item.valid_utc for item in parsed]
     decoded_rows = [decode_metar(item, station, tz) for item in parsed]
-    temp_values = [decoded.get("temp_f") for decoded in decoded_rows]
-    features["_observed_local_day_high_f_so_far"] = model_awc_observed_high_f_so_far(
+    temp_key = "temp_c" if model_unit == "C" else "temp_f"
+    temp_values = [decoded.get(temp_key) for decoded in decoded_rows]
+    features["_observed_local_day_high_model_unit_so_far"] = model_awc_observed_high_f_so_far(
         parsed,
         temp_values,
         tz,
@@ -2687,18 +2730,31 @@ def model_awc_feature_row(
     )
     previous_highs, previous_lows, current_mins = daily_temperature_context_series(parsed, temp_values, tz)
     tolerance = timedelta(minutes=int(config["trading"].get("model_awc_lag_tolerance_minutes", 30)))
-    current_temp = features.get("temp_f")
+    current_temp = features.get(temp_key)
     for hours in range(1, model_awc_required_lag_hours(config) + 1):
         lag_value = nearest_lag_value(latest.valid_utc - timedelta(hours=hours), valid_times, temp_values, tolerance)
-        features[f"temp_f_lag_{hours}h"] = lag_value
-        features[f"temp_f_change_{hours}h"] = (
+        features[f"temp_{model_unit.lower()}_lag_{hours}h"] = lag_value
+        features[f"temp_{model_unit.lower()}_change_{hours}h"] = (
             None if current_temp is None or lag_value is None else float(current_temp) - float(lag_value)
         )
     latest_idx = parsed.index(latest)
-    add_daily_temperature_context_features(features, latest_idx, previous_highs, previous_lows, current_mins)
+    daily_context: dict[str, Any] = {}
+    add_daily_temperature_context_features(daily_context, latest_idx, previous_highs, previous_lows, current_mins)
+    suffix = model_unit.lower()
+    if model_unit == "C":
+        features["previous_local_day_high_c"] = daily_context.get("previous_local_day_high_f")
+        features["previous_local_day_low_c"] = daily_context.get("previous_local_day_low_f")
+        features["current_local_day_min_temp_c_so_far"] = daily_context.get(
+            "current_local_day_min_temp_f_so_far"
+        )
+    else:
+        features.update(daily_context)
     context_hours = model_awc_required_context_hours(config)
+    observation_context = dict(features)
+    if model_unit == "C":
+        observation_context["temp_f"] = current_temp
     add_observation_context_features(
-        features=features,
+        features=observation_context,
         row=latest,
         row_idx=latest_idx,
         valid_times=valid_times,
@@ -2707,6 +2763,27 @@ def model_awc_feature_row(
         window=timedelta(hours=context_hours),
         context_hours=context_hours,
     )
+    for key, value in observation_context.items():
+        if key not in features or key.startswith(("metar_obs_", "extra_metar_", "has_extra_", "is_extra_", "temp_f_change_from_")):
+            output_key = key.replace("temp_f", "temp_c") if model_unit == "C" else key
+            output_key = output_key.replace("range_f", "range_c") if model_unit == "C" else output_key
+            features[output_key] = value
+
+    # The NONUS model contains ten additional half-hour delta features.
+    feature_names = {str(name) for name in getattr(model_awc_load_model(config), "feature_name_", [])}
+    for half_step in range(1, 20, 2):
+        hours_back = half_step / 2.0
+        whole = int(hours_back)
+        name = f"temp_{suffix}_change_{whole}_5h"
+        if name not in feature_names:
+            continue
+        lag_value = nearest_lag_value(
+            latest.valid_utc - timedelta(minutes=half_step * 30),
+            valid_times,
+            temp_values,
+            tolerance,
+        )
+        features[name] = None if current_temp is None or lag_value is None else float(current_temp) - float(lag_value)
     return features, latest, latest_local
 
 
@@ -2730,7 +2807,10 @@ def model_awc_predict_high(config: dict[str, Any], features: dict[str, Any]) -> 
         warnings.simplefilter("ignore", UserWarning)
         prediction = model.predict([row], num_iteration=getattr(model, "best_iteration_", None))
     raw_prediction = float(prediction[0])
-    observed_high = features.get("_observed_local_day_high_f_so_far")
+    observed_high = features.get(
+        "_observed_local_day_high_model_unit_so_far",
+        features.get("_observed_local_day_high_f_so_far"),
+    )
     try:
         factual_floor = None if observed_high in (None, "") else float(observed_high)
     except (TypeError, ValueError):
@@ -2742,13 +2822,27 @@ def model_awc_predict_high(config: dict[str, Any], features: dict[str, Any]) -> 
             raw_prediction,
             factual_floor,
         )
-        return factual_floor
-    return raw_prediction
+        raw_prediction = factual_floor
+    return (
+        convert_temperature(raw_prediction, "C", "F")
+        if model_awc_model_unit(config) == "C"
+        else raw_prediction
+    )
 
 
-def model_awc_trade_exists_for_window(trades: list[PaperTrade], strategy_name: str, city: str, station: str, event_date: str, local_hour: int) -> bool:
-    """Prevent duplicate entries for the same city/station/date/hour prediction window."""
+def model_awc_trade_exists_for_window(
+    trades: list[PaperTrade],
+    strategy_name: str,
+    city: str,
+    station: str,
+    event_date: str,
+    local_hour: int,
+    local_minute: Optional[int] = None,
+) -> bool:
+    """Prevent duplicate entries for the same model observation window."""
     marker = f"model_awc_high:{city}:{station}:{event_date}:hour_{local_hour:02d}"
+    if local_minute is not None:
+        marker += f"_minute_{int(local_minute):02d}"
     active_statuses = {"OPEN", "BUY_PENDING", "SELL_PENDING"}
     return any(t.strategy == strategy_name and t.status in active_statuses and marker in t.cycle_id for t in trades)
 
@@ -2851,6 +2945,8 @@ def model_awc_prediction_matches(
 
 def model_awc_interval_snap_tolerance(config: dict[str, Any], event_unit: str) -> float:
     """Return the configured boundary snap tolerance in the event market unit."""
+    if event_unit.upper() == "C" and "model_awc_interval_snap_tolerance_c" in config["trading"]:
+        return max(0.0, float(config["trading"]["model_awc_interval_snap_tolerance_c"]))
     tolerance_f = max(0.0, float(config["trading"].get("model_awc_interval_snap_tolerance_f", 0.15)))
     return tolerance_f * 5.0 / 9.0 if event_unit.upper() == "C" else tolerance_f
 
@@ -2964,7 +3060,15 @@ def process_model_awc_prediction(
     trades = read_trades(config["outputs"]["trades_csv"])
     strategy_name = str(config["trading"]["strategy_name"])
     local_hour = int(latest_local.hour)
-    duplicate_window = model_awc_trade_exists_for_window(trades, strategy_name, city, station, event_date, local_hour)
+    local_minute = int(latest_local.minute)
+    duplicate_minute = (
+        local_minute
+        if len(model_awc_station_observation_minutes(config, station)) > 1
+        else None
+    )
+    duplicate_window = model_awc_trade_exists_for_window(
+        trades, strategy_name, city, station, event_date, local_hour, duplicate_minute
+    )
     active_event_positions = model_awc_active_event_positions(trades, strategy_name, city, event_date)
 
     markets = [m for m in markets_for_event(config, event) if not m.closed and m.kind == "Highest"]
@@ -2982,7 +3086,12 @@ def process_model_awc_prediction(
         amount_usd: Optional[float] = None,
         shares: Optional[float] = None,
     ) -> Optional[PaperTrade]:
-        cycle_id = f"{datetime.now().strftime('%Y%m%dT%H%M%S')}:model_awc_high:{city}:{station}:{event_date}:hour_{local_hour:02d}"
+        cycle_id = (
+            f"{datetime.now().strftime('%Y%m%dT%H%M%S')}:model_awc_high:{city}:{station}:{event_date}:"
+            f"hour_{local_hour:02d}"
+        )
+        if duplicate_minute is not None:
+            cycle_id += f"_minute_{local_minute:02d}"
         trade = (
             live_trader.submit_buy_trade(config, cycle_id, market, "", station, side, price, predicted_high_f, None, reason, amount_usd=amount_usd, shares=shares)
             if live_trader
@@ -3066,6 +3175,7 @@ def process_model_awc_prediction(
             predicted_high_f,
             "single",
             target_notional_usd=remaining_notional,
+            local_minute=local_minute,
         )
         LOGGER.info(
             "model awc single interval delegated to notional websocket manager "
@@ -3133,13 +3243,13 @@ def process_model_awc_prediction(
             return start_single_notional_manager(
                 snap_market, "YES", "snap_current_price_above_configured_max"
             )
-        tolerance_f = float(config["trading"].get("model_awc_interval_snap_tolerance_f", 0.15))
+        tolerance = model_awc_interval_snap_tolerance(config, event_unit)
         reason = (
             f"model_awc_high_predicted_{predicted_high_f:.2f}_boundary_snap_yes_{snap_market.market_id}"
-            f"_distance_{snap_distance:.3f}{event_unit}_tolerance_{tolerance_f:.2f}F_local_hour_{local_hour:02d}"
+            f"_distance_{snap_distance:.3f}{event_unit}_tolerance_{tolerance:.5f}{event_unit}_local_hour_{local_hour:02d}"
         )
         LOGGER.info(
-            "model awc boundary snap city=%s station=%s event_date=%s local_hour=%s predicted_high_f=%r market=%s distance=%r%s tolerance_f=%r yes_price=%.4f",
+            "model awc boundary snap city=%s station=%s event_date=%s local_hour=%s predicted_high_f=%r market=%s distance=%r%s tolerance=%r%s yes_price=%.4f",
             city,
             station,
             event_date,
@@ -3148,7 +3258,8 @@ def process_model_awc_prediction(
             snap_market.market_id,
             snap_distance,
             event_unit,
-            tolerance_f,
+            tolerance,
+            event_unit,
             price,
         )
         return submit_model_awc_trade(snap_market, "YES", price, reason)
@@ -3260,6 +3371,7 @@ def process_model_awc_prediction(
                 hedge_shares,
                 predicted_high_f,
                 "single",
+                local_minute=local_minute,
             )
             LOGGER.info(
                 "model awc adjacent hedge delegated to websocket manager batch=%s "
@@ -3324,6 +3436,7 @@ def process_model_awc_prediction(
                 batch_id = live_trader.start_model_awc_hourly_batch(
                     city, station, event_date, local_hour, (no_market,), ("NO",),
                     adjacent_shares, predicted_high_f, "single",
+                    local_minute=local_minute,
                 )
                 LOGGER.info(
                     "model awc non-adjacent no delegated to websocket manager "
@@ -3363,6 +3476,7 @@ def process_model_awc_prediction(
             batch_id = live_trader.start_model_awc_hourly_batch(
                 city, station, event_date, local_hour, (no_market,), ("NO",),
                 adjacent_shares, predicted_high_f, "single",
+                local_minute=local_minute,
             )
             LOGGER.info(
                 "model awc non-adjacent no delegated to websocket manager "
@@ -3387,6 +3501,7 @@ def process_model_awc_prediction(
             adjacent_shares,
             predicted_high_f,
             "adjacent",
+            local_minute=local_minute,
         )
         LOGGER.info(
             "model awc adjacent delegated to websocket manager batch=%s "
@@ -4363,12 +4478,13 @@ class LiveTradingManager:
         predicted_high_f: float,
         mode: str,
         target_notional_usd: float = 0.0,
+        local_minute: int = 0,
     ) -> str:
         """Replace the prior city/hour target and begin websocket order management."""
         if not self.executor or not self.market_feed:
             raise RuntimeError("live trading manager is not started")
         batch_id = (
-            f"{city}:{station}:{event_date}:hour_{local_hour:02d}:{mode}"
+            f"{city}:{station}:{event_date}:hour_{local_hour:02d}:minute_{local_minute:02d}:{mode}"
         )
         group_prefix = f"{city}:{station}:{event_date}:"
         token_ids = tuple(
@@ -4410,9 +4526,9 @@ class LiveTradingManager:
             cycle_id=(
                 f"{datetime.now().strftime('%Y%m%dT%H%M%S')}:"
                 f"model_awc_managed:{city}:{station}:{event_date}:"
-                f"hour_{local_hour:02d}"
+                f"hour_{local_hour:02d}_minute_{local_minute:02d}"
             ),
-            reason=f"model_awc_managed_{mode}_hour_{local_hour:02d}",
+            reason=f"model_awc_managed_{mode}_hour_{local_hour:02d}_minute_{local_minute:02d}",
             baseline_balances=baseline,
             acquired_shares={token_id: 0.0 for token_id in token_ids},
             acquired_cost_usd={token_id: 0.0 for token_id in token_ids},
@@ -7673,7 +7789,7 @@ def model_awc_run_prediction_rows(
         if built is None:
             continue
         features, latest_row, latest_local = built
-        if latest_local.hour != local_hour or latest_row.valid_utc < expected_utc - timedelta(minutes=10):
+        if latest_local.hour != local_hour or abs(latest_row.valid_utc - expected_utc) > timedelta(minutes=10):
             LOGGER.info(
                 "model awc latest metar not current window source=%s city=%s station=%s latest=%s latest_local=%s expected=%s",
                 source,
@@ -7888,7 +8004,7 @@ def model_awc_supervisor(config: dict[str, Any]) -> None:
                 station = str(group["station"])
                 tz = city_timezone(config, city)
                 now_local = now_utc.astimezone(tz)
-                observation_minute = model_awc_station_observation_minute(config, station)
+                observation_minutes = model_awc_station_observation_minutes(config, station)
                 events_by_date: dict[str, list[dict[str, Any]]] = {}
                 for event in list(group["events"]):
                     event_date = str(event.get("_parsed_event_date") or "")
@@ -7903,14 +8019,15 @@ def model_awc_supervisor(config: dict[str, Any]) -> None:
                         continue
                     if now_local.date() != target_date:
                         continue
-                    for local_hour in range(start_hour, end_hour + 1):
+                    windows = (
+                        (hour, minute)
+                        for hour in range(start_hour, end_hour + 1)
+                        for minute in observation_minutes
+                    )
+                    for local_hour, observation_minute in windows:
                         expected_local = datetime(
-                            target_date.year,
-                            target_date.month,
-                            target_date.day,
-                            local_hour,
-                            observation_minute,
-                            tzinfo=tz,
+                            target_date.year, target_date.month, target_date.day,
+                            local_hour, observation_minute, tzinfo=tz,
                         )
                         expected_utc = expected_local.astimezone(timezone.utc)
                         tgftp_start_utc = expected_utc + timedelta(seconds=poll_delay_seconds)
@@ -7924,7 +8041,10 @@ def model_awc_supervisor(config: dict[str, Any]) -> None:
                         )
                         if now_utc < poll_start_utc:
                             continue
-                        window_key = f"{city}:{station}:{event_date}:hour_{local_hour:02d}:model_awc"
+                        window_key = (
+                            f"{city}:{station}:{event_date}:hour_{local_hour:02d}:"
+                            f"minute_{observation_minute:02d}:model_awc"
+                        )
                         state = window_state.setdefault(
                             window_key,
                             {
@@ -7955,7 +8075,7 @@ def model_awc_supervisor(config: dict[str, Any]) -> None:
                                     list(events_for_date),
                                     lookback_hours,
                                 ),
-                                name=f"model-tgftp-{station}-{event_date}-{local_hour:02d}",
+                                name=f"model-tgftp-{station}-{event_date}-{local_hour:02d}-{observation_minute:02d}",
                                 daemon=True,
                             )
                             thread.start()
@@ -7978,7 +8098,7 @@ def model_awc_supervisor(config: dict[str, Any]) -> None:
                                 if built is None:
                                     continue
                                 features, latest_row, latest_local = built
-                                if latest_local.hour != local_hour or latest_row.valid_utc < expected_utc - timedelta(minutes=10):
+                                if latest_local.hour != local_hour or abs(latest_row.valid_utc - expected_utc) > timedelta(minutes=10):
                                     LOGGER.info(
                                         "model awc latest metar not current window city=%s station=%s latest=%s latest_local=%s expected=%s attempt=%s",
                                         city,

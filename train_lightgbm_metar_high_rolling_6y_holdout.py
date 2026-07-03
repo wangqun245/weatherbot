@@ -66,6 +66,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--learning-rate", type=float, default=0.035)
     parser.add_argument("--num-leaves", type=int, default=96)
     parser.add_argument("--random-state", type=int, default=42)
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help=(
+            "Reuse and re-evaluate completed variant models in an existing "
+            "output directory, training only missing variants."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -75,9 +83,9 @@ def make_output_dir(args: argparse.Namespace) -> Path:
     else:
         stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         output_dir = args.models_root / f"lightgbm_rolling_6y_holdout_{stamp}"
-    if output_dir.exists():
+    if output_dir.exists() and not args.resume:
         raise SystemExit(f"Output directory already exists; choose a new path: {output_dir}")
-    output_dir.mkdir(parents=True)
+    output_dir.mkdir(parents=True, exist_ok=args.resume)
     return output_dir
 
 
@@ -223,6 +231,49 @@ def train_variant(
     return model, metrics, importance
 
 
+def evaluate_variant(
+    df: pd.DataFrame,
+    variant: str,
+    train_mask: np.ndarray,
+    valid_mask: np.ndarray,
+    model: lgb.LGBMRegressor,
+) -> tuple[dict[str, object], pd.DataFrame]:
+    feature_columns = feature_columns_for(df, variant)
+    if feature_columns != list(model.feature_name_):
+        raise ValueError(
+            f"Existing {variant} model feature columns do not match the dataset"
+        )
+    X = coerce_features(df, feature_columns)
+    y = pd.to_numeric(df[TARGET_COLUMN], errors="coerce").astype("float32")
+    train_pred = model.predict(
+        X.loc[train_mask], num_iteration=model.best_iteration_
+    )
+    valid_pred = model.predict(
+        X.loc[valid_mask], num_iteration=model.best_iteration_
+    )
+    metrics = {
+        "variant": variant,
+        "feature_count": len(feature_columns),
+        "best_iteration": int(model.best_iteration_ or model.n_estimators),
+        "train": metrics_for(y.loc[train_mask].to_numpy(), train_pred),
+        "validation": metrics_for(y.loc[valid_mask].to_numpy(), valid_pred),
+    }
+    importance = pd.DataFrame(
+        {
+            "feature": feature_columns,
+            "importance_gain": model.booster_.feature_importance(
+                importance_type="gain"
+            ),
+            "importance_split": model.booster_.feature_importance(
+                importance_type="split"
+            ),
+        }
+    ).sort_values(
+        ["importance_gain", "importance_split"], ascending=False
+    )
+    return metrics, importance
+
+
 def write_validation_reports(
     df: pd.DataFrame,
     model: lgb.LGBMRegressor,
@@ -309,10 +360,22 @@ def main() -> int:
 
     for variant in ("month_day", "week_of_year", "cyclical_day_of_year"):
         print(f"Training variant: {variant}")
-        model, metrics, importance = train_variant(df, variant, train_mask, valid_mask, args)
+        variant_model_file = (
+            output_dir / f"lightgbm_metar_high_rolling_6y_{variant}.pkl"
+        )
+        if args.resume and variant_model_file.exists():
+            print(f"Resuming completed variant: {variant}")
+            model = joblib.load(variant_model_file)
+            metrics, importance = evaluate_variant(
+                df, variant, train_mask, valid_mask, model
+            )
+        else:
+            model, metrics, importance = train_variant(
+                df, variant, train_mask, valid_mask, args
+            )
         all_metrics.append(metrics)
 
-        joblib.dump(model, output_dir / f"lightgbm_metar_high_rolling_6y_{variant}.pkl")
+        joblib.dump(model, variant_model_file)
         model.booster_.save_model(output_dir / f"lightgbm_metar_high_rolling_6y_{variant}.txt")
         importance.to_csv(
             output_dir / f"lightgbm_metar_high_rolling_6y_{variant}_feature_importance.csv",

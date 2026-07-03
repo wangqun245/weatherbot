@@ -18,6 +18,38 @@ PRECISE_TEMP_RE = re.compile(
     r"(?:^|\s)T([01])(\d{3})[01]\d{3}(?=\s|$)"
 )
 BODY_TEMP_RE = re.compile(r"(?:^|\s)(M?\d{2})/(?:M?\d{2}|//)(?=\s|$)")
+
+
+def obvious_temperature_error(metar: str) -> bool:
+    """Return whether a METAR contains a structurally invalid temperature."""
+    precise = PRECISE_TEMP_RE.search(metar)
+    body = BODY_TEMP_RE.search(metar)
+    precise_c: Decimal | None = None
+    body_c: Decimal | None = None
+    if precise:
+        precise_c = Decimal(precise.group(2)) / Decimal(10)
+        if precise.group(1) == "1":
+            precise_c = -precise_c
+    if body:
+        text = body.group(1)
+        body_c = Decimal(text[1:] if text.startswith("M") else text)
+        if text.startswith("M"):
+            body_c = -body_c
+    if precise_c is not None and body_c is not None:
+        if abs(precise_c - body_c) > Decimal("1.0"):
+            return True
+    values = [value for value in (precise_c, body_c) if value is not None]
+    if any(not Decimal("-60") <= value <= Decimal("52") for value in values):
+        return True
+    six_hour = MAX_6H_RE.search(metar)
+    if six_hour:
+        max_f = signed_tenths_f(*six_hour.groups())
+        max_c = (max_f - Decimal(32)) * Decimal(5) / Decimal(9)
+        if not Decimal("-60") <= max_c <= Decimal("52"):
+            return True
+    return False
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Decode ASOS six-hour maxima by station-local day and compare with NWS CLI."
@@ -29,6 +61,16 @@ def parse_args() -> argparse.Namespace:
         "--input-dir", type=Path, default=Path(r"C:\weather\metar_history\KLAX")
     )
     parser.add_argument("--start-year", type=int, default=2000)
+    parser.add_argument(
+        "--local-standard-offset-hours",
+        type=int,
+        help="Use a fixed UTC offset for the midnight-to-midnight NWS climate day.",
+    )
+    parser.add_argument(
+        "--strict-yesterday",
+        action="store_true",
+        help="Compare only against next-day CLI YESTERDAY MAXIMUM products.",
+    )
     parser.add_argument(
         "--include-instantaneous-max",
         action="store_true",
@@ -70,16 +112,24 @@ def nws_integer_f(value: Decimal) -> int:
 
 
 def instantaneous_temp_f(metar: str) -> Decimal | None:
-    precise = PRECISE_TEMP_RE.search(metar)
-    if precise:
-        return signed_tenths_f(*precise.groups())
-    body = BODY_TEMP_RE.search(metar)
-    if body is None:
+    if obvious_temperature_error(metar):
         return None
-    text = body.group(1)
-    value_c = Decimal(text[1:] if text.startswith("M") else text)
-    if text.startswith("M"):
-        value_c = -value_c
+    precise = PRECISE_TEMP_RE.search(metar)
+    body = BODY_TEMP_RE.search(metar)
+    precise_c: Decimal | None = None
+    body_c: Decimal | None = None
+    if precise:
+        precise_c = Decimal(precise.group(2)) / Decimal(10)
+        if precise.group(1) == "1":
+            precise_c = -precise_c
+    if body:
+        text = body.group(1)
+        body_c = Decimal(text[1:] if text.startswith("M") else text)
+        if text.startswith("M"):
+            body_c = -body_c
+    value_c = precise_c if precise_c is not None else body_c
+    if value_c is None:
+        return None
     return value_c * Decimal(9) / Decimal(5) + Decimal(32)
 
 
@@ -107,6 +157,12 @@ def load_six_hour_maxima(
                 metar = row.get("metar", "")
                 match = MAX_6H_RE.search(metar)
                 if match is not None:
+                    max_f = signed_tenths_f(*match.groups())
+                    max_c = (max_f - Decimal(32)) * Decimal(5) / Decimal(9)
+                    if not Decimal("-60") <= max_c <= Decimal("52"):
+                        stats["rows_removed_implausible_6h_max"] += 1
+                        match = None
+                if match is not None:
                     stats["rows_with_6h_max"] += 1
                     # The 1snTTT group covers the preceding six hours.
                     local_day = (valid_utc - timedelta(hours=3)).astimezone(
@@ -116,7 +172,7 @@ def load_six_hour_maxima(
                         by_day[local_day].append(
                             (
                                 valid_utc,
-                                signed_tenths_f(*match.groups()),
+                                max_f,
                                 metar,
                                 "rmk_6h_max",
                             )
@@ -142,7 +198,11 @@ def load_six_hour_maxima(
 def main() -> int:
     args = parse_args()
     station = args.station.upper()
-    local_tz = ZoneInfo(args.timezone)
+    local_tz = (
+        timezone(timedelta(hours=args.local_standard_offset_hours))
+        if args.local_standard_offset_hours is not None
+        else ZoneInfo(args.timezone)
+    )
     by_day, stats = load_six_hour_maxima(
         args.input_dir,
         station,
@@ -216,9 +276,15 @@ def main() -> int:
         if metar_high is None:
             counters["station_daily_max_missing"] += 1
             row["status"] = "station_daily_max_missing"
-        elif report is None:
+        elif report is None or (
+            args.strict_yesterday and report.period_label != "YESTERDAY"
+        ):
             counters["nws_report_missing"] += 1
-            row["status"] = "nws_report_missing"
+            row["status"] = (
+                "nws_yesterday_report_missing"
+                if args.strict_yesterday
+                else "nws_report_missing"
+            )
         elif report.maximum_f is None:
             counters["nws_maximum_missing"] += 1
             row["status"] = "nws_maximum_missing"
@@ -280,6 +346,11 @@ def main() -> int:
         "rows_with_instantaneous_temp": stats[
             "rows_with_instantaneous_temp"
         ],
+        "rows_removed_implausible_6h_max": stats[
+            "rows_removed_implausible_6h_max"
+        ],
+        "strict_yesterday": args.strict_yesterday,
+        "local_standard_offset_hours": args.local_standard_offset_hours,
         "days_with_daily_max": len(daily_highs),
         "days_with_6h_max": sum(
             any(item[3] == "rmk_6h_max" for item in observations)

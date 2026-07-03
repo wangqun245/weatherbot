@@ -173,6 +173,17 @@ class _FeatureModel:
     ]
 
 
+class _NwsFeatureModel:
+    feature_name_ = [
+        "station_id",
+        "local_hour",
+        "temp_f_lag_10h",
+        "metar_obs_count_past_10h",
+        "metar_obs_max_temp_f_past_10h",
+        "extra_metar_count_past_10h",
+    ]
+
+
 class _LowPredictionModel:
     feature_name_ = ["temp_f"]
     best_iteration_ = None
@@ -260,6 +271,43 @@ def test_build_feature_row_adds_rolling_metar_context() -> None:
     assert features["asos_6h_extrema_age_minutes"] == 300.0
     assert features["asos_previous_6h_max_temp_f"] == 83.12
     assert features["asos_previous_6h_extrema_age_minutes"] == 660.0
+
+
+def test_nws_feature_row_uses_fixed_lst_and_ten_hour_context() -> None:
+    config = json.loads(Path("kalshi_weather_config.json").read_text(encoding="utf-8"))
+    config["observations"].update(
+        {
+            "station": "KMIA",
+            "timezone": "America/New_York",
+            "regular_observation_minute": 53,
+        }
+    )
+    config["model"]["station_buy_hours"]["KMIA"] = [11, 15]
+    rows = [
+        {
+            "obsTime": f"2026-06-29T{hour:02d}:53:00+00:00",
+            "rawOb": (
+                f"METAR KMIA 29{hour:02d}53Z 09007KT 10SM FEW027 "
+                f"{28 + (hour >= 12)}/23 A3002 RMK AO2 T0"
+                f"{280 + 10 * (hour >= 12):03d}0230 $"
+            ),
+        }
+        for hour in range(6, 17)
+    ]
+
+    built = build_feature_row(
+        config, _NwsFeatureModel(), rows, date(2026, 6, 29)
+    )
+
+    assert built is not None
+    features, latest, latest_local = built
+    assert latest.valid_utc.hour == 16
+    assert latest_local.hour == 11
+    assert features["local_hour"] == 11
+    assert features["station_id"] == 11
+    assert features["metar_obs_count_past_10h"] == 11
+    assert "metar_obs_count_past_6h" not in features
+    assert not any(name.startswith("asos_") for name in features)
 
 
 def test_kalshi_no_order_uses_ask_and_yes_scale_price(monkeypatch) -> None:
@@ -808,20 +856,21 @@ def test_production_strategy_parameters_match_requested_policy() -> None:
     assert config["model"]["buy_start_hour"] == 12
     assert config["model"]["buy_end_hour"] == 16
     assert config["model"]["station_buy_hours"] == {
-        "KATL": [14, 16],
+        "KATL": [14, 17],
         "KAUS": [14, 17],
         "KBOS": [14, 17],
         "KDCA": [14, 17],
-        "KDFW": [16, 17],
+        "KDFW": [14, 18],
         "KLAS": [13, 16],
+        "KLAX": [11, 15],
         "KMDW": [14, 16],
         "KMIA": [12, 16],
         "KMSP": [14, 16],
         "KOKC": [14, 17],
         "KPHL": [14, 17],
-        "KPHX": [14, 16],
+        "KPHX": [14, 17],
         "KSAT": [14, 17],
-        "KSEA": [14, 17],
+        "KSEA": [13, 16],
         "KSFO": [14, 17],
     }
     assert (
@@ -840,7 +889,22 @@ def test_production_strategy_parameters_match_requested_policy() -> None:
     assert config["trading"]["default_contracts"] == 5
     assert config["trading"]["max_order_cost_dollars"] == 5.00
     assert config["trading"]["min_order_cost_dollars"] == 1.00
-    assert set(config["trading"]["live_stations"]) == set(trader.STATION_IDS)
+    assert config["trading"]["disabled_stations"] == ["KMSY"]
+    assert set(config["trading"]["live_stations"]) == {
+        "KATL",
+        "KAUS",
+        "KBOS",
+        "KDFW",
+        "KLAS",
+        "KLAX",
+        "KMDW",
+        "KMIA",
+        "KOKC",
+        "KPHL",
+        "KPHX",
+        "KSAT",
+        "KSEA",
+    }
     assert config["trading"]["order_management_window_minutes"] == 40
     assert config["observations"]["lookback_hours"] == 24
     assert config["observations"]["awc_prefetch_hours"] == 24
@@ -864,20 +928,38 @@ def test_station_buy_hours_use_station_overrides_and_default() -> None:
     assert trader.station_buy_hours(config) == (12, 16)
 
 
-def test_city_configs_enable_all_model_stations_live() -> None:
+def test_city_configs_enable_only_selected_model_stations_live() -> None:
     config = json.loads(Path("kalshi_weather_config.json").read_text(encoding="utf-8"))
     city_configs = trader.configured_city_configs(config)
 
-    assert len(city_configs) == 16
+    assert len(city_configs) == 18
     live = {
         item["observations"]["station"]
         for item in city_configs
         if item["trading"]["live_enabled"]
         and not item["trading"]["dry_run"]
     }
-    assert live == set(trader.STATION_IDS)
-    assert not any(item["trading"]["dry_run"] for item in city_configs)
-    assert {"KDEN", "KHOU", "KLAX", "KMSY"}.isdisjoint(live)
+    assert live == set(config["trading"]["live_stations"])
+    paper = {
+        item["observations"]["station"]
+        for item in city_configs
+        if item["trading"]["dry_run"]
+    }
+    assert paper == {"KDCA", "KDEN", "KHOU", "KMSP", "KSFO"}
+
+
+def test_disabled_station_cannot_trade_even_when_live_listed() -> None:
+    config = json.loads(Path("kalshi_weather_config.json").read_text(encoding="utf-8"))
+    config["trading"]["disabled_stations"] = ["KMIA"]
+    city_configs = trader.configured_city_configs(config)
+    miami = next(
+        item
+        for item in city_configs
+        if item["observations"]["station"] == "KMIA"
+    )
+
+    assert not miami["trading"]["live_enabled"]
+    assert miami["trading"]["dry_run"]
 
 
 def test_kalshi_telegram_title_has_platform_prefix() -> None:

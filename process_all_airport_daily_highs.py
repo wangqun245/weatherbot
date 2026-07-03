@@ -3,15 +3,14 @@ from __future__ import annotations
 import argparse
 import csv
 import json
-import subprocess
-import sys
+from collections import Counter, defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
-from zoneinfo import ZoneInfo
 
-import pandas as pd
+from compare_kaus_metar_to_nws_cli import download_year, load_cli_reports
+from compare_klax_6h_max_to_nws_cli import obvious_temperature_error
 
 
 @dataclass(frozen=True)
@@ -26,8 +25,16 @@ class Airport:
         return f"CLI{self.issuedby}"
 
 
+@dataclass(frozen=True)
+class MetarRow:
+    station: str
+    valid_text: str
+    valid_utc: datetime
+    metar: str
+    climate_date: date
+
+
 AIRPORTS = [
-    Airport("NYC", "KNYC", "America/New_York", "NYC"),
     Airport("Chicago", "KMDW", "America/Chicago", "MDW"),
     Airport("Miami", "KMIA", "America/New_York", "MIA"),
     Airport("Austin", "KAUS", "America/Chicago", "AUS"),
@@ -46,14 +53,24 @@ AIRPORTS = [
     Airport("Las Vegas", "KLAS", "America/Los_Angeles", "LAS"),
     Airport("Atlanta", "KATL", "America/New_York", "ATL"),
     Airport("San Antonio", "KSAT", "America/Chicago", "SAT"),
-    Airport("New Orleans", "KMSY", "America/Chicago", "MSY"),
 ]
 
-DIRTY_DATA_STATIONS = {"KDEN", "KLAX", "KHOU", "KMSY"}
+STANDARD_UTC_OFFSETS = {
+    "America/New_York": -5,
+    "America/Chicago": -6,
+    "America/Denver": -7,
+    "America/Phoenix": -7,
+    "America/Los_Angeles": -8,
+}
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(
+        description=(
+            "Build Kalshi training rows using strict NWS CLI YESTERDAY "
+            "maximum temperatures as labels and fixed-LST climate days."
+        )
+    )
     parser.add_argument(
         "--raw-root", type=Path, default=Path(r"C:\weather\metar_history")
     )
@@ -70,325 +87,201 @@ def parse_args() -> argparse.Namespace:
         / "nws_cache",
     )
     parser.add_argument("--start-year", type=int, default=2000)
-    parser.add_argument("--daily-coverage-min-pct", type=float, default=90.0)
-    parser.add_argument("--extrema-coverage-min-pct", type=float, default=80.0)
-    parser.add_argument("--min-six-hour-groups", type=int, default=3)
-    parser.add_argument("--weekly-high-outlier-f", type=float, default=20.0)
+    parser.add_argument("--year-coverage-min-pct", type=float, default=95.0)
     parser.add_argument("--workers", type=int, default=4)
+    parser.add_argument("--refresh-nws", action="store_true")
     return parser.parse_args()
-
-
-def run_station(
-    airport: Airport, args: argparse.Namespace, raw_dir: Path
-) -> dict[str, str]:
-    raw_output = args.output_dir / "raw"
-    cache_dir = args.nws_cache_root / airport.pil
-    daily = raw_output / f"{airport.station}_daily_unfiltered.csv"
-    comparison = raw_output / f"{airport.station}_vs_{airport.pil}_unfiltered.csv"
-    summary = raw_output / f"{airport.station}_unfiltered_summary.json"
-    command = [
-        sys.executable,
-        str(Path(__file__).with_name("compare_klax_6h_max_to_nws_cli.py")),
-        "--station",
-        airport.station,
-        "--timezone",
-        airport.timezone,
-        "--pil",
-        airport.pil,
-        "--input-dir",
-        str(raw_dir),
-        "--start-year",
-        str(args.start_year),
-        "--include-instantaneous-max",
-        "--daily-output",
-        str(daily),
-        "--comparison-output",
-        str(comparison),
-        "--summary",
-        str(summary),
-        "--cache-dir",
-        str(cache_dir),
-    ]
-    completed = subprocess.run(
-        command,
-        cwd=Path(__file__).parent,
-        text=True,
-        capture_output=True,
-        check=False,
-    )
-    if completed.returncode:
-        raise RuntimeError(
-            f"{airport.station} failed: {completed.stderr or completed.stdout}"
-        )
-    return {
-        "daily": str(daily),
-        "comparison": str(comparison),
-        "summary": str(summary),
-    }
 
 
 def expected_days(year: int, last_day: date) -> int:
     start = date(year, 1, 1)
     end = min(date(year, 12, 31), last_day)
-    if end < start:
-        return 0
-    return (end - start).days + 1
+    return max(0, (end - start).days + 1)
 
 
-def write_tagged_processed_rows(
-    airport: Airport,
-    raw_dir: Path,
-    cleaned_daily: pd.DataFrame,
-    output_path: Path,
-    mismatch_dates: set[pd.Timestamp],
-) -> tuple[int, int]:
-    daily_high_by_date = {
-        row.local_date.date(): float(row.daily_max_temp_f)
-        for row in cleaned_daily.itertuples()
-    }
-    local_tz = ZoneInfo(airport.timezone)
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    written = 0
-    removed_mismatch_rows = 0
-    with output_path.open("w", encoding="utf-8", newline="") as out_handle:
-        writer = csv.writer(out_handle)
-        writer.writerow(["daily_high_f", "station", "valid", "metar"])
-        for source_path in sorted(
-            raw_dir.glob(f"{airport.station}_*_metar.csv")
-        ):
-            with source_path.open(
-                "r", encoding="utf-8", newline=""
-            ) as in_handle:
-                for row in csv.DictReader(in_handle):
-                    metar = row.get("metar", "")
-                    if " AUTO " in f" {metar} ":
-                        continue
-                    try:
-                        valid_utc = datetime.strptime(
-                            row["valid"], "%Y-%m-%d %H:%M"
-                        ).replace(tzinfo=timezone.utc)
-                    except (KeyError, ValueError):
-                        continue
-                    local_date = valid_utc.astimezone(local_tz).date()
-                    daily_high_f = daily_high_by_date.get(local_date)
-                    if daily_high_f is None:
-                        continue
-                    if pd.Timestamp(local_date) in mismatch_dates:
-                        removed_mismatch_rows += 1
-                        continue
-                    writer.writerow(
-                        [
-                            f"{daily_high_f:.1f}",
-                            row.get("station", ""),
-                            row["valid"],
-                            metar,
-                        ]
+def station_files(station_dir: Path, station: str) -> list[Path]:
+    return sorted(station_dir.glob(f"{station}_*_metar.csv"))
+
+
+def read_station_rows(
+    airport: Airport, station_dir: Path, start_year: int
+) -> tuple[list[MetarRow], set[date], Counter]:
+    offset = timezone(
+        timedelta(hours=STANDARD_UTC_OFFSETS[airport.timezone])
+    )
+    rows: list[MetarRow] = []
+    dirty_days: set[date] = set()
+    stats: Counter = Counter()
+    seen: set[tuple[str, str]] = set()
+
+    for source_path in station_files(station_dir, airport.station):
+        with source_path.open("r", encoding="utf-8", newline="") as handle:
+            for source in csv.DictReader(handle):
+                stats["input_rows"] += 1
+                valid_text = source.get("valid", "")
+                metar = source.get("metar", "")
+                try:
+                    valid_utc = datetime.strptime(
+                        valid_text, "%Y-%m-%d %H:%M"
+                    ).replace(tzinfo=timezone.utc)
+                except ValueError:
+                    stats["invalid_timestamp_rows"] += 1
+                    continue
+                climate_date = valid_utc.astimezone(offset).date()
+                if climate_date.year < start_year:
+                    continue
+
+                key = (valid_text, metar)
+                if key in seen:
+                    stats["duplicate_rows"] += 1
+                    continue
+                seen.add(key)
+
+                if obvious_temperature_error(metar):
+                    dirty_days.add(climate_date)
+                    stats["obvious_dirty_rows"] += 1
+
+                if " AUTO " in f" {metar} ":
+                    stats["auto_rows_removed"] += 1
+                    continue
+
+                rows.append(
+                    MetarRow(
+                        station=source.get("station", airport.station),
+                        valid_text=valid_text,
+                        valid_utc=valid_utc,
+                        metar=metar,
+                        climate_date=climate_date,
                     )
-                    written += 1
-    return written, removed_mismatch_rows
+                )
+
+    rows.sort(key=lambda row: row.valid_utc)
+    return rows, dirty_days, stats
 
 
-def clean_station(
-    airport: Airport,
-    raw_dir: Path,
-    paths: dict[str, str],
-    args: argparse.Namespace,
-) -> tuple[
-    dict[str, object],
-    list[dict[str, object]],
-    list[dict[str, object]],
-    list[dict[str, object]],
-]:
-    daily = pd.read_csv(paths["daily"])
-    comparison = pd.read_csv(paths["comparison"])
-    daily["local_date"] = pd.to_datetime(daily["local_date"])
-    comparison["local_date"] = pd.to_datetime(comparison["local_date"])
-    last_day = daily["local_date"].max().date()
-    daily["year"] = daily["local_date"].dt.year
+def process_station(
+    airport: Airport, args: argparse.Namespace
+) -> tuple[dict[str, object], list[dict[str, object]], list[dict[str, object]]]:
+    station_dir = args.raw_root / airport.station
+    rows, dirty_days, stats = read_station_rows(
+        airport, station_dir, args.start_year
+    )
+    if not rows:
+        raise RuntimeError(f"No usable METAR rows for {airport.station}")
 
+    last_day = max(row.climate_date for row in rows)
+    observed_days_by_year: dict[int, set[date]] = defaultdict(set)
+    for row in rows:
+        observed_days_by_year[row.climate_date.year].add(row.climate_date)
+
+    retained_years: set[int] = set()
     year_audit: list[dict[str, object]] = []
-    removed_years: set[int] = set()
     for year in range(args.start_year, last_day.year + 1):
-        rows = daily[daily["year"] == year]
         expected = expected_days(year, last_day)
-        observed = len(rows)
-        daily_pct = observed * 100.0 / expected if expected else 0.0
-        extrema_days = int(
-            (rows["six_hour_group_count"] >= args.min_six_hour_groups).sum()
-        )
-        extrema_pct = extrema_days * 100.0 / observed if observed else 0.0
-        reasons = []
-        if daily_pct < args.daily_coverage_min_pct:
-            reasons.append("daily_coverage_below_threshold")
-        if extrema_pct < args.extrema_coverage_min_pct:
-            reasons.append("six_hour_extrema_coverage_below_threshold")
-        removed = bool(reasons)
-        if removed:
-            removed_years.add(year)
+        observed = len(observed_days_by_year.get(year, set()))
+        coverage = observed * 100.0 / expected if expected else 0.0
+        retained = coverage >= args.year_coverage_min_pct
+        if retained:
+            retained_years.add(year)
         year_audit.append(
             {
                 "city": airport.city,
                 "station": airport.station,
-                "nws_product": airport.pil,
                 "year": year,
-                "expected_days": expected,
-                "daily_label_days": observed,
-                "daily_coverage_pct": round(daily_pct, 4),
-                "days_with_min_six_hour_groups": extrema_days,
-                "extrema_coverage_pct": round(extrema_pct, 4),
-                "removed": removed,
-                "removal_reason": "|".join(reasons),
+                "expected_calendar_days": expected,
+                "days_with_usable_metar": observed,
+                "coverage_pct": round(coverage, 4),
+                "retained": retained,
+                "exclusion_reason": (
+                    ""
+                    if retained
+                    else "metar_calendar_day_coverage_below_95pct"
+                ),
             }
         )
 
-    candidate = daily[~daily["year"].isin(removed_years)].copy()
-    iso = candidate["local_date"].dt.isocalendar()
-    candidate["iso_year"] = iso.year.astype(int)
-    candidate["iso_week"] = iso.week.astype(int)
-    group_keys = ["iso_year", "iso_week"]
-    weekly_sum = candidate.groupby(group_keys)["daily_max_temp_f"].transform("sum")
-    weekly_count = candidate.groupby(group_keys)["daily_max_temp_f"].transform(
-        "count"
-    )
-    candidate["peer_week_mean_f"] = (
-        weekly_sum - candidate["daily_max_temp_f"]
-    ) / (weekly_count - 1)
-    candidate["above_peer_week_mean_f"] = (
-        candidate["daily_max_temp_f"] - candidate["peer_week_mean_f"]
-    )
-    anomaly_mask = (weekly_count >= 4) & (
-        candidate["above_peer_week_mean_f"] > args.weekly_high_outlier_f
-    )
-    anomalies = candidate[anomaly_mask].copy()
-    anomaly_audit = [
-        {
-            "city": airport.city,
-            "station": airport.station,
-            "local_date": row.local_date.date().isoformat(),
-            "daily_max_temp_f": row.daily_max_temp_f,
-            "peer_week_mean_f": round(row.peer_week_mean_f, 4),
-            "above_peer_week_mean_f": round(row.above_peer_week_mean_f, 4),
-            "removal_reason": "daily_high_gt_peer_week_mean_plus_threshold",
-            "source_metar": row.source_metar,
-        }
-        for row in anomalies.itertuples()
+    cache_dir = args.nws_cache_root / airport.pil
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    archives = [
+        download_year(year, cache_dir, args.refresh_nws, airport.pil)
+        for year in range(args.start_year, last_day.year + 2)
     ]
-    cleaned = candidate[~anomaly_mask].copy()
-    keep_dates = set(cleaned["local_date"])
-    cleaned_comparison = comparison[
-        comparison["local_date"].isin(keep_dates)
-    ].copy()
-    mismatch_mask = cleaned_comparison["difference_f"].notna() & (
-        cleaned_comparison["difference_f"] != 0
-    )
-    mismatch_comparison = cleaned_comparison[mismatch_mask].copy()
-    mismatch_dates = set(mismatch_comparison["local_date"])
-    processed_daily = cleaned[
-        ~cleaned["local_date"].isin(mismatch_dates)
-    ].copy()
-    mismatch_audit = [
-        {
-            "city": airport.city,
-            "station": airport.station,
-            "dirty_data_station": airport.station in DIRTY_DATA_STATIONS,
-            "local_date": row.local_date.date().isoformat(),
-            "metar_daily_high_f": row.station_daily_maximum_f,
-            "nws_daily_high_f": row.nws_cli_maximum_f,
-            "difference_f": row.difference_f,
-            "removal_reason": "metar_daily_high_not_equal_to_nws",
-        }
-        for row in mismatch_comparison.itertuples()
-    ]
+    reports, parsed_versions = load_cli_reports(archives)
+    labels = {
+        climate_date: report.maximum_f
+        for climate_date, report in reports.items()
+        if report.period_label == "YESTERDAY"
+        and report.maximum_f is not None
+    }
 
     processed_dir = args.output_dir / "processed"
-    comparison_dir = args.output_dir / "comparisons"
     processed_dir.mkdir(parents=True, exist_ok=True)
-    comparison_dir.mkdir(parents=True, exist_ok=True)
-    processed_daily_path = (
-        processed_dir / f"{airport.station}_daily_high_cleaned.csv"
-    )
-    processed_daily.drop(
-        columns=[
-            "year",
-            "iso_year",
-            "iso_week",
-            "peer_week_mean_f",
-            "above_peer_week_mean_f",
-        ],
-        errors="ignore",
-    ).to_csv(
-        processed_daily_path,
-        index=False,
-        encoding="utf-8-sig",
-    )
-    cleaned_comparison.to_csv(
-        comparison_dir / f"{airport.station}_vs_{airport.pil}_cleaned.csv",
-        index=False,
-        encoding="utf-8-sig",
-    )
-    tagged_output = (
+    output_path = (
         processed_dir
         / f"{airport.station}_local_0000_2359_daily_high.csv"
     )
-    tagged_rows, removed_mismatch_rows = write_tagged_processed_rows(
-        airport=airport,
-        raw_dir=raw_dir,
-        cleaned_daily=cleaned,
-        output_path=tagged_output,
-        mismatch_dates=mismatch_dates,
-    )
-    excluded_from_training = airport.station in DIRTY_DATA_STATIONS
-    if excluded_from_training:
-        processed_daily_path.unlink(missing_ok=True)
-        tagged_output.unlink(missing_ok=True)
-        tagged_rows = 0
+    output_rows = 0
+    skipped_dirty_rows = 0
+    skipped_missing_label_rows = 0
+    output_days: set[date] = set()
+    missing_label_days: set[date] = set()
+    with output_path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.writer(handle, lineterminator="\n")
+        writer.writerow(["daily_high_f", "station", "valid", "metar"])
+        for row in rows:
+            if row.climate_date.year not in retained_years:
+                continue
+            if row.climate_date in dirty_days:
+                skipped_dirty_rows += 1
+                continue
+            label = labels.get(row.climate_date)
+            if label is None:
+                skipped_missing_label_rows += 1
+                missing_label_days.add(row.climate_date)
+                continue
+            writer.writerow(
+                [f"{float(label):.1f}", row.station, row.valid_text, row.metar]
+            )
+            output_rows += 1
+            output_days.add(row.climate_date)
 
-    comparable = cleaned_comparison[
-        cleaned_comparison["difference_f"].notna()
-    ].copy()
-    exact = int((comparable["difference_f"] == 0).sum())
-    within1 = int((comparable["difference_f"].abs() <= 1).sum())
-    metrics = {
+    dirty_audit = [
+        {
+            "city": airport.city,
+            "station": airport.station,
+            "climate_date_lst": day.isoformat(),
+            "removal_reason": "day_contains_obviously_dirty_metar",
+        }
+        for day in sorted(dirty_days)
+    ]
+    summary = {
         "city": airport.city,
         "station": airport.station,
         "timezone": airport.timezone,
         "nws_product": airport.pil,
-        "dirty_data": excluded_from_training,
-        "excluded_from_training": excluded_from_training,
-        "first_clean_date": processed_daily["local_date"].min().date().isoformat()
-        if len(processed_daily)
-        else "",
-        "last_clean_date": processed_daily["local_date"].max().date().isoformat()
-        if len(processed_daily)
-        else "",
-        "clean_daily_days": 0 if excluded_from_training else len(processed_daily),
-        "removed_nws_mismatch_days": len(mismatch_dates),
-        "removed_nws_mismatch_metar_rows": removed_mismatch_rows,
-        "tagged_processed_rows": tagged_rows,
-        "tagged_processed_file": str(tagged_output),
-        "removed_year_count": len(removed_years),
-        "removed_years": ",".join(map(str, sorted(removed_years))),
-        "removed_anomaly_days": len(anomalies),
-        "nws_comparable_days": len(comparable),
-        "exact_matches": exact,
-        "exact_match_rate_pct": round(exact * 100 / len(comparable), 4)
-        if len(comparable)
-        else None,
-        "within_1f_days": within1,
-        "within_1f_rate_pct": round(within1 * 100 / len(comparable), 4)
-        if len(comparable)
-        else None,
-        "mae_f": round(comparable["difference_f"].abs().mean(), 6)
-        if len(comparable)
-        else None,
-        "bias_f": round(comparable["difference_f"].mean(), 6)
-        if len(comparable)
-        else None,
-        "nws_report_missing_days": int(
-            (cleaned_comparison["status"] == "nws_report_missing").sum()
+        "lst_utc_offset_hours": STANDARD_UTC_OFFSETS[airport.timezone],
+        "first_output_climate_date": (
+            min(output_days).isoformat() if output_days else ""
         ),
+        "last_output_climate_date": (
+            max(output_days).isoformat() if output_days else ""
+        ),
+        "retained_year_count": len(retained_years),
+        "retained_years": ",".join(map(str, sorted(retained_years))),
+        "excluded_year_count": len(year_audit) - len(retained_years),
+        "dirty_climate_days_removed": len(
+            dirty_days & set().union(*observed_days_by_year.values())
+        ),
+        "metar_rows_removed_with_dirty_days": skipped_dirty_rows,
+        "nws_label_missing_days": len(missing_label_days),
+        "metar_rows_skipped_without_nws_label": skipped_missing_label_rows,
+        "nws_cli_versions_parsed": parsed_versions,
+        "output_climate_days": len(output_days),
+        "output_rows": output_rows,
+        "output_file": str(output_path),
+        **dict(stats),
     }
-    return metrics, year_audit, anomaly_audit, mismatch_audit
+    return summary, year_audit, dirty_audit
 
 
 def write_csv(path: Path, rows: list[dict[str, object]]) -> None:
@@ -404,66 +297,73 @@ def write_csv(path: Path, rows: list[dict[str, object]]) -> None:
 
 def main() -> int:
     args = parse_args()
-    args.output_dir.mkdir(parents=True, exist_ok=True)
-    (args.output_dir / "raw").mkdir(parents=True, exist_ok=True)
-    available: list[tuple[Airport, Path]] = []
-    missing: list[str] = []
-    for airport in AIRPORTS:
-        raw_dir = args.raw_root / airport.station
-        if raw_dir.exists() and any(raw_dir.glob(f"{airport.station}_*_metar.csv")):
-            available.append((airport, raw_dir))
-        else:
-            missing.append(airport.station)
+    if not 0 < args.year_coverage_min_pct <= 100:
+        raise SystemExit("--year-coverage-min-pct must be in (0, 100]")
+
+    missing = [
+        airport.station
+        for airport in AIRPORTS
+        if not (args.raw_root / airport.station).exists()
+    ]
     if missing:
         raise SystemExit(f"Missing raw station data: {', '.join(missing)}")
 
-    generated: dict[str, dict[str, str]] = {}
+    summaries: list[dict[str, object]] = []
+    year_rows: list[dict[str, object]] = []
+    dirty_rows: list[dict[str, object]] = []
     with ThreadPoolExecutor(max_workers=max(1, args.workers)) as pool:
         futures = {
-            pool.submit(run_station, airport, args, raw_dir): airport
-            for airport, raw_dir in available
+            pool.submit(process_station, airport, args): airport
+            for airport in AIRPORTS
         }
         for future in as_completed(futures):
             airport = futures[future]
-            generated[airport.station] = future.result()
-            print(f"Generated unfiltered daily/NWS data: {airport.station}")
+            summary, years, dirty = future.result()
+            summaries.append(summary)
+            year_rows.extend(years)
+            dirty_rows.extend(dirty)
+            print(
+                f"{airport.station}: {summary['output_rows']} rows, "
+                f"{summary['output_climate_days']} labeled climate days"
+            )
 
-    metrics_rows: list[dict[str, object]] = []
-    year_rows: list[dict[str, object]] = []
-    anomaly_rows: list[dict[str, object]] = []
-    mismatch_rows: list[dict[str, object]] = []
-    for airport, raw_dir in available:
-        metrics, years, anomalies, mismatches = clean_station(
-            airport, raw_dir, generated[airport.station], args
+    order = {airport.station: index for index, airport in enumerate(AIRPORTS)}
+    summaries.sort(key=lambda row: order[str(row["station"])])
+    year_rows.sort(key=lambda row: (order[str(row["station"])], row["year"]))
+    dirty_rows.sort(
+        key=lambda row: (
+            order[str(row["station"])],
+            row["climate_date_lst"],
         )
-        metrics_rows.append(metrics)
-        year_rows.extend(years)
-        anomaly_rows.extend(anomalies)
-        mismatch_rows.extend(mismatches)
-
-    write_csv(args.output_dir / "station_summary.csv", metrics_rows)
-    write_csv(args.output_dir / "year_coverage_audit.csv", year_rows)
-    write_csv(args.output_dir / "removed_anomaly_days.csv", anomaly_rows)
-    write_csv(
-        args.output_dir / "removed_nws_mismatch_days.csv", mismatch_rows
     )
+    write_csv(args.output_dir / "station_summary.csv", summaries)
+    write_csv(args.output_dir / "year_coverage_audit.csv", year_rows)
+    write_csv(args.output_dir / "removed_dirty_climate_days.csv", dirty_rows)
+
     config = {
         "raw_root": str(args.raw_root),
         "nws_cache_root": str(args.nws_cache_root),
         "start_year": args.start_year,
-        "daily_coverage_min_pct": args.daily_coverage_min_pct,
-        "extrema_coverage_min_pct": args.extrema_coverage_min_pct,
-        "min_six_hour_groups": args.min_six_hour_groups,
-        "weekly_high_outlier_f": args.weekly_high_outlier_f,
-        "dirty_data_stations": sorted(DIRTY_DATA_STATIONS),
-        "training_exclusion_policy": (
-            "dirty_data_stations have no files in the processed directory"
+        "year_coverage_min_pct": args.year_coverage_min_pct,
+        "year_coverage_definition": (
+            "fixed-LST calendar days containing at least one valid non-AUTO "
+            "METAR divided by expected calendar days through the last raw day"
         ),
-        "nws_mismatch_policy": (
-            "remove days with both values present and unequal; "
-            "retain days where NWS report is missing"
+        "climate_day_definition": (
+            "00:00-23:59 fixed Local Standard Time using the station's "
+            "standard UTC offset"
         ),
-        "stations": [airport.station for airport, _ in available],
+        "label_definition": (
+            "strict next-morning NWS CLI YESTERDAY MAXIMUM; no METAR-derived "
+            "daily high"
+        ),
+        "dirty_day_policy": (
+            "remove the entire fixed-LST climate day when any METAR has a "
+            "body/T-group difference greater than 1C or temperature/extrema "
+            "outside -60C..52C"
+        ),
+        "output_format": "daily_high_f,station,valid_utc,metar",
+        "stations": [airport.station for airport in AIRPORTS],
     }
     (args.output_dir / "processing_config.json").write_text(
         json.dumps(config, indent=2) + "\n", encoding="utf-8"

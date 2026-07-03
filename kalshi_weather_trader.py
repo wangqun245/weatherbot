@@ -32,6 +32,9 @@ from featurize_metar_history import (
 )
 from kalshi.featurize_katt import parse_six_hour_extrema
 from kalshi.featurize_all_stations import STATION_IDS
+from kalshi.featurize_nws_cli_polymarket_context import (
+    STATION_STANDARD_UTC_OFFSETS,
+)
 from kalshi_client import KalshiClient
 from kalshi_execution import (
     KalshiHourlyExecutionManager,
@@ -545,9 +548,10 @@ def build_feature_row(
         decode_metar(row, station, local_timezone) for row in rows
     ]
     features = decode_metar(latest, station, local_timezone)
-    if station not in STATION_IDS:
-        raise ValueError(f"Station {station} is not present in the 16-station model")
-    features["station_id"] = STATION_IDS[station]
+    station_ids = configured_station_ids(config)
+    if station not in station_ids:
+        raise ValueError(f"Station {station} is not present in the configured model")
+    features["station_id"] = station_ids[station]
     features["local_week_of_year"] = float(latest_local.isocalendar().week)
     valid_times = [row.valid_utc for row in rows]
     temp_values = [decoded.get("temp_f") for decoded in decoded_rows]
@@ -579,6 +583,7 @@ def build_feature_row(
         is_extra_metar_report(row, regular_minutes_by_year) for row in rows
     ]
     latest_index = rows.index(latest)
+    context_hours = int(config["model"].get("context_hours", 6))
     add_observation_context_features(
         features=features,
         row=latest,
@@ -586,9 +591,20 @@ def build_feature_row(
         valid_times=valid_times,
         temp_values=temp_values,
         extra_flags=extra_flags,
-        window=timedelta(hours=6),
+        window=timedelta(hours=context_hours),
     )
-    add_asos_extrema_context(features, rows, latest)
+    if context_hours != 6:
+        for name in list(features):
+            if "_past_6h" in name:
+                renamed = name.replace(
+                    "_past_6h", f"_past_{context_hours}h"
+                )
+                features[renamed] = features.pop(name)
+    if context_hours == 6 or any(
+        str(name).startswith("asos_")
+        for name in getattr(model, "feature_name_", [])
+    ):
+        add_asos_extrema_context(features, rows, latest)
     return features, latest, latest_local
 
 
@@ -983,6 +999,12 @@ def append_trade(path: Path, payload: dict[str, Any]) -> None:
 
 
 def configured_timezone(config: dict[str, Any]) -> Any:
+    if str(config.get("model", {}).get("time_basis", "")).lower() == "fixed_lst":
+        station = str(config["observations"]["station"]).upper()
+        offset = STATION_STANDARD_UTC_OFFSETS.get(station)
+        if offset is None:
+            raise ValueError(f"Missing fixed-LST offset for {station}")
+        return timezone(timedelta(hours=offset), name=f"LST{offset:+d}")
     value = str(
         config.get("observations", {}).get(
             "timezone", "America/Chicago"
@@ -991,6 +1013,16 @@ def configured_timezone(config: dict[str, Any]) -> Any:
     if value.lower() == "fixed_cst":
         return NWS_LST
     return ZoneInfo(value)
+
+
+def configured_station_ids(config: dict[str, Any]) -> dict[str, int]:
+    configured = config.get("model", {}).get("station_ids")
+    if isinstance(configured, dict) and configured:
+        return {
+            str(station).upper(): int(station_id)
+            for station, station_id in configured.items()
+        }
+    return STATION_IDS
 
 
 def configured_city_configs(config: dict[str, Any]) -> list[dict[str, Any]]:
@@ -1002,12 +1034,20 @@ def configured_city_configs(config: dict[str, Any]) -> list[dict[str, Any]]:
         str(value).upper()
         for value in config.get("trading", {}).get("live_stations", [])
     }
+    disabled_stations = {
+        str(value).upper()
+        for value in config.get("trading", {}).get(
+            "disabled_stations", []
+        )
+    }
+    live_stations.difference_update(disabled_stations)
+    station_ids = configured_station_ids(config)
     expanded = []
     for city in cities:
         if not isinstance(city, dict) or not city.get("station"):
             continue
         station = str(city["station"]).upper()
-        if station not in STATION_IDS:
+        if station not in station_ids:
             LOGGER.warning(
                 "Skipping station absent from model station IDs station=%s",
                 station,
@@ -1028,7 +1068,9 @@ def configured_city_configs(config: dict[str, Any]) -> list[dict[str, Any]]:
         item["market"]["expected_rules_text"] = str(
             city.get("expected_rules_text") or ""
         )
-        is_live = station in live_stations
+        is_live = (
+            station in live_stations and station not in disabled_stations
+        )
         item["trading"]["live_enabled"] = is_live
         item["trading"]["dry_run"] = not is_live
         expanded.append(item)

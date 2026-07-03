@@ -521,9 +521,14 @@ def read_rows(path: Path) -> list[MetarRow]:
         reader = csv.DictReader(handle)
         for source in reader:
             valid_utc = datetime.strptime(source["valid"], "%Y-%m-%d %H:%M").replace(tzinfo=timezone.utc)
+            target_value = source.get("daily_high_f")
+            if target_value in (None, ""):
+                target_value = source.get("daily_high_c")
+            if target_value in (None, ""):
+                raise ValueError(f"Missing daily high target in {path}")
             rows.append(
                 MetarRow(
-                    daily_high_f=source["daily_high_f"],
+                    daily_high_f=str(target_value),
                     station=source["station"],
                     valid_utc=valid_utc,
                     valid_text=source["valid"],
@@ -870,10 +875,14 @@ def write_station_features(
 def input_feature_sources(input_dir: Path) -> list[Path]:
     return [
         path
-        for path in sorted(input_dir.glob("*_local_*_daily_high.csv"))
+        for path in sorted(input_dir.glob("*_local_*.csv"))
         if (
             not path.name.endswith("_features.csv")
             and not path.name.startswith("all_")
+            and (
+                path.stem.endswith("_daily_high")
+                or path.stem.endswith("_daily_high_c")
+            )
         )
     ]
 

@@ -3168,37 +3168,6 @@ def process_model_awc_prediction(
         return None
 
     adjacent_shares = float(config["trading"].get("model_awc_adjacent_yes_shares", 10))
-    if live_trader:
-        if duplicate_window:
-            LOGGER.info(
-                "model awc skip duplicate managed adjacent batch city=%s "
-                "station=%s event_date=%s local_hour=%s",
-                city,
-                station,
-                event_date,
-                local_hour,
-            )
-            return None
-        batch_id = live_trader.start_model_awc_hourly_batch(
-            city,
-            station,
-            event_date,
-            local_hour,
-            tuple(adjacent_markets),
-            ("YES", "YES"),
-            adjacent_shares,
-            predicted_high_f,
-            "adjacent",
-        )
-        LOGGER.info(
-            "model awc adjacent delegated to websocket manager batch=%s "
-            "markets=%s target_shares_each=%s",
-            batch_id,
-            [market.market_id for market in adjacent_markets],
-            adjacent_shares,
-        )
-        return None
-
     adjacent_prices: list[tuple[TemperatureMarket, float]] = []
     for market in adjacent_markets:
         yes_price = best_buy_price(
@@ -3218,9 +3187,8 @@ def process_model_awc_prediction(
         adjacent_prices.append((market, round(float(yes_price), 2)))
     total_yes_price = sum(price for _market, price in adjacent_prices)
     max_total_price = float(config["trading"].get("model_awc_adjacent_yes_max_total_price", 0.9))
-    held_no_exists = any((trade.position_side or "YES").upper() == "NO" for trade in active_event_positions)
     held_adjacent_yes = model_awc_adjacent_yes_position_summary(active_event_positions, adjacent_markets)
-    if held_adjacent_yes and not held_no_exists:
+    if held_adjacent_yes:
         held_market_ids = set(held_adjacent_yes)
         if len(held_market_ids) >= len(adjacent_markets):
             LOGGER.info(
@@ -3252,7 +3220,7 @@ def process_model_awc_prediction(
         hedge_market, hedge_price = missing[0]
         hedge_total_price = held_cost_price + float(hedge_price)
         held_shares = float(held_summary.get("shares", 0.0))
-        hedge_shares = held_shares
+        hedge_shares = adjacent_shares
         if held_shares <= 0 or hedge_shares <= 0:
             LOGGER.info(
                 "model awc skip adjacent hedge invalid shares city=%s station=%s event_date=%s local_hour=%s held_market=%s held_shares=%s hedge_shares=%s",
@@ -3261,24 +3229,6 @@ def process_model_awc_prediction(
                 event_date,
                 local_hour,
                 held_market_id,
-                held_shares,
-                hedge_shares,
-            )
-            return None
-        if hedge_total_price > max_total_price:
-            LOGGER.info(
-                "model awc skip adjacent hedge total too high city=%s station=%s event_date=%s local_hour=%s predicted_high_f=%r held_market=%s held_cost=%.4f hedge_market=%s hedge_price=%.4f total=%.4f max=%.4f held_shares=%s hedge_shares=%s",
-                city,
-                station,
-                event_date,
-                local_hour,
-                predicted_high_f,
-                held_market_id,
-                held_cost_price,
-                hedge_market.market_id,
-                hedge_price,
-                hedge_total_price,
-                max_total_price,
                 held_shares,
                 hedge_shares,
             )
@@ -3299,6 +3249,28 @@ def process_model_awc_prediction(
             f"_held_cost_{held_cost_price:.2f}_hedge_price_{hedge_price:.2f}_total_yes_{hedge_total_price:.2f}"
             f"_held_shares_{held_shares:g}_hedge_shares_{hedge_shares:g}_local_hour_{local_hour:02d}"
         )
+        if live_trader:
+            batch_id = live_trader.start_model_awc_hourly_batch(
+                city,
+                station,
+                event_date,
+                local_hour,
+                (hedge_market,),
+                ("YES",),
+                hedge_shares,
+                predicted_high_f,
+                "single",
+            )
+            LOGGER.info(
+                "model awc adjacent hedge delegated to websocket manager batch=%s "
+                "held_market=%s hedge_market=%s held_shares=%s target_shares=%s",
+                batch_id,
+                held_market_id,
+                hedge_market.market_id,
+                held_shares,
+                hedge_shares,
+            )
+            return None
         trade = submit_model_awc_trade(hedge_market, "YES", hedge_price, reason, amount_usd=amount_usd, shares=hedge_shares)
         if trade:
             LOGGER.info(
@@ -3348,7 +3320,22 @@ def process_model_awc_prediction(
                 f"model_awc_high_predicted_{predicted_high_f:.2f}_non_adjacent_no_{no_market.market_id}"
                 f"_adjacent_yes_total_{total_yes_price:.2f}_over_max_{max_total_price:.2f}_local_hour_{local_hour:02d}"
             )
-            return submit_model_awc_trade(no_market, "NO", no_price, reason)
+            if live_trader:
+                batch_id = live_trader.start_model_awc_hourly_batch(
+                    city, station, event_date, local_hour, (no_market,), ("NO",),
+                    adjacent_shares, predicted_high_f, "single",
+                )
+                LOGGER.info(
+                    "model awc non-adjacent no delegated to websocket manager "
+                    "batch=%s market=%s target_shares=%s reason=adjacent_yes_over_max",
+                    batch_id, no_market.market_id, adjacent_shares,
+                )
+                return None
+            return submit_model_awc_trade(
+                no_market, "NO", no_price, reason,
+                amount_usd=round(adjacent_shares * no_price, 2),
+                shares=adjacent_shares,
+            )
         LOGGER.info(
             "model awc skip adjacent yes total too high and non-adjacent no above max city=%s station=%s event_date=%s local_hour=%s predicted_high_f=%r total_yes_price=%.4f max=%.4f no_price=%.4f no_max=%.4f no_market=%s markets=%s",
             city,
@@ -3372,7 +3359,44 @@ def process_model_awc_prediction(
             f"model_awc_high_predicted_{predicted_high_f:.2f}_non_adjacent_no_{no_market.market_id}"
             f"_cheaper_than_adjacent_yes_{total_yes_price:.2f}_local_hour_{local_hour:02d}"
         )
-        return submit_model_awc_trade(no_market, "NO", no_price, reason)
+        if live_trader:
+            batch_id = live_trader.start_model_awc_hourly_batch(
+                city, station, event_date, local_hour, (no_market,), ("NO",),
+                adjacent_shares, predicted_high_f, "single",
+            )
+            LOGGER.info(
+                "model awc non-adjacent no delegated to websocket manager "
+                "batch=%s market=%s target_shares=%s no_price=%.4f adjacent_yes_total=%.4f",
+                batch_id, no_market.market_id, adjacent_shares, no_price, total_yes_price,
+            )
+            return None
+        return submit_model_awc_trade(
+            no_market, "NO", no_price, reason,
+            amount_usd=round(adjacent_shares * no_price, 2),
+            shares=adjacent_shares,
+        )
+
+    if live_trader:
+        batch_id = live_trader.start_model_awc_hourly_batch(
+            city,
+            station,
+            event_date,
+            local_hour,
+            tuple(adjacent_markets),
+            ("YES", "YES"),
+            adjacent_shares,
+            predicted_high_f,
+            "adjacent",
+        )
+        LOGGER.info(
+            "model awc adjacent delegated to websocket manager batch=%s "
+            "markets=%s target_shares_each=%s total_yes_price=%.4f",
+            batch_id,
+            [market.market_id for market in adjacent_markets],
+            adjacent_shares,
+            total_yes_price,
+        )
+        return None
 
     created: list[PaperTrade] = []
     adjacent_market_ids = "_".join(market.market_id for market, _price in adjacent_prices)

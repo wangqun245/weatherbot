@@ -429,6 +429,142 @@ class ModelAwcLiveSingleIntervalTest(unittest.TestCase):
         self.assertEqual(10, submissions[0][1])
 
 
+class ModelAwcLiveAdjacentSelectionTest(unittest.TestCase):
+    def setUp(self):
+        self.config = bot.default_config()
+        self.config["trading"]["live_trading_enabled"] = True
+        self.config["trading"]["model_awc_adjacent_yes_shares"] = 10.0
+        self.config["outputs"]["trades_csv"] = "unused-trades.csv"
+        self.config["outputs"]["settled_trades_csv"] = "unused-settled.csv"
+        self.event = {
+            "id": "event-miami",
+            "slug": "miami-high-july-3",
+            "_parsed_kind": "Highest",
+            "_parsed_event_date": "2026-07-03",
+        }
+        self.markets = [
+            self._market("market-86-87", 86, 87),
+            self._market("market-88-89", 88, 89),
+            self._market("market-90-91", 90, 91),
+        ]
+        self.latest_utc = bot.datetime(2026, 7, 3, 17, 53, tzinfo=bot.timezone.utc)
+        self.latest_local = self.latest_utc.astimezone(bot.ZoneInfo("America/New_York"))
+        self.latest_row = bot.FeatureMetarRow(
+            daily_high_f="90.0",
+            station="KMIA",
+            valid_utc=self.latest_utc,
+            valid_text="2026-07-03T17:53:00+00:00",
+            metar="KMIA 031753Z 18006KT 10SM 31/23 A3005",
+        )
+
+    def _market(self, market_id, low, high):
+        return bot.TemperatureMarket(
+            event_id="event-miami",
+            market_id=market_id,
+            condition_id=f"condition-{market_id}",
+            city="Miami",
+            kind="Highest",
+            event_date="2026-07-03",
+            event_title="Highest temperature in Miami on July 3",
+            market_question=f"Will Miami be between {low}-{high}F?",
+            polymarket_url="https://polymarket.com/event/miami-high-july-3",
+            yes_price=0.4,
+            rule_min=float(low),
+            rule_max=float(high),
+            unit="F",
+            raw_market_json=(
+                '{"outcomes":["Yes","No"],'
+                f'"clobTokenIds":["yes-{market_id}","no-{market_id}"]}}'
+            ),
+        )
+
+    def _run(self, prices, trades=None):
+        fake_live_trader = SimpleNamespace(batches=[])
+
+        def start_model_awc_hourly_batch(*args, **kwargs):
+            fake_live_trader.batches.append((args, kwargs))
+            return "batch-1"
+
+        fake_live_trader.start_model_awc_hourly_batch = start_model_awc_hourly_batch
+
+        def best_price(_config, market, side, **_kwargs):
+            return prices.get((market.market_id, side))
+
+        with mock.patch.object(bot, "get_live_trader", return_value=fake_live_trader), \
+            mock.patch.object(bot, "markets_for_event", return_value=self.markets), \
+            mock.patch.object(bot, "read_trades", return_value=trades or []), \
+            mock.patch.object(bot, "best_buy_price", side_effect=best_price):
+            result = bot.process_model_awc_prediction(
+                self.config, self.event, "Miami", "KMIA", 89.7,
+                self.latest_row, self.latest_local,
+            )
+        return fake_live_trader, result
+
+    def test_live_adjacent_existing_yes_only_manages_missing_yes_leg(self):
+        held = SimpleNamespace(
+            status="OPEN",
+            strategy=self.config["trading"]["strategy_name"],
+            city="Miami",
+            kind="Highest",
+            event_date="2026-07-03",
+            position_side="YES",
+            market_id="market-90-91",
+            shares=11.0,
+            yes_price=0.69,
+            total_cost_usdc=7.59,
+            cycle_id="20260703T165541:model_awc_high:Miami:KMIA:2026-07-03:hour_12",
+        )
+        prices = {
+            ("market-88-89", "YES"): 0.30,
+            ("market-90-91", "YES"): 0.59,
+        }
+
+        manager, result = self._run(prices, [held])
+
+        self.assertIsNone(result)
+        self.assertEqual(1, len(manager.batches))
+        args, _kwargs = manager.batches[0]
+        self.assertEqual(("market-88-89",), tuple(m.market_id for m in args[4]))
+        self.assertEqual(("YES",), args[5])
+        self.assertEqual(10.0, args[6])
+        self.assertEqual("single", args[8])
+
+    def test_live_adjacent_chooses_cheaper_non_adjacent_no_fixed_shares(self):
+        prices = {
+            ("market-88-89", "YES"): 0.45,
+            ("market-90-91", "YES"): 0.44,
+            ("market-86-87", "NO"): 0.20,
+        }
+
+        manager, result = self._run(prices)
+
+        self.assertIsNone(result)
+        args, _kwargs = manager.batches[0]
+        self.assertEqual(("market-86-87",), tuple(m.market_id for m in args[4]))
+        self.assertEqual(("NO",), args[5])
+        self.assertEqual(10.0, args[6])
+        self.assertEqual("single", args[8])
+
+    def test_live_adjacent_chooses_two_yes_legs_when_combination_is_cheaper(self):
+        prices = {
+            ("market-88-89", "YES"): 0.30,
+            ("market-90-91", "YES"): 0.35,
+            ("market-86-87", "NO"): 0.80,
+        }
+
+        manager, result = self._run(prices)
+
+        self.assertIsNone(result)
+        args, _kwargs = manager.batches[0]
+        self.assertEqual(
+            ("market-88-89", "market-90-91"),
+            tuple(m.market_id for m in args[4]),
+        )
+        self.assertEqual(("YES", "YES"), args[5])
+        self.assertEqual(10.0, args[6])
+        self.assertEqual("adjacent", args[8])
+
+
 class MetarMomentumTest(unittest.TestCase):
     def test_websocket_message_prices_extracts_nested_changes(self):
         rows = bot.websocket_message_prices({

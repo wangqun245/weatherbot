@@ -538,6 +538,34 @@ class ModelAwcLiveAdjacentSelectionTest(unittest.TestCase):
         self.assertEqual(10.0, args[6])
         self.assertEqual("single", args[8])
 
+    def test_live_adjacent_cheaper_no_wins_before_existing_yes_check(self):
+        held = SimpleNamespace(
+            status="OPEN",
+            strategy=self.config["trading"]["strategy_name"],
+            city="Miami",
+            kind="Highest",
+            event_date="2026-07-03",
+            position_side="YES",
+            market_id="market-90-91",
+            shares=11.0,
+            yes_price=0.69,
+            total_cost_usdc=7.59,
+            cycle_id="20260703T165541:model_awc_high:Miami:KMIA:2026-07-03:hour_12",
+        )
+        prices = {
+            ("market-88-89", "YES"): 0.40,
+            ("market-90-91", "YES"): 0.45,
+            ("market-86-87", "NO"): 0.20,
+        }
+
+        manager, result = self._run(prices, [held])
+
+        self.assertIsNone(result)
+        args, _kwargs = manager.batches[0]
+        self.assertEqual(("market-86-87",), tuple(m.market_id for m in args[4]))
+        self.assertEqual(("NO",), args[5])
+        self.assertEqual(10.0, args[6])
+
     def test_live_adjacent_chooses_cheaper_non_adjacent_no_fixed_shares(self):
         prices = {
             ("market-88-89", "YES"): 0.45,
@@ -572,6 +600,18 @@ class ModelAwcLiveAdjacentSelectionTest(unittest.TestCase):
         self.assertEqual(("YES", "YES"), args[5])
         self.assertEqual(10.0, args[6])
         self.assertEqual("adjacent", args[8])
+
+    def test_live_adjacent_skips_yes_when_total_exceeds_threshold_and_no_is_not_cheaper(self):
+        prices = {
+            ("market-88-89", "YES"): 0.48,
+            ("market-90-91", "YES"): 0.47,
+            ("market-86-87", "NO"): 0.97,
+        }
+
+        manager, result = self._run(prices)
+
+        self.assertIsNone(result)
+        self.assertEqual([], manager.batches)
 
 
 class MetarMomentumTest(unittest.TestCase):

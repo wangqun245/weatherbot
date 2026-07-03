@@ -32,9 +32,6 @@ from featurize_metar_history import (
 )
 from kalshi.featurize_katt import parse_six_hour_extrema
 from kalshi.featurize_all_stations import STATION_IDS
-from kalshi.featurize_nws_cli_polymarket_context import (
-    STATION_STANDARD_UTC_OFFSETS,
-)
 from kalshi_client import KalshiClient
 from kalshi_execution import (
     KalshiHourlyExecutionManager,
@@ -48,6 +45,26 @@ from weather_telegram_notifier import TelegramNotifier
 
 DEFAULT_CONFIG = "kalshi_weather_config.json"
 NWS_LST = timezone(timedelta(hours=-6), name="CST")
+STATION_STANDARD_UTC_OFFSETS = {
+    "KATL": -5,
+    "KAUS": -6,
+    "KBOS": -5,
+    "KDCA": -5,
+    "KDEN": -7,
+    "KDFW": -6,
+    "KHOU": -6,
+    "KLAS": -8,
+    "KLAX": -8,
+    "KMDW": -6,
+    "KMIA": -5,
+    "KMSP": -6,
+    "KOKC": -6,
+    "KPHL": -5,
+    "KPHX": -7,
+    "KSAT": -6,
+    "KSEA": -8,
+    "KSFO": -8,
+}
 LOGGER = logging.getLogger("kalshi_weather_trader")
 ORDER_EVENT_LOCK = threading.RLock()
 EVENT_DATE_RE = re.compile(r"-(\d{2}[A-Z]{3}\d{2})(?:-|$)")

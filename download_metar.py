@@ -6,33 +6,31 @@ import io
 from datetime import datetime
 
 AIRPORTS = {
-   ## "Atlanta": ("KATL", "GA_ASOS", "ATL"),
-   ##  "Austin": ("KAUS", "TX_ASOS", "AUS"),
-   ##  "Chicago": ("KORD", "IL_ASOS", "ORD"),
-   ##     "Dallas": ("KDAL", "TX_ASOS", "DAL"),
-   ## "Denver": ("KBKF", "CO_ASOS", "BKF"),
-   ##  "Houston": ("KHOU", "TX_ASOS", "HOU"),
-    ##  "Los Angeles": ("KLAX", "CA_ASOS", "LAX"),
-    ##   "Miami": ("KMIA", "FL_ASOS", "MIA"),
-    ##   "NYC": ("KLGA", "NY_ASOS", "LGA"),
-    ##  "San Francisco": ("KSFO", "CA_ASOS", "SFO"),
-   ##  "Seattle": ("KSEA", "WA_ASOS", "SEA"),
-    # Polymarket China highest-temperature resolution stations.
-    "Beijing": ("ZBAA", "CN__ASOS", "ZBAA"),
-    "Chengdu": ("ZUUU", "CN__ASOS", "ZUUU"),
-    "Chongqing": ("ZUCK", "CN__ASOS", "ZUCK"),
-    "Guangzhou": ("ZGGG", "CN__ASOS", "ZGGG"),
-    "Jinan": ("ZSJN", "CN__ASOS", "ZSJN"),
-    "Qingdao": ("ZSQD", "CN__ASOS", "ZSQD"),
+    "Tokyo": ("RJTT", "JP__ASOS", "RJTT"),
+    "Seoul": ("RKSI", "KR__ASOS", "RKSI"),
     "Shanghai": ("ZSPD", "CN__ASOS", "ZSPD"),
-    "Shenzhen": ("ZGSZ", "CN__ASOS", "ZGSZ"),
-    "Wuhan": ("ZHHH", "CN__ASOS", "ZHHH"),
-    "Zhengzhou": ("ZHCC", "CN__ASOS", "ZHCC"),
+    "Taipei": ("RCSS", "TW__ASOS", "RCSS"),
+    "Wellington": ("NZWN", "NZ__ASOS", "NZWN"),
+    "Madrid": ("LEMD", "ES__ASOS", "LEMD"),
+    "Paris": ("LFPB", "FR__ASOS", "LFPB"),
+    "Singapore": ("WSSS", "SG__ASOS", "WSSS"),
+    "London": ("EGLC", "GB__ASOS", "EGLC"),
+    "Ankara": ("LTAC", "TR__ASOS", "LTAC"),
+    "Busan": ("RKPK", "KR__ASOS", "RKPK"),
+    "Munich": ("EDDM", "DE__ASOS", "EDDM"),
+    "Kuala Lumpur": ("WMKK", "MY__ASOS", "WMKK"),
+    "Helsinki": ("EFHK", "FI__ASOS", "EFHK"),
+    "Milan": ("LIMC", "IT__ASOS", "LIMC"),
+    "Warsaw": ("EPWA", "PL__ASOS", "EPWA"),
+    "Lucknow": ("VILK", "IN__ASOS", "VILK"),
+    "Karachi": ("OPKC", "PK__ASOS", "OPKC"),
+    "Amsterdam": ("EHAM", "NL__ASOS", "EHAM"),
 }
 
 CURRENT_YEAR = datetime.now().year
 START_YEAR = CURRENT_YEAR - 49
-OVERWRITE_EXISTING = True
+OVERWRITE_EXISTING = False
+MAX_RETRIES = 5
 
 BASE_DIR = r"C:\weather\metar_history"
 
@@ -97,7 +95,22 @@ for city, (station, network, iem_station) in AIRPORTS.items():
         try:
             print(f"Downloading {station} {year}")
 
-            r = requests.get(url, timeout=120)
+            for attempt in range(1, MAX_RETRIES + 1):
+                r = requests.get(url, timeout=120)
+                if r.status_code != 429:
+                    break
+
+                retry_after = r.headers.get("Retry-After")
+                wait_seconds = (
+                    int(retry_after)
+                    if retry_after and retry_after.isdigit()
+                    else attempt * 5
+                )
+                print(
+                    f"Rate limited for {year}; "
+                    f"retry {attempt}/{MAX_RETRIES} in {wait_seconds}s"
+                )
+                time.sleep(wait_seconds)
 
             if r.status_code != 200:
                 print(f"Failed {year}: HTTP {r.status_code}")

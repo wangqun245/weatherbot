@@ -29,6 +29,17 @@ STATION_TIMEZONES = {
     "KORD": "America/Chicago",
     "KSEA": "America/Los_Angeles",
     "KSFO": "America/Los_Angeles",
+    "RJTT": "Asia/Tokyo",
+    "RKSI": "Asia/Seoul",
+    "ZSPD": "Asia/Shanghai",
+    "LEMD": "Europe/Madrid",
+    "WSSS": "Asia/Singapore",
+    "LTAC": "Europe/Istanbul",
+    "RKPK": "Asia/Seoul",
+    "EDDM": "Europe/Berlin",
+    "WMKK": "Asia/Kuala_Lumpur",
+    "EFHK": "Europe/Helsinki",
+    "EPWA": "Europe/Warsaw",
 }
 
 SHORT_TO_ICAO = {
@@ -59,6 +70,17 @@ STATION_IDS = {
     "KORD": 9,
     "KSEA": 10,
     "KSFO": 11,
+    "RJTT": 101,
+    "RKSI": 102,
+    "ZSPD": 103,
+    "LEMD": 104,
+    "WSSS": 105,
+    "LTAC": 106,
+    "RKPK": 107,
+    "EDDM": 108,
+    "WMKK": 109,
+    "EFHK": 110,
+    "EPWA": 111,
 }
 
 RMK_TEMP_RE = re.compile(r"(?:^|\s)T([01])(\d{3})([01])(\d{3})(?:\s|$)")
@@ -139,6 +161,11 @@ def parse_args() -> argparse.Namespace:
         help="Only output regular scheduled observation rows; use SPECI/COR rows as lookback context features.",
     )
     parser.add_argument("--overwrite", action="store_true")
+    parser.add_argument(
+        "--missing-as-nan",
+        action="store_true",
+        help="Write missing numeric feature values as NaN instead of empty CSV fields.",
+    )
     return parser.parse_args()
 
 
@@ -461,11 +488,16 @@ def observation_context_columns(context_hours: int) -> list[str]:
 def feature_columns(max_lag_hours: int, context_hours: int = 6) -> list[str]:
     lag_columns = [f"temp_f_lag_{hours}h" for hours in range(1, max_lag_hours + 1)]
     change_columns = [f"temp_f_change_{hours}h" for hours in range(1, max_lag_hours + 1)]
+    half_hour_change_columns = [
+        f"temp_f_change_{hours}_5h"
+        for hours in range(0, max_lag_hours)
+    ]
     return [
         *BASE_FEATURE_COLUMNS,
         *observation_context_columns(context_hours),
         *lag_columns,
         *change_columns,
+        *half_hour_change_columns,
     ]
 
 
@@ -530,22 +562,51 @@ def nearest_lag_value(
     return temp_values[best_idx] if best_idx is not None else None
 
 
-def regular_observation_minutes_by_year(rows: list[MetarRow]) -> dict[int, int]:
+def regular_observation_minutes_by_year(rows: list[MetarRow]) -> dict[int, tuple[int, ...]]:
     counts_by_year: dict[int, Counter] = {}
     for row in rows:
         counts_by_year.setdefault(row.valid_utc.year, Counter())[row.valid_utc.minute] += 1
-    return {
-        year: counts.most_common(1)[0][0]
-        for year, counts in counts_by_year.items()
-        if counts
-    }
+    result = {}
+    for year, counts in counts_by_year.items():
+        if not counts:
+            continue
+        primary = counts.most_common(1)[0][0]
+        opposite = (primary + 30) % 60
+        primary_count = sum(
+            count
+            for minute, count in counts.items()
+            if min(abs(minute - primary), 60 - abs(minute - primary)) <= 2
+        )
+        opposite_count = sum(
+            count
+            for minute, count in counts.items()
+            if min(abs(minute - opposite), 60 - abs(minute - opposite)) <= 2
+        )
+        minutes = [primary]
+        if opposite_count >= primary_count * 0.5:
+            minutes.append(opposite)
+        result[year] = tuple(sorted(minutes))
+    return result
 
 
-def is_extra_metar_report(row: MetarRow, regular_minutes_by_year: dict[int, int]) -> bool:
-    regular_minute = regular_minutes_by_year.get(row.valid_utc.year)
-    if regular_minute is None:
+def is_extra_metar_report(
+    row: MetarRow, regular_minutes_by_year: dict[int, tuple[int, ...]]
+) -> bool:
+    regular_minutes = regular_minutes_by_year.get(row.valid_utc.year)
+    if not regular_minutes:
         return True
-    return row.valid_utc.minute != regular_minute or " COR " in f" {row.metar} "
+    minute_delta = min(
+        min(
+            abs(row.valid_utc.minute - regular_minute),
+            60 - abs(row.valid_utc.minute - regular_minute),
+        )
+        for regular_minute in regular_minutes
+    )
+    return (
+        minute_delta > 2
+        or " COR " in f" {row.metar} "
+        or " SPECI " in f" {row.metar} "
+    )
 
 
 def daily_temperature_context_series(
@@ -699,6 +760,7 @@ def write_station_features(
     regular_inputs_only: bool,
     columns: list[str],
     fieldnames: list[str],
+    missing_as_nan: bool,
 ) -> Counter:
     rows = read_rows(input_file)
     station_icao = station_icao_from_path(input_file, rows)
@@ -712,6 +774,10 @@ def write_station_features(
         features["station_id"] = STATION_IDS[station_icao]
     valid_times = [row.valid_utc for row in rows]
     temp_values = [features.get("temp_f") for features in decoded]
+    non_speci_temp_values = [
+        None if " SPECI " in f" {row.metar} " else value
+        for row, value in zip(rows, temp_values)
+    ]
     previous_highs, previous_lows, current_mins = daily_temperature_context_series(rows, temp_values, tz)
     regular_minutes_by_year = regular_observation_minutes_by_year(rows)
     extra_flags = [is_extra_metar_report(row, regular_minutes_by_year) for row in rows]
@@ -745,6 +811,19 @@ def write_station_features(
                 features[f"temp_f_change_{hours}h"] = (
                     None if temp_f is None or lag_value is None else float(temp_f) - lag_value
                 )
+            for hours in range(max_lag_hours):
+                offset_hours = hours + 0.5
+                half_hour_value = nearest_lag_value(
+                    row.valid_utc - timedelta(hours=offset_hours),
+                    valid_times,
+                    non_speci_temp_values,
+                    timedelta(seconds=150),
+                )
+                features[f"temp_f_change_{hours}_5h"] = (
+                    None
+                    if temp_f is None or half_hour_value is None
+                    else float(temp_f) - half_hour_value
+                )
             add_observation_context_features(
                 features=features,
                 row=row,
@@ -762,13 +841,25 @@ def write_station_features(
                 "valid": row.valid_text,
                 "metar": row.metar,
             }
-            output_row.update({column: blank(features.get(column)) for column in columns})
+            output_row.update(
+                {
+                    column: (
+                        "NaN"
+                        if missing_as_nan and features.get(column) is None
+                        else blank(features.get(column))
+                    )
+                    for column in columns
+                }
+            )
             writer.writerow(output_row)
             combined_writer.writerow(output_row)
             stats["output_rows"] += 1
             for hours in range(1, max_lag_hours + 1):
                 if features.get(f"temp_f_lag_{hours}h") is None:
                     stats[f"missing_temp_lag_{hours}h"] += 1
+            for hours in range(max_lag_hours):
+                if features.get(f"temp_f_change_{hours}_5h") is None:
+                    stats[f"missing_temp_change_{hours}_5h"] += 1
             context_count_column = f"extra_metar_count_past_{context_hours}h"
             if features.get(context_count_column):
                 stats[f"rows_with_extra_metar_in_past_{context_hours}h"] += 1
@@ -779,8 +870,11 @@ def write_station_features(
 def input_feature_sources(input_dir: Path) -> list[Path]:
     return [
         path
-        for path in sorted(input_dir.glob("K*_local_*_daily_high.csv"))
-        if not path.name.endswith("_features.csv")
+        for path in sorted(input_dir.glob("*_local_*_daily_high.csv"))
+        if (
+            not path.name.endswith("_features.csv")
+            and not path.name.startswith("all_")
+        )
     ]
 
 
@@ -832,6 +926,7 @@ def main() -> int:
                 args.regular_inputs_only,
                 columns,
                 fieldnames,
+                args.missing_as_nan,
             )
             stats["output_file"] = str(output_file)
             summary[source.name] = dict(stats)
@@ -847,6 +942,7 @@ def main() -> int:
         "max_lag_hours": args.max_lag_hours,
         "context_hours": args.context_hours,
         "regular_inputs_only": int(args.regular_inputs_only),
+        "missing_as_nan": int(args.missing_as_nan),
         "combined_file": str(args.combined_file),
     }
     summary_file = output_dir / "feature_summary.json"

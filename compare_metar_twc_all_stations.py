@@ -20,7 +20,7 @@ CONFIG = ROOT / "polymarket_weather_config.json"
 DEFAULT_INPUT_DIR = Path(r"C:\weather\metar_history")
 DEFAULT_OUTPUT_DIR = ROOT / "outputs" / "metar_twc_comparison"
 
-STATION_TIMEZONES = {
+STATION_LOCATIONS = {
     "KATL": "America/New_York",
     "KAUS": "America/Chicago",
     "KBKF": "America/Denver",
@@ -32,10 +32,38 @@ STATION_TIMEZONES = {
     "KORD": "America/Chicago",
     "KSEA": "America/Los_Angeles",
     "KSFO": "America/Los_Angeles",
+    "RJTT": ("Asia/Tokyo", "JP"),
+    "RKSI": ("Asia/Seoul", "KR"),
+    "ZSPD": ("Asia/Shanghai", "CN"),
+    "RCSS": ("Asia/Taipei", "TW"),
+    "NZWN": ("Pacific/Auckland", "NZ"),
+    "LEMD": ("Europe/Madrid", "ES"),
+    "LFPB": ("Europe/Paris", "FR"),
+    "WSSS": ("Asia/Singapore", "SG"),
+    "EGLC": ("Europe/London", "GB"),
+    "LTAC": ("Europe/Istanbul", "TR"),
+    "RKPK": ("Asia/Seoul", "KR"),
+    "EDDM": ("Europe/Berlin", "DE"),
+    "WMKK": ("Asia/Kuala_Lumpur", "MY"),
+    "EFHK": ("Europe/Helsinki", "FI"),
+    "LIMC": ("Europe/Rome", "IT"),
+    "EPWA": ("Europe/Warsaw", "PL"),
+    "VILK": ("Asia/Kolkata", "IN"),
+    "OPKC": ("Asia/Karachi", "PK"),
+    "EHAM": ("Europe/Amsterdam", "NL"),
+}
+
+# Keep the original US entries backward compatible.
+STATION_LOCATIONS = {
+    station: (value, "US") if isinstance(value, str) else value
+    for station, value in STATION_LOCATIONS.items()
 }
 
 T_RE = re.compile(r"\bT(?P<t>[01]\d{3}|////)(?P<d>[01]\d{3}|////)\b")
 MAIN_TEMP_RE = re.compile(r"\b(?P<t>M?\d{2})/(?P<d>M?\d{2})\b")
+EMBEDDED_REPORT_RE = re.compile(
+    r"\s+(?:METAR|SPECI)\s+(?P<station>[A-Z]{4})\s+\d{6}Z\b"
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -63,7 +91,11 @@ def load_api_key() -> str:
     return api_key
 
 
-def parse_metar_temp_c(metar: str) -> float | None:
+def parse_metar_temp_c(metar: str, station: str | None = None) -> float | None:
+    for embedded in EMBEDDED_REPORT_RE.finditer(metar):
+        if station is None or embedded.group("station") != station:
+            metar = metar[:embedded.start()]
+            break
     match = T_RE.search(metar)
     if match and match.group("t") != "////":
         raw = match.group("t")
@@ -100,7 +132,9 @@ def metar_file_for_year(input_dir: Path, station: str, year: int) -> Path:
 
 def load_metar_points(input_dir: Path, station: str, start: date, end: date) -> dict[str, dict]:
     points: dict[str, dict] = {}
-    for year in range(start.year, end.year + 1):
+    utc_start = start - timedelta(days=1)
+    utc_end = end + timedelta(days=1)
+    for year in range(utc_start.year, utc_end.year + 1):
         path = metar_file_for_year(input_dir, station, year)
         if not path.exists():
             continue
@@ -115,9 +149,9 @@ def load_metar_points(input_dir: Path, station: str, start: date, end: date) -> 
                     dt = datetime.strptime(valid_text, "%Y-%m-%d %H:%M").replace(tzinfo=timezone.utc)
                 except ValueError:
                     continue
-                if dt.date() < start or dt.date() > end:
+                if dt.date() < utc_start or dt.date() > utc_end:
                     continue
-                temp_c = parse_metar_temp_c(metar)
+                temp_c = parse_metar_temp_c(metar, station)
                 if temp_c is None:
                     continue
                 points[dt.strftime("%Y-%m-%d %H:%M")] = {
@@ -141,23 +175,39 @@ def month_chunks(start: date, end: date) -> list[tuple[date, date]]:
     return chunks
 
 
-def fetch_json(url: str, params: dict) -> object:
+def fetch_json(url: str, params: dict, max_retries: int = 5) -> object:
     full_url = f"{url}?{urllib.parse.urlencode(params)}"
-    req = urllib.request.Request(
-        full_url,
-        headers={
-            "User-Agent": "Mozilla/5.0 metar-twc-compare",
-            "Accept": "application/json,*/*",
-        },
-    )
-    with urllib.request.urlopen(req, timeout=60) as response:
-        return json.loads(response.read().decode("utf-8"))
+    for attempt in range(1, max_retries + 1):
+        req = urllib.request.Request(
+            full_url,
+            headers={
+                "User-Agent": "Mozilla/5.0 metar-twc-compare",
+                "Accept": "application/json,*/*",
+            },
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=120) as response:
+                return json.loads(response.read().decode("utf-8"))
+        except Exception:
+            if attempt == max_retries:
+                raise
+            time.sleep(attempt * 3)
+    raise RuntimeError("unreachable")
 
 
-def load_twc_points(station: str, api_key: str, start: date, end: date, sleep: float) -> dict[str, dict]:
+def load_twc_points(
+    station: str,
+    country_code: str,
+    api_key: str,
+    start: date,
+    end: date,
+    sleep: float,
+) -> dict[str, dict]:
     points: dict[str, dict] = {}
-    base = f"https://api.weather.com/v1/location/{station}:9:US/observations/historical.json"
-    for chunk_start, chunk_end in month_chunks(start, end):
+    query_start = start - timedelta(days=1)
+    query_end = end + timedelta(days=1)
+    base = f"https://api.weather.com/v1/location/{station}:9:{country_code}/observations/historical.json"
+    for chunk_start, chunk_end in month_chunks(query_start, query_end):
         payload = fetch_json(
             base,
             {
@@ -171,7 +221,7 @@ def load_twc_points(station: str, api_key: str, start: date, end: date, sleep: f
             if row.get("temp") is None:
                 continue
             dt = parse_utc(row.get("valid_time_gmt") or row.get("expire_time_gmt") or row.get("obsTime"))
-            if dt is None or dt.date() < start or dt.date() > end:
+            if dt is None or dt.date() < query_start or dt.date() > query_end:
                 continue
             points[dt.strftime("%Y-%m-%d %H:%M")] = {
                 "utc": dt,
@@ -199,9 +249,20 @@ def local_daily(points: dict[str, dict], tz: ZoneInfo, temp_key: str) -> dict[st
 
 
 def compare_station(station: str, input_dir: Path, output_dir: Path, api_key: str, start: date, end: date, sleep: float) -> dict:
-    tz = ZoneInfo(STATION_TIMEZONES[station])
+    timezone_name, country_code = STATION_LOCATIONS[station]
+    tz = ZoneInfo(timezone_name)
     metar = load_metar_points(input_dir, station, start, end)
-    twc = load_twc_points(station, api_key, start, end, sleep)
+    twc = load_twc_points(station, country_code, api_key, start, end, sleep)
+    metar = {
+        ts: point
+        for ts, point in metar.items()
+        if start <= point["utc"].astimezone(tz).date() <= end
+    }
+    twc = {
+        ts: point
+        for ts, point in twc.items()
+        if start <= point["utc"].astimezone(tz).date() <= end
+    }
     common = sorted(set(metar) & set(twc))
     only_metar = sorted(set(metar) - set(twc))
     only_twc = sorted(set(twc) - set(metar))
@@ -332,7 +393,7 @@ def main() -> int:
     requested = {station.upper() for station in (args.stations or [])}
     stations = [
         station
-        for station in sorted(STATION_TIMEZONES)
+        for station in sorted(STATION_LOCATIONS)
         if (not requested or station in requested) and (args.input_dir / station).exists()
     ]
     if requested and not stations:

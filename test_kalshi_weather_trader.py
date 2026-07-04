@@ -854,24 +854,24 @@ def test_websocket_idle_timeout_sends_ping_without_reconnect(monkeypatch) -> Non
 def test_production_strategy_parameters_match_requested_policy() -> None:
     config = json.loads(Path("kalshi_weather_config.json").read_text(encoding="utf-8"))
     assert config["model"]["buy_start_hour"] == 12
-    assert config["model"]["buy_end_hour"] == 16
+    assert config["model"]["buy_end_hour"] == 18
     assert config["model"]["station_buy_hours"] == {
-        "KATL": [14, 17],
-        "KAUS": [14, 17],
+        "KATL": [13, 16],
+        "KAUS": [13, 17],
         "KBOS": [14, 17],
-        "KDCA": [14, 17],
-        "KDFW": [14, 18],
-        "KLAS": [13, 16],
-        "KLAX": [11, 15],
-        "KMDW": [14, 16],
+        "KDCA": [13, 16],
+        "KDFW": [12, 15],
+        "KLAS": [13, 15],
+        "KLAX": [10, 13],
+        "KMDW": [12, 17],
         "KMIA": [12, 16],
-        "KMSP": [14, 16],
-        "KOKC": [14, 17],
+        "KMSP": [13, 17],
+        "KOKC": [12, 16],
         "KPHL": [14, 17],
         "KPHX": [14, 17],
-        "KSAT": [14, 17],
-        "KSEA": [13, 16],
-        "KSFO": [14, 17],
+        "KSAT": [13, 17],
+        "KSEA": [14, 17],
+        "KSFO": [12, 15],
     }
     assert (
         config["kalshi"]["websocket_url"]
@@ -893,12 +893,13 @@ def test_production_strategy_parameters_match_requested_policy() -> None:
     assert set(config["trading"]["live_stations"]) == {
         "KATL",
         "KAUS",
-        "KBOS",
+        "KDCA",
         "KDFW",
         "KLAS",
         "KLAX",
         "KMDW",
         "KMIA",
+        "KSFO",
         "KOKC",
         "KPHL",
         "KPHX",
@@ -925,7 +926,7 @@ def test_station_buy_hours_use_station_overrides_and_default() -> None:
         assert trader.station_buy_hours(item) == tuple(hours)
 
     config["observations"]["station"] = "KNYC"
-    assert trader.station_buy_hours(config) == (12, 16)
+    assert trader.station_buy_hours(config) == (12, 18)
 
 
 def test_city_configs_enable_only_selected_model_stations_live() -> None:
@@ -945,7 +946,7 @@ def test_city_configs_enable_only_selected_model_stations_live() -> None:
         for item in city_configs
         if item["trading"]["dry_run"]
     }
-    assert paper == {"KDCA", "KDEN", "KHOU", "KMSP", "KSFO"}
+    assert paper == {"KBOS", "KDEN", "KHOU", "KMSP"}
 
 
 def test_disabled_station_cannot_trade_even_when_live_listed() -> None:

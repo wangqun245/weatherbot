@@ -56,6 +56,35 @@ class ClobPricingTest(unittest.TestCase):
             bot.model_awc_live_stations(config),
         )
 
+    def test_production_model_awc_sizing_and_station_hours(self):
+        config = bot.load_config("polymarket_weather_config.json")
+        expected_hours = {
+            "KATL": (14, 17),
+            "KAUS": (13, 17),
+            "KHOU": (14, 17),
+            "KORD": (13, 16),
+            "KDAL": (14, 17),
+            "KBKF": (15, 17),
+            "KLGA": (14, 17),
+            "KLAX": (11, 15),
+            "KSEA": (15, 17),
+            "KSFO": (13, 16),
+            "KMIA": (11, 16),
+        }
+
+        self.assertEqual(20.0, float(config["trading"]["buy_notional_usdc"]))
+        self.assertEqual(
+            20.0,
+            float(config["trading"]["model_awc_adjacent_yes_shares"]),
+        )
+        self.assertEqual(
+            expected_hours,
+            {
+                station: bot.model_awc_station_buy_hours(config, station)
+                for station in expected_hours
+            },
+        )
+
     def test_model_awc_prediction_cannot_be_below_observed_high(self):
         model = SimpleNamespace(
             feature_name_=["temp_f"],

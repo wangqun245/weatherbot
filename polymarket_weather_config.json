@@ -61,7 +61,7 @@
     "trading":  {
                     "strategy_name":  "model_awc_high",
                     "strategy_mode":  "model_awc_high",
-                    "buy_notional_usdc":  10,
+                    "buy_notional_usdc":  20,
                     "fee_rate":  0.05,
                     "fee_enabled":  true,
                     "deterministic_min_yes_price":  0.01,
@@ -125,16 +125,16 @@
                     ,"model_awc_buy_end_hour": 17
                     ,"model_awc_station_buy_hours": {
                         "KATL": [14, 17],
-                        "KAUS": [14, 17],
+                        "KAUS": [13, 17],
                         "KHOU": [14, 17],
-                        "KORD": [14, 17],
-                        "KDAL": [15, 17],
+                        "KORD": [13, 16],
+                        "KDAL": [14, 17],
                         "KBKF": [15, 17],
                         "KLGA": [14, 17],
-                        "KLAX": [12, 16],
-                        "KSEA": [14, 17],
+                        "KLAX": [11, 15],
+                        "KSEA": [15, 17],
                         "KSFO": [13, 16],
-                        "KMIA": [12, 16]
+                        "KMIA": [11, 16]
                     }
                     ,"model_awc_metar_lookback_hours": 48
                     ,"model_awc_observation_minute": 53
@@ -165,7 +165,7 @@
                     ,"model_awc_awc_max_attempts": 3
                     ,"model_awc_awc_retry_interval_seconds": 3
                     ,"model_awc_adjacent_yes_max_total_price": 0.9
-                    ,"model_awc_adjacent_yes_shares": 10
+                    ,"model_awc_adjacent_yes_shares": 20
                     ,"model_awc_order_management_window_minutes": 40
                     ,"model_awc_interval_snap_tolerance_f": 0.15
                 },
@@ -243,7 +243,7 @@
                            "trading":  {
                                            "strategy_name":  "model_awc_high",
                                            "strategy_mode":  "model_awc_high",
-                                           "buy_notional_usdc":  10,
+                                           "buy_notional_usdc":  20,
                                            "fee_rate":  0.05,
                                            "fee_enabled":  true,
                                            "deterministic_min_yes_price":  0.01,
@@ -304,17 +304,17 @@
                                            ,"model_awc_buy_start_hour": 12
                                            ,"model_awc_buy_end_hour": 17
                                            ,"model_awc_station_buy_hours": {
-                "KATL": [14, 17],
-                        "KAUS": [14, 17],
+                                        "KATL": [14, 17],
+                        "KAUS": [13, 17],
                         "KHOU": [14, 17],
-                        "KORD": [14, 17],
-                        "KDAL": [15, 17],
+                        "KORD": [13, 16],
+                        "KDAL": [14, 17],
                         "KBKF": [15, 17],
                         "KLGA": [14, 17],
-                        "KLAX": [12, 16],
-                        "KSEA": [14, 17],
+                        "KLAX": [11, 15],
+                        "KSEA": [15, 17],
                         "KSFO": [13, 16],
-                        "KMIA": [12, 16]
+                        "KMIA": [11, 16]
                                            }
                                            ,"model_awc_metar_lookback_hours": 48
                                            ,"model_awc_observation_minute": 53
@@ -345,7 +345,7 @@
                                            ,"model_awc_awc_max_attempts": 3
                                            ,"model_awc_awc_retry_interval_seconds": 3
                                            ,"model_awc_adjacent_yes_max_total_price": 0.9
-                                           ,"model_awc_adjacent_yes_shares": 10
+                                           ,"model_awc_adjacent_yes_shares": 20
                                            ,"model_awc_order_management_window_minutes": 40
                                            ,"model_awc_interval_snap_tolerance_f": 0.15
                                        }

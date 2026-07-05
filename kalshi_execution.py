@@ -319,7 +319,7 @@ class KalshiHourlyExecutionManager:
         cost_budget = float(
             batch.target_notional_dollars
             if batch.target_notional_dollars > 0
-            else self.trading.get("max_order_cost_dollars", 5.0)
+            else self.trading.get("max_order_cost_dollars", 10.0)
         )
         budget_remaining = max(0.0, cost_budget - batch.total_cost[0])
         if budget_remaining < minimum:
@@ -423,7 +423,7 @@ class KalshiHourlyExecutionManager:
             for leg in batch.legs
         ]
         cost_budget = float(
-            self.trading.get("max_order_cost_dollars", 5.0)
+            self.trading.get("max_order_cost_dollars", 10.0)
         )
         remaining_budgets = [
             max(0.0, cost_budget - batch.total_cost[index])

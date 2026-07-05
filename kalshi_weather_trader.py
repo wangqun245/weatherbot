@@ -931,7 +931,7 @@ def contract_count_for_order(price: float, trading: dict[str, Any]) -> int:
     if price <= 0:
         return 0
     requested = max(1, int(trading.get("default_contracts", 10)))
-    max_cost = max(0.01, float(trading.get("max_order_cost_dollars", 5.0)))
+    max_cost = max(0.01, float(trading.get("max_order_cost_dollars", 10.0)))
     min_cost = max(
         0.0,
         float(trading.get("min_order_cost_dollars", 1.0)),

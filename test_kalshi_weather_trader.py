@@ -505,7 +505,7 @@ def test_adjacent_total_equal_point_90_does_not_buy() -> None:
     assert client.batches == []
 
 
-def test_adjacent_pair_reduces_equal_size_to_keep_repair_under_five_dollars() -> None:
+def test_adjacent_pair_buys_full_ten_shares_under_ten_dollar_budget() -> None:
     client = _FakeClient()
     feed = _FakeFeed({"LEFT": [(0.30, 10)], "RIGHT": [(0.50, 10)]})
     manager = _manager(client, feed)
@@ -523,8 +523,8 @@ def test_adjacent_pair_reduces_equal_size_to_keep_repair_under_five_dollars() ->
     )
     manager._manage_adjacent(batch)
     assert [body["count"] for body in client.batches[0]] == [
-        "9.00",
-        "9.00",
+        "10.00",
+        "10.00",
     ]
 
 
@@ -886,8 +886,8 @@ def test_production_strategy_parameters_match_requested_policy() -> None:
     assert config["trading"]["max_buy_price"] == 0.85
     assert config["trading"]["interval_snap_tolerance_f"] == 0.15
     assert config["trading"]["adjacent_yes_max_total_price"] == 0.90
-    assert config["trading"]["default_contracts"] == 5
-    assert config["trading"]["max_order_cost_dollars"] == 5.00
+    assert config["trading"]["default_contracts"] == 10
+    assert config["trading"]["max_order_cost_dollars"] == 10.00
     assert config["trading"]["min_order_cost_dollars"] == 1.00
     assert config["trading"]["disabled_stations"] == ["KMSY"]
     assert set(config["trading"]["live_stations"]) == {

@@ -317,20 +317,30 @@ class KalshiHourlyExecutionManager:
         confidence_floor = float(
             self.trading.get("model_min_yes_price", 0.16)
         )
+        no_confidence_floor = float(
+            self.trading.get("model_min_no_price", confidence_floor)
+        )
         leg = batch.legs[0]
+        side = leg.outcome_side.upper()
+        side_floor = (
+            confidence_floor if side == "YES" else no_confidence_floor
+        )
         levels = self.feed.buy_levels(leg.ticker, leg.outcome_side)
         active = self._active_order_for_leg(batch, 0)
-        if leg.outcome_side.upper() == "YES":
+        if side in {"YES", "NO"}:
             if active is not None:
                 self._cancel_order(
                     batch,
                     active.order_id,
-                    "yes_confidence_floor_requires_live_offer",
+                    "confidence_floor_requires_live_offer",
                 )
             if not levels:
                 return
-            if float(levels[0][0]) < confidence_floor:
-                self.close_batch(batch, "yes_below_model_confidence_floor")
+            if float(levels[0][0]) < side_floor:
+                self.close_batch(
+                    batch,
+                    f"{side.lower()}_below_model_confidence_floor",
+                )
                 return
         elif active is not None:
             return
@@ -365,11 +375,11 @@ class KalshiHourlyExecutionManager:
                 batch.next_action_ts = time.time() + 0.5
                 return
             available -= 1
-        # A resting YES bid at the maximum could later execute against a price
-        # below the confidence floor, so YES batches only act on live offers.
-        if leg.outcome_side.upper() == "YES":
+        # A resting bid at the maximum could later execute against a price
+        # below the model-confidence floor, so gated batches only act on
+        # live offers.
+        if side in {"YES", "NO"}:
             return
-        # NO legs are not model-confidence-gated and may rest at the maximum.
         resting_quantity = min(
             remaining,
             int(math.floor((budget_remaining + 1e-9) / maximum)),
@@ -387,18 +397,26 @@ class KalshiHourlyExecutionManager:
         confidence_floor = float(
             self.trading.get("model_min_yes_price", 0.16)
         )
+        no_confidence_floor = float(
+            self.trading.get("model_min_no_price", confidence_floor)
+        )
         live_levels = [
             self.feed.buy_levels(leg.ticker, leg.outcome_side)
             for leg in batch.legs
         ]
         for leg, levels in zip(batch.legs, live_levels):
+            side = leg.outcome_side.upper()
+            floor = (
+                confidence_floor if side == "YES" else no_confidence_floor
+            )
             if (
-                leg.outcome_side.upper() == "YES"
+                side in {"YES", "NO"}
                 and levels
-                and float(levels[0][0]) < confidence_floor
+                and float(levels[0][0]) < floor
             ):
                 self.close_batch(
-                    batch, "adjacent_yes_below_model_confidence_floor"
+                    batch,
+                    f"adjacent_{side.lower()}_below_model_confidence_floor",
                 )
                 return
         left, right = batch.acquired

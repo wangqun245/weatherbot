@@ -173,6 +173,21 @@ def test_exact_interval_yes_below_model_floor_skips_all_orders() -> None:
     assert "below_model_min_yes_price_0.1600" in reason
 
 
+def test_exact_interval_no_below_model_floor_is_not_selected() -> None:
+    config = _config()
+    config["trading"]["model_min_yes_price"] = 0.16
+    config["trading"]["model_min_no_price"] = 0.16
+    markets = _markets()
+    markets[2]["no_ask_dollars"] = "0.15"
+
+    orders, reason = select_order_plan(config, markets, 94.4)
+
+    assert [(order["market"]["ticker"], order["side"]) for order in orders] == [
+        ("MID", "YES")
+    ]
+    assert reason.startswith("exact_interval_MID_selected_YES_MID")
+
+
 def test_adjacent_one_yes_below_floor_treats_other_as_single() -> None:
     config = _config()
     config["trading"]["model_min_yes_price"] = 0.16
@@ -216,6 +231,22 @@ def test_adjacent_both_yes_below_floor_skips_all_orders() -> None:
 
     assert orders == []
     assert reason == "adjacent_both_yes_below_model_min_yes_price_0.1600"
+
+
+def test_adjacent_non_target_no_below_floor_is_not_selected() -> None:
+    config = _config()
+    config["trading"]["model_min_yes_price"] = 0.16
+    config["trading"]["model_min_no_price"] = 0.16
+    markets = _markets()
+    markets[1]["yes_ask_dollars"] = "0.46"
+    markets[2]["yes_ask_dollars"] = "0.46"
+    markets[0]["no_ask_dollars"] = "0.15"
+    markets[3]["no_ask_dollars"] = "0.00"
+
+    orders, reason = select_order_plan(config, markets, 95.5)
+
+    assert orders == []
+    assert reason.startswith("adjacent_yes_total_0.9200_without_no_alternative")
 
 
 class _FeatureModel:
@@ -693,6 +724,32 @@ def test_single_yes_manager_closes_below_model_confidence_floor() -> None:
     assert client.singles == []
 
 
+def test_single_no_manager_closes_below_model_confidence_floor() -> None:
+    client = _FakeClient()
+    feed = _FakeFeed({"SINGLE": [(0.15, 200)]})
+    manager = _manager(client, feed)
+    manager.trading["model_min_yes_price"] = 0.16
+    manager.trading["model_min_no_price"] = 0.16
+    batch = HourlyBatch(
+        batch_id="b",
+        window_key="2026-06-28:hour_12",
+        mode="single",
+        legs=(ManagedLeg("SINGLE", "NO"),),
+        target_shares=10,
+        target_notional_dollars=10.0,
+        predicted_high_f=90,
+        created_ts=time.time(),
+        expires_ts=time.time() + 2400,
+        acquired=[0],
+        total_cost=[0],
+    )
+
+    manager._manage_single(batch)
+
+    assert batch.closed
+    assert client.singles == []
+
+
 def test_adjacent_manager_closes_when_either_yes_falls_below_floor() -> None:
     client = _FakeClient()
     feed = _FakeFeed({"LEFT": [(0.15, 10)], "RIGHT": [(0.45, 10)]})
@@ -717,7 +774,7 @@ def test_adjacent_manager_closes_when_either_yes_falls_below_floor() -> None:
     assert client.batches == []
 
 
-def test_run_cycle_single_interval_buys_partial_before_kalshi_manager(monkeypatch, tmp_path) -> None:
+def test_run_cycle_single_interval_ioc_partial_fill_passes_remainder_to_manager(monkeypatch, tmp_path) -> None:
     target_day = date(2026, 6, 29)
     config = {
         "kalshi": {
@@ -783,8 +840,8 @@ def test_run_cycle_single_interval_buys_partial_before_kalshi_manager(monkeypatc
             )
             return {
                 "order_id": "ioc-1",
-                "fill_count": str(count),
-                "remaining_count": "0.00",
+                "fill_count": "13",
+                "remaining_count": str(max(0, count - 13)),
                 "average_fill_price": price,
             }
 
@@ -839,16 +896,16 @@ def test_run_cycle_single_interval_buys_partial_before_kalshi_manager(monkeypatc
     assert client.orders[0]["price"] == 0.08
     assert len(manager.started) == 1
     assert manager.started[0]["mode"] == "single"
-    assert manager.started[0]["target_notional_dollars"] == 6.0
+    assert manager.started[0]["target_notional_dollars"] == 8.96
     messages = [call.args[0] for call in notifier.send.call_args_list]
     assert any(message.startswith("*Kalshi LIVE BUY FILLED*") for message in messages)
-    assert any("Contracts: 50" in message for message in messages)
+    assert any("Contracts: 13" in message for message in messages)
     events = [
         json.loads(line)
         for line in (tmp_path / "order_events.jsonl").read_text().splitlines()
     ]
     assert events[0]["source"] == "single_interval_immediate_ioc"
-    assert events[0]["filled"] == 50
+    assert events[0]["filled"] == 13
 
 
 def test_websocket_unified_yes_scale_builds_yes_and_no_asks() -> None:

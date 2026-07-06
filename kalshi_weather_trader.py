@@ -814,6 +814,10 @@ def select_order_plan(
     """Mirror the prior Polymarket interval/YES/NO selection policy."""
     trading = config["trading"]
     min_yes_price = float(trading.get("model_min_yes_price", 0.16))
+    min_no_price = float(trading.get("model_min_no_price", min_yes_price))
+
+    def model_min_price(side: str) -> float:
+        return min_yes_price if side.upper() == "YES" else min_no_price
 
     def single_interval_plan(
         predicted_market: dict[str, Any],
@@ -833,7 +837,8 @@ def select_order_plan(
                 else "NO"
             )
             price = outcome_ask(market, side)
-            if price > 0:
+            floor = model_min_price(side)
+            if price > 0 and price >= floor:
                 candidates.append(
                     {"market": market, "side": side, "price": price}
                 )
@@ -917,6 +922,7 @@ def select_order_plan(
     ]
     no_candidates = [
         candidate for candidate in no_candidates if float(candidate["price"]) > 0
+        and float(candidate["price"]) >= min_no_price
     ]
     cheapest_no = (
         min(
@@ -1346,17 +1352,20 @@ def run_cycle(
             model_min_yes_price = float(
                 trading.get("model_min_yes_price", 0.16)
             )
-            if (
-                side == "YES"
-                and levels
-                and float(levels[0][0]) < model_min_yes_price
-            ):
+            model_min_no_price = float(
+                trading.get("model_min_no_price", model_min_yes_price)
+            )
+            model_min_side_price = (
+                model_min_yes_price if side == "YES" else model_min_no_price
+            )
+            if levels and float(levels[0][0]) < model_min_side_price:
                 LOGGER.info(
-                    "Skip Kalshi single interval: live YES price below model "
-                    "confidence floor ticker=%s price=%.4f min_yes_price=%.4f",
+                    "Skip Kalshi single interval: live %s price below model "
+                    "confidence floor ticker=%s price=%.4f min_price=%.4f",
+                    side,
                     market["ticker"],
                     float(levels[0][0]),
-                    model_min_yes_price,
+                    model_min_side_price,
                 )
                 return
             partial = partial_contract_plan_for_notional(

@@ -2493,6 +2493,28 @@ def configured_model_awc_min_yes_price(config: dict[str, Any]) -> float:
     return value
 
 
+def configured_model_awc_min_no_price(config: dict[str, Any]) -> float:
+    """Return the model confidence floor for a model-implied NO buy price."""
+    fallback = configured_model_awc_min_yes_price(config)
+    raw = config.get("trading", {}).get("model_awc_min_no_price", fallback)
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return fallback
+    if value < 0 or value >= 1:
+        return fallback
+    return value
+
+
+def configured_model_awc_min_side_price(config: dict[str, Any], side: str) -> float:
+    """Return the model confidence floor for the selected buy side."""
+    return (
+        configured_model_awc_min_no_price(config)
+        if side.strip().upper() == "NO"
+        else configured_model_awc_min_yes_price(config)
+    )
+
+
 def model_awc_load_model(config: dict[str, Any]) -> Any:
     """Load and cache the latest trained LightGBM model."""
     global MODEL_AWC_MODEL, MODEL_AWC_MODEL_PATH
@@ -2925,6 +2947,9 @@ def model_awc_market_candidate(
     price = best_buy_price(config, market, side)
     if price is None or price <= 0:
         return None
+    min_side_price = configured_model_awc_min_side_price(config, side)
+    if float(price) < min_side_price:
+        return None
     return {"market": market, "side": side, "price": float(price)}
 
 
@@ -3041,6 +3066,9 @@ def model_awc_best_non_adjacent_no_candidate(
             continue
         price = best_buy_price(config, market, "NO")
         if price is None or price <= 0:
+            continue
+        min_no_price = configured_model_awc_min_no_price(config)
+        if float(price) < min_no_price:
             continue
         candidates.append({"market": market, "side": "NO", "price": round(float(price), 2)})
     if not candidates:
@@ -4880,23 +4908,32 @@ class LiveTradingManager:
             if remaining_notional < 0.01:
                 self._close_hourly_batch(batch, "target_filled")
                 return
-            if token in batch.open_order_ids:
-                return
             max_price = configured_max_buy_price(self.config)
-            min_yes_price = configured_model_awc_min_yes_price(self.config)
+            side = batch.sides[0].upper()
+            min_side_price = configured_model_awc_min_side_price(
+                self.config, side
+            )
             offer = self._live_offer(token)
-            if (
-                batch.sides[0].upper() == "YES"
-                and offer is not None
-                and offer[0] < min_yes_price
-            ):
-                self._close_hourly_batch(batch, "yes_below_confidence_floor")
+            if side in {"YES", "NO"}:
+                if token in batch.open_order_ids:
+                    self._cancel_batch_order(
+                        batch,
+                        token,
+                        reason="confidence_floor_requires_live_offer",
+                    )
+                    return
+                if offer is not None and offer[0] < min_side_price:
+                    self._close_hourly_batch(
+                        batch, f"{side.lower()}_below_confidence_floor"
+                    )
+                    return
+            elif token in batch.open_order_ids:
                 return
             if offer is not None and offer[0] <= max_price:
                 price = float(offer[0])
                 shares = min(float(offer[1]), remaining_notional / price)
                 reason = f"{batch.reason}_single_websocket_offer"
-            elif batch.sides[0].upper() == "YES":
+            elif side in {"YES", "NO"}:
                 return
             else:
                 price = max_price
@@ -4917,14 +4954,42 @@ class LiveTradingManager:
             self._close_hourly_batch(batch, "target_filled")
             return
         if token in batch.open_order_ids:
+            self._cancel_batch_order(
+                batch, token, reason="confidence_floor_requires_live_offer"
+            )
             return
-        # A 0.85 GTC bid both rests when the YES ask is too high and
-        # immediately matches any websocket-visible seller at 0.85 or below.
+        side = batch.sides[0].upper()
+        max_price = configured_max_buy_price(self.config)
+        min_side_price = configured_model_awc_min_side_price(self.config, side)
+        offer = self._live_offer(token)
+        if side in {"YES", "NO"}:
+            if offer is None:
+                return
+            if offer[0] < min_side_price:
+                self._close_hourly_batch(
+                    batch, f"{side.lower()}_below_confidence_floor"
+                )
+                return
+            if offer[0] > max_price:
+                return
+            shares = min(float(remaining), float(offer[1]))
+            if shares < 1:
+                return
+            self._submit_batch_order(
+                batch,
+                0,
+                shares,
+                float(offer[0]),
+                f"{batch.reason}_single_websocket_offer",
+            )
+            batch.next_action_ts = time.time() + 2.0
+            return
+        # Non-model-gated sides may rest at the configured maximum.
         self._submit_batch_order(
             batch,
             0,
             remaining,
-            configured_max_buy_price(self.config),
+            max_price,
             f"{batch.reason}_single_limit_085",
         )
         batch.next_action_ts = time.time() + 2.0
@@ -4955,6 +5020,9 @@ class LiveTradingManager:
             if deficit < 1 or poorer in batch.open_order_ids:
                 return
             other_price = batch.average_prices.get(richer, 0.0)
+            batch_sides = tuple(
+                getattr(batch, "sides", ("YES",) * len(batch.token_ids))
+            )
             repair_price = round(
                 max(
                     0.01,
@@ -4965,12 +5033,29 @@ class LiveTradingManager:
                 ),
                 2,
             )
+            poorer_offer = self._live_offer(poorer)
+            min_poorer_price = configured_model_awc_min_side_price(
+                self.config,
+                batch_sides[batch.token_ids.index(poorer)],
+            )
+            if poorer_offer is None:
+                return
+            if poorer_offer[0] < min_poorer_price:
+                self._close_hourly_batch(
+                    batch, "adjacent_repair_below_confidence_floor"
+                )
+                return
+            if poorer_offer[0] > repair_price:
+                return
+            deficit = min(deficit, int(float(poorer_offer[1])))
+            if deficit < 1:
+                return
             batch.repair_token_id = poorer
             self._submit_batch_order(
                 batch,
                 batch.token_ids.index(poorer),
                 deficit,
-                repair_price,
+                float(poorer_offer[0]),
                 f"{batch.reason}_balance_repair",
             )
             batch.next_action_ts = time.time() + 2.0
@@ -5001,6 +5086,18 @@ class LiveTradingManager:
         left_offer, right_offer = offers
         assert left_offer is not None and right_offer is not None
         max_price = configured_max_buy_price(self.config)
+        batch_sides = tuple(
+            getattr(batch, "sides", ("YES",) * len(batch.token_ids))
+        )
+        min_prices = [
+            configured_model_awc_min_side_price(self.config, side)
+            for side in batch_sides
+        ]
+        if left_offer[0] < min_prices[0] or right_offer[0] < min_prices[1]:
+            self._close_hourly_batch(
+                batch, "adjacent_below_confidence_floor"
+            )
+            return
         max_total = float(
             self.config["trading"].get(
                 "model_awc_adjacent_yes_max_total_price", 0.9

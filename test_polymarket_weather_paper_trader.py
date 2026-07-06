@@ -602,6 +602,45 @@ class ModelAwcLiveSingleIntervalTest(unittest.TestCase):
         )
         manager._submit_batch_order.assert_not_called()
 
+    def test_live_single_manager_closes_when_no_falls_below_confidence_floor(self):
+        self.config["trading"]["model_awc_min_yes_price"] = 0.16
+        self.config["trading"]["model_awc_min_no_price"] = 0.16
+        manager = bot.LiveTradingManager(self.config)
+        manager.market_feed = SimpleNamespace(
+            get_price=lambda token: SimpleNamespace(best_ask=0.15, ask_size=200.0)
+        )
+        manager._close_hourly_batch = mock.Mock()
+        manager._submit_batch_order = mock.Mock()
+        batch = bot.ModelAwcHourlyBatch(
+            batch_id="Austin:KAUS:2026-06-29:hour_13:single",
+            city="Austin",
+            station="KAUS",
+            event_date="2026-06-29",
+            local_hour=13,
+            mode="single",
+            markets=(self.market,),
+            sides=("NO",),
+            token_ids=("no-token",),
+            target_shares=10.0,
+            target_notional_usd=0.0,
+            predicted_high_f=98.51,
+            cycle_id="cycle-1",
+            reason="model_awc_managed_single_hour_13",
+            baseline_balances={"no-token": 0.0},
+            acquired_shares={"no-token": 0.0},
+            acquired_cost_usd={"no-token": 0.0},
+            average_prices={"no-token": 0.0},
+            open_order_ids={},
+            expires_ts=bot.time.time() + 60,
+        )
+
+        manager._manage_single_hourly_batch(batch)
+
+        manager._close_hourly_batch.assert_called_once_with(
+            batch, "no_below_confidence_floor"
+        )
+        manager._submit_batch_order.assert_not_called()
+
     def test_managed_balance_does_not_regress_confirmed_websocket_fills(self):
         manager = bot.LiveTradingManager(self.config)
         manager.executor = SimpleNamespace(
@@ -621,6 +660,11 @@ class ModelAwcLiveSingleIntervalTest(unittest.TestCase):
             (leg_index, shares, price, reason)
         )
         manager._cancel_batch_order = lambda *_args, **_kwargs: None
+        manager.market_feed = SimpleNamespace(
+            get_price=lambda token: SimpleNamespace(best_ask=0.19, ask_size=20.0)
+            if token == "right"
+            else None
+        )
         batch = SimpleNamespace(
             batch_id="Chicago:KORD:2026-06-30:hour_12:adjacent",
             token_ids=("left", "right"),
@@ -810,6 +854,21 @@ class ModelAwcLiveAdjacentSelectionTest(unittest.TestCase):
         self.assertEqual(("NO",), args[5])
         self.assertEqual(10.0, args[6])
         self.assertEqual("single", args[8])
+
+    def test_live_adjacent_skips_non_adjacent_no_below_floor(self):
+        self.config["trading"]["model_awc_min_yes_price"] = 0.16
+        self.config["trading"]["model_awc_min_no_price"] = 0.16
+        prices = {
+            ("market-88-89", "YES"): 0.46,
+            ("market-90-91", "YES"): 0.46,
+            ("market-86-87", "NO"): 0.15,
+        }
+
+        manager, result = self._run(prices)
+
+        self.assertIsNone(result)
+        self.assertEqual([], manager.batches)
+        self.assertEqual([], manager.submissions)
 
     def test_live_adjacent_chooses_two_yes_legs_when_combination_is_cheaper(self):
         prices = {

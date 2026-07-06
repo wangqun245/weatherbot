@@ -813,36 +813,18 @@ def select_order_plan(
 ) -> tuple[list[dict[str, Any]], str]:
     """Mirror the prior Polymarket interval/YES/NO selection policy."""
     trading = config["trading"]
-    matches = prediction_matches(markets, prediction_f)
-    if len(matches) == 1:
-        predicted_market = matches[0]
-        candidates = []
-        for market in markets:
-            side = "YES" if market["ticker"] == predicted_market["ticker"] else "NO"
-            price = outcome_ask(market, side)
-            if price > 0:
-                candidates.append({"market": market, "side": side, "price": price})
-        if not candidates:
-            return [], "exact_no_priced_candidates"
-        selected = min(
-            candidates,
-            key=lambda item: (
-                float(item["price"]),
-                str(item["market"]["ticker"]),
-                str(item["side"]),
-            ),
-        )
-        gross_profit = 1.0 - float(selected["price"])
-        return [selected], (
-            f"exact_interval_{predicted_market['ticker']}_selected_"
-            f"{selected['side']}_{selected['market']['ticker']}_"
-            f"gross_profit_{gross_profit:.4f}"
-        )
+    min_yes_price = float(trading.get("model_min_yes_price", 0.16))
 
-    tolerance = float(trading.get("interval_snap_tolerance_f", 0.15))
-    snapped = boundary_snap_market(markets, prediction_f, tolerance)
-    if snapped is not None:
-        predicted_market, distance = snapped
+    def single_interval_plan(
+        predicted_market: dict[str, Any],
+        reason_prefix: str,
+    ) -> tuple[list[dict[str, Any]], str]:
+        predicted_yes_price = outcome_ask(predicted_market, "YES")
+        if 0 < predicted_yes_price < min_yes_price:
+            return [], (
+                f"{reason_prefix}_yes_{predicted_yes_price:.4f}_below_"
+                f"model_min_yes_price_{min_yes_price:.4f}"
+            )
         candidates = []
         for market in markets:
             side = (
@@ -856,7 +838,7 @@ def select_order_plan(
                     {"market": market, "side": side, "price": price}
                 )
         if not candidates:
-            return [], "boundary_snap_no_priced_candidates"
+            return [], f"{reason_prefix}_no_priced_candidates"
         selected = min(
             candidates,
             key=lambda item: (
@@ -865,10 +847,28 @@ def select_order_plan(
                 str(item["side"]),
             ),
         )
+        gross_profit = 1.0 - float(selected["price"])
         return [selected], (
+            f"{reason_prefix}_selected_{selected['side']}_"
+            f"{selected['market']['ticker']}_gross_profit_{gross_profit:.4f}"
+        )
+
+    matches = prediction_matches(markets, prediction_f)
+    if len(matches) == 1:
+        predicted_market = matches[0]
+        return single_interval_plan(
+            predicted_market,
+            f"exact_interval_{predicted_market['ticker']}",
+        )
+
+    tolerance = float(trading.get("interval_snap_tolerance_f", 0.15))
+    snapped = boundary_snap_market(markets, prediction_f, tolerance)
+    if snapped is not None:
+        predicted_market, distance = snapped
+        return single_interval_plan(
+            predicted_market,
             f"boundary_snap_interval_{predicted_market['ticker']}_distance_"
-            f"{distance:.4f}F_tolerance_{tolerance:.4f}F_selected_"
-            f"{selected['side']}_{selected['market']['ticker']}"
+            f"{distance:.4f}F_tolerance_{tolerance:.4f}F",
         )
 
     adjacent = adjacent_prediction_markets(markets, prediction_f)
@@ -880,6 +880,29 @@ def select_order_plan(
     ]
     if any(float(order["price"]) <= 0 for order in adjacent_orders):
         return [], "adjacent_missing_yes_price"
+    below_floor = [
+        order
+        for order in adjacent_orders
+        if float(order["price"]) < min_yes_price
+    ]
+    if len(below_floor) == 2:
+        return [], (
+            f"adjacent_both_yes_below_model_min_yes_price_"
+            f"{min_yes_price:.4f}"
+        )
+    if len(below_floor) == 1:
+        rejected = below_floor[0]
+        remaining_market = next(
+            order["market"]
+            for order in adjacent_orders
+            if order["market"]["ticker"] != rejected["market"]["ticker"]
+        )
+        return single_interval_plan(
+            remaining_market,
+            f"adjacent_reject_{rejected['market']['ticker']}_yes_"
+            f"{float(rejected['price']):.4f}_below_{min_yes_price:.4f}_"
+            f"single_interval_{remaining_market['ticker']}",
+        )
     total_yes_price = sum(float(order["price"]) for order in adjacent_orders)
 
     adjacent_tickers = {market["ticker"] for market in adjacent}
@@ -1320,6 +1343,22 @@ def run_cycle(
             side = str(planned["side"]).upper()
             target_notional = float(trading.get("max_order_cost_dollars", 10.0))
             levels = list(market.get(f"_{side.lower()}_buy_levels") or [])
+            model_min_yes_price = float(
+                trading.get("model_min_yes_price", 0.16)
+            )
+            if (
+                side == "YES"
+                and levels
+                and float(levels[0][0]) < model_min_yes_price
+            ):
+                LOGGER.info(
+                    "Skip Kalshi single interval: live YES price below model "
+                    "confidence floor ticker=%s price=%.4f min_yes_price=%.4f",
+                    market["ticker"],
+                    float(levels[0][0]),
+                    model_min_yes_price,
+                )
+                return
             partial = partial_contract_plan_for_notional(
                 levels, target_notional, trading
             )

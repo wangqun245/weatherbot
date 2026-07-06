@@ -109,6 +109,7 @@
     "min_order_cost_dollars": 1.00,
     "min_buy_price": 0.01,
     "max_buy_price": 0.85,
+    "model_min_yes_price": 0.16,
     "interval_snap_tolerance_f": 0.15,
     "adjacent_yes_max_total_price": 0.90,
     "order_management_window_minutes": 40,

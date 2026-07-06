@@ -161,6 +161,63 @@ def test_prediction_in_middle_gap_buys_adjacent_yes_pair_when_cheaper() -> None:
     assert reason.startswith("adjacent_yes_pair")
 
 
+def test_exact_interval_yes_below_model_floor_skips_all_orders() -> None:
+    config = _config()
+    config["trading"]["model_min_yes_price"] = 0.16
+    markets = _markets()
+    markets[1]["yes_ask_dollars"] = "0.15"
+
+    orders, reason = select_order_plan(config, markets, 94.4)
+
+    assert orders == []
+    assert "below_model_min_yes_price_0.1600" in reason
+
+
+def test_adjacent_one_yes_below_floor_treats_other_as_single() -> None:
+    config = _config()
+    config["trading"]["model_min_yes_price"] = 0.16
+    markets = _markets()
+    markets[1]["yes_ask_dollars"] = "0.15"
+    markets[2]["yes_ask_dollars"] = "0.35"
+    markets[0]["no_ask_dollars"] = "0.80"
+    markets[3]["no_ask_dollars"] = "0.90"
+
+    orders, reason = select_order_plan(config, markets, 95.5)
+
+    assert [(order["market"]["ticker"], order["side"]) for order in orders] == [
+        ("HIGH", "YES")
+    ]
+    assert reason.startswith("adjacent_reject_MID")
+
+
+def test_adjacent_one_yes_below_floor_can_select_other_market_no() -> None:
+    config = _config()
+    config["trading"]["model_min_yes_price"] = 0.16
+    markets = _markets()
+    markets[1]["yes_ask_dollars"] = "0.15"
+    markets[2]["yes_ask_dollars"] = "0.35"
+    markets[0]["no_ask_dollars"] = "0.20"
+
+    orders, _reason = select_order_plan(config, markets, 95.5)
+
+    assert [(order["market"]["ticker"], order["side"]) for order in orders] == [
+        ("LOW", "NO")
+    ]
+
+
+def test_adjacent_both_yes_below_floor_skips_all_orders() -> None:
+    config = _config()
+    config["trading"]["model_min_yes_price"] = 0.16
+    markets = _markets()
+    markets[1]["yes_ask_dollars"] = "0.15"
+    markets[2]["yes_ask_dollars"] = "0.12"
+
+    orders, reason = select_order_plan(config, markets, 95.5)
+
+    assert orders == []
+    assert reason == "adjacent_both_yes_below_model_min_yes_price_0.1600"
+
+
 class _FeatureModel:
     feature_name_ = [
         "temp_f_lag_1h",
@@ -454,6 +511,7 @@ def _manager(client, feed):
         trading={
             "max_buy_price": 0.85,
             "min_buy_price": 0.01,
+            "model_min_yes_price": 0.01,
             "adjacent_yes_max_total_price": 0.90,
             "order_management_window_minutes": 40,
         },
@@ -530,7 +588,7 @@ def test_adjacent_pair_buys_full_ten_shares_under_ten_dollar_budget() -> None:
 
 def test_adjacent_single_leg_fill_places_balance_repair() -> None:
     client = _FakeClient()
-    feed = _FakeFeed({"LEFT": [], "RIGHT": []})
+    feed = _FakeFeed({"LEFT": [], "RIGHT": [(0.55, 5)]})
     manager = _manager(client, feed)
     batch = HourlyBatch(
         batch_id="b",
@@ -550,8 +608,8 @@ def test_adjacent_single_leg_fill_places_balance_repair() -> None:
     assert repair["ticker"] == "RIGHT"
     assert repair["count"] == 5
     assert repair["price"] == 0.55
-    assert repair["time_in_force"] == "good_till_canceled"
-    assert repair["expiration_time"] == math.ceil(batch.expires_ts)
+    assert repair["time_in_force"] == "immediate_or_cancel"
+    assert repair["expiration_time"] is None
 
 
 def test_manager_does_not_submit_gtc_order_at_expiration_boundary() -> None:
@@ -610,6 +668,55 @@ def test_single_manager_uses_remaining_notional_not_fixed_shares() -> None:
     assert order["time_in_force"] == "immediate_or_cancel"
 
 
+def test_single_yes_manager_closes_below_model_confidence_floor() -> None:
+    client = _FakeClient()
+    feed = _FakeFeed({"SINGLE": [(0.15, 200)]})
+    manager = _manager(client, feed)
+    manager.trading["model_min_yes_price"] = 0.16
+    batch = HourlyBatch(
+        batch_id="b",
+        window_key="2026-06-28:hour_12",
+        mode="single",
+        legs=(ManagedLeg("SINGLE", "YES"),),
+        target_shares=10,
+        target_notional_dollars=10.0,
+        predicted_high_f=90,
+        created_ts=time.time(),
+        expires_ts=time.time() + 2400,
+        acquired=[0],
+        total_cost=[0],
+    )
+
+    manager._manage_single(batch)
+
+    assert batch.closed
+    assert client.singles == []
+
+
+def test_adjacent_manager_closes_when_either_yes_falls_below_floor() -> None:
+    client = _FakeClient()
+    feed = _FakeFeed({"LEFT": [(0.15, 10)], "RIGHT": [(0.45, 10)]})
+    manager = _manager(client, feed)
+    manager.trading["model_min_yes_price"] = 0.16
+    batch = HourlyBatch(
+        batch_id="b",
+        window_key="2026-06-28:hour_12",
+        mode="adjacent",
+        legs=(ManagedLeg("LEFT", "YES"), ManagedLeg("RIGHT", "YES")),
+        target_shares=10,
+        predicted_high_f=90,
+        created_ts=time.time(),
+        expires_ts=time.time() + 2400,
+        acquired=[0, 0],
+        total_cost=[0, 0],
+    )
+
+    manager._manage_adjacent(batch)
+
+    assert batch.closed
+    assert client.batches == []
+
+
 def test_run_cycle_single_interval_buys_partial_before_kalshi_manager(monkeypatch, tmp_path) -> None:
     target_day = date(2026, 6, 29)
     config = {
@@ -633,6 +740,7 @@ def test_run_cycle_single_interval_buys_partial_before_kalshi_manager(monkeypatc
             "max_order_cost_dollars": 10.0,
             "min_buy_price": 0.01,
             "max_buy_price": 0.85,
+            "model_min_yes_price": 0.01,
             "interval_snap_tolerance_f": 0.15,
             "adjacent_yes_max_total_price": 0.90,
             "time_in_force": "immediate_or_cancel",

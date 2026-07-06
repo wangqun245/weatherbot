@@ -267,6 +267,8 @@ class LivePendingOrder:
     created_ts: float
     balance_before: float = 0.0
     token_balance_before: Optional[float] = None
+    confirmed_shares: float = 0.0
+    confirmed_cost_usd: float = 0.0
 
 
 @dataclass
@@ -3148,48 +3150,6 @@ def process_model_awc_prediction(
         if not live_trader:
             return None
         target_notional = float(config["trading"].get("buy_notional_usdc", 10.0))
-        partial = partial_buy_fillable_now(config, market, side, target_notional)
-        partial_trade = None
-        remaining_notional = target_notional
-        if (
-            partial is not None
-            and side.upper() == "YES"
-            and float(partial["price"]) < configured_model_awc_min_yes_price(config)
-        ):
-            LOGGER.info(
-                "model awc skip immediate partial yes below confidence floor "
-                "market=%s price=%.4f min_yes_price=%.4f",
-                market.market_id,
-                float(partial["price"]),
-                configured_model_awc_min_yes_price(config),
-            )
-            partial = None
-        if partial is not None:
-            partial_trade = submit_model_awc_trade(
-                market,
-                side,
-                float(partial["price"]),
-                f"model_awc_high_single_partial_before_manager_{market.market_id}_{reason}_local_hour_{local_hour:02d}",
-                amount_usd=float(partial["amount_usd"]),
-                shares=float(partial["shares"]),
-            )
-            remaining_notional = max(
-                0.0,
-                target_notional - float(partial["amount_usd"]),
-            )
-            LOGGER.info(
-                "model awc single interval bought immediate partial before "
-                "manager market=%s price=%.4f shares=%s amount_usd=%.2f "
-                "remaining_notional_usd=%.2f reason=%s",
-                market.market_id,
-                float(partial["price"]),
-                float(partial["shares"]),
-                float(partial["amount_usd"]),
-                remaining_notional,
-                reason,
-            )
-        if remaining_notional < 0.01:
-            return partial_trade
         batch_id = live_trader.start_model_awc_hourly_batch(
             city,
             station,
@@ -3200,7 +3160,7 @@ def process_model_awc_prediction(
             0.0,
             predicted_high_f,
             "single",
-            target_notional_usd=remaining_notional,
+            target_notional_usd=target_notional,
             local_minute=local_minute,
         )
         LOGGER.info(
@@ -3208,10 +3168,10 @@ def process_model_awc_prediction(
             "batch=%s market=%s target_notional_usd=%.2f reason=%s",
             batch_id,
             market.market_id,
-            remaining_notional,
+            target_notional,
             reason,
         )
-        return partial_trade
+        return None
 
     def process_single_interval(
         predicted_market: TemperatureMarket,
@@ -3274,6 +3234,10 @@ def process_model_awc_prediction(
         if price > configured_max_buy_price(config):
             return start_single_notional_manager(
                 market, side, "current_price_above_configured_max"
+            )
+        if live_trader:
+            return start_single_notional_manager(
+                market, side, "single_interval_managed"
             )
         return submit_model_awc_trade(market, side, price, reason)
 
@@ -3348,6 +3312,10 @@ def process_model_awc_prediction(
             event_unit,
             price,
         )
+        if live_trader:
+            return start_single_notional_manager(
+                snap_market, "YES", "boundary_snap_managed"
+            )
         return submit_model_awc_trade(snap_market, "YES", price, reason)
 
     matched_prediction_markets = model_awc_prediction_matches(markets, predicted_high_f, event_unit)
@@ -4659,7 +4627,6 @@ class LiveTradingManager:
         with self._lock:
             self._hourly_batches[batch_id] = batch
         self._refresh_hourly_market_subscriptions()
-        self._market_wakeup.set()
         LOGGER.info(
             "model awc hourly batch started batch=%s mode=%s tokens=%s "
             "target_shares=%s target_notional_usd=%s predicted_high_f=%r window_minutes=%s",
@@ -4673,6 +4640,8 @@ class LiveTradingManager:
                 "model_awc_order_management_window_minutes", 40
             ),
         )
+        self._manage_hourly_batch(batch)
+        self._market_wakeup.set()
         return batch_id
 
     def _on_market_message(
@@ -4770,7 +4739,8 @@ class LiveTradingManager:
                 self._apply_order_result(
                     pending, result, source="managed_pre_cancel"
                 )
-                pending = None
+                with self._lock:
+                    pending = self._pending.get(order_id)
         cancelled = self.executor.cancel_order(order_id)
         with self._lock:
             self._managed_order_ids.discard(order_id)
@@ -4800,11 +4770,19 @@ class LiveTradingManager:
             for token_id, order_id in list(batch.open_order_ids.items()):
                 if order_id != pending.order_id:
                     continue
+                delta_shares = max(0.0, shares - pending.confirmed_shares)
+                delta_amount = max(0.0, amount - pending.confirmed_cost_usd)
                 batch.acquired_shares[token_id] = (
-                    batch.acquired_shares.get(token_id, 0.0) + shares
+                    batch.acquired_shares.get(token_id, 0.0) + delta_shares
                 )
                 batch.acquired_cost_usd[token_id] = (
-                    batch.acquired_cost_usd.get(token_id, 0.0) + amount
+                    batch.acquired_cost_usd.get(token_id, 0.0) + delta_amount
+                )
+                pending.confirmed_shares = max(
+                    pending.confirmed_shares, shares
+                )
+                pending.confirmed_cost_usd = max(
+                    pending.confirmed_cost_usd, amount
                 )
                 if status == "FILLED" or shares_remaining < 1:
                     batch.open_order_ids.pop(token_id, None)
@@ -4814,8 +4792,8 @@ class LiveTradingManager:
                     "model awc managed fill batch=%s token=%s shares=%s amount_usd=%.4f acquired_cost_usd=%.4f target_notional_usd=%.4f",
                     batch.batch_id,
                     token_id[:16],
-                    shares,
-                    amount,
+                    delta_shares,
+                    delta_amount,
                     batch.acquired_cost_usd.get(token_id, 0.0),
                     batch.target_notional_usd,
                 )
@@ -4924,6 +4902,11 @@ class LiveTradingManager:
                 price = max_price
                 shares = remaining_notional / price
                 reason = f"{batch.reason}_single_limit_085"
+            if shares < 1:
+                self._close_hourly_batch(
+                    batch, "target_unfillable_notional_remainder"
+                )
+                return
             self._submit_batch_order(batch, 0, shares, price, reason)
             batch.next_action_ts = time.time() + 2.0
             return
@@ -5194,6 +5177,8 @@ class LiveTradingManager:
             shares, price = match
             if shares <= 0:
                 continue
+            if event_type == "trade" or str(msg.get("type") or "").upper() == "MATCHED":
+                shares += pending.confirmed_shares
             result = {
                 "success": True,
                 "order_id": pending.order_id,
@@ -5296,6 +5281,11 @@ class LiveTradingManager:
         Returns:
             None: This function is executed for its side effects.
         """
+        status = str(_result_value(result, "status", "FILLED") or "FILLED").upper()
+        shares_remaining = float(
+            _result_value(result, "shares_remaining", 0.0) or 0.0
+        )
+        partial = status == "PARTIAL" and shares_remaining >= 1
         if pending.kind == "BUY":
             self._record_managed_buy_fill(pending, result)
         trades = read_trades(self.config["outputs"]["trades_csv"])
@@ -5317,9 +5307,16 @@ class LiveTradingManager:
         write_csv(self.config["outputs"]["trades_csv"], trades)
         write_csv(self.config["outputs"]["settled_trades_csv"], trades)
         write_performance_reports(self.config, trades)
-        with self._lock:
-            self._pending.pop(pending.order_id, None)
-        notify_trade(self.config, trade, pending.kind, "FILLED", source=source)
+        if not partial:
+            with self._lock:
+                self._pending.pop(pending.order_id, None)
+        notify_trade(
+            self.config,
+            trade,
+            pending.kind,
+            "PARTIAL" if partial else "FILLED",
+            source=source,
+        )
 
     def _apply_buy_result_to_trade(self, trade: PaperTrade, result: Any, pending: bool) -> None:
         """Copy live buy order result fields onto a trade row.
@@ -5402,7 +5399,13 @@ class LiveTradingManager:
             trade.live_order_status = "CANCELLED" if cancelled else "CANCEL_FAILED"
             trade.live_order_error = reason
             if pending.kind == "BUY":
-                trade.status = "BUY_CANCELLED" if cancelled else "BUY_CANCEL_FAILED"
+                if safe_float(trade.shares, 0.0) > 0:
+                    trade.status = "OPEN"
+                    trade.error = (
+                        f"partial live buy; remaining order cancelled: {reason}"
+                    )
+                else:
+                    trade.status = "BUY_CANCELLED" if cancelled else "BUY_CANCEL_FAILED"
             else:
                 trade.status = "OPEN"
             break

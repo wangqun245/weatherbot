@@ -281,18 +281,17 @@ class ModelAwcLiveSingleIntervalTest(unittest.TestCase):
 
         return fake_live_trader, trade
 
-    def test_live_single_interval_buys_configured_notional_directly(self):
+    def test_live_single_interval_delegates_full_notional_to_manager(self):
         fake_live_trader, trade = self._run_with_fake_live_trader(98.51)
 
-        self.assertIsNotNone(trade)
-        self.assertEqual([], fake_live_trader.batches)
-        self.assertEqual(1, len(fake_live_trader.submissions))
-        submission = fake_live_trader.submissions[0]
-        self.assertEqual("market-98-99", submission["market_id"])
-        self.assertEqual("YES", submission["side"])
-        self.assertEqual(0.08, submission["price"])
-        self.assertIsNone(submission["amount_usd"])
-        self.assertIsNone(submission["shares"])
+        self.assertIsNone(trade)
+        self.assertEqual([], fake_live_trader.submissions)
+        self.assertEqual(1, len(fake_live_trader.batches))
+        args, kwargs = fake_live_trader.batches[0]
+        self.assertEqual((self.market,), args[4])
+        self.assertEqual(("YES",), args[5])
+        self.assertEqual("single", args[8])
+        self.assertEqual(10.0, kwargs["target_notional_usd"])
 
     def test_live_single_interval_below_confidence_floor_skips_all_trading(self):
         self.config["trading"]["model_awc_min_yes_price"] = 0.16
@@ -305,18 +304,17 @@ class ModelAwcLiveSingleIntervalTest(unittest.TestCase):
         self.assertEqual([], fake_live_trader.submissions)
         self.assertEqual([], fake_live_trader.batches)
 
-    def test_live_boundary_snap_single_interval_buys_notional_directly(self):
+    def test_live_boundary_snap_delegates_full_notional_to_manager(self):
         fake_live_trader, trade = self._run_with_fake_live_trader(97.98)
 
-        self.assertIsNotNone(trade)
-        self.assertEqual([], fake_live_trader.batches)
-        self.assertEqual(1, len(fake_live_trader.submissions))
-        submission = fake_live_trader.submissions[0]
-        self.assertEqual("market-98-99", submission["market_id"])
-        self.assertEqual("YES", submission["side"])
-        self.assertIsNone(submission["amount_usd"])
-        self.assertIsNone(submission["shares"])
-        self.assertIn("boundary_snap_yes_market-98-99", submission["reason"])
+        self.assertIsNone(trade)
+        self.assertEqual([], fake_live_trader.submissions)
+        self.assertEqual(1, len(fake_live_trader.batches))
+        args, kwargs = fake_live_trader.batches[0]
+        self.assertEqual((self.market,), args[4])
+        self.assertEqual(("YES",), args[5])
+        self.assertEqual("single", args[8])
+        self.assertEqual(10.0, kwargs["target_notional_usd"])
 
     def test_live_single_interval_insufficient_depth_starts_notional_manager(self):
         fake_live_trader, trade = self._run_with_fake_live_trader(98.51, best_price=None)
@@ -356,24 +354,18 @@ class ModelAwcLiveSingleIntervalTest(unittest.TestCase):
         self.assertEqual(("YES",), args[5])
         self.assertEqual(10.0, kwargs["target_notional_usd"])
 
-    def test_live_single_interval_buys_partial_before_notional_manager(self):
+    def test_live_single_interval_manager_owns_full_target_even_with_rest_depth(self):
         fake_live_trader, trade = self._run_with_fake_live_trader(
             98.51,
             best_price=None,
             partial_now={"price": 0.08, "shares": 50.0, "amount_usd": 4.0},
         )
 
-        self.assertIsNotNone(trade)
-        self.assertEqual(1, len(fake_live_trader.submissions))
-        submission = fake_live_trader.submissions[0]
-        self.assertEqual("market-98-99", submission["market_id"])
-        self.assertEqual("YES", submission["side"])
-        self.assertEqual(0.08, submission["price"])
-        self.assertEqual(4.0, submission["amount_usd"])
-        self.assertEqual(50.0, submission["shares"])
+        self.assertIsNone(trade)
+        self.assertEqual([], fake_live_trader.submissions)
         self.assertEqual(1, len(fake_live_trader.batches))
         _args, kwargs = fake_live_trader.batches[0]
-        self.assertEqual(6.0, kwargs["target_notional_usd"])
+        self.assertEqual(10.0, kwargs["target_notional_usd"])
 
     def test_live_single_manager_buys_websocket_offer_by_notional(self):
         manager = bot.LiveTradingManager(self.config)
@@ -440,6 +432,136 @@ class ModelAwcLiveSingleIntervalTest(unittest.TestCase):
         self.assertEqual(10.0, submissions[0]["amount_usd"])
         self.assertEqual(125.0, submissions[0]["shares"])
         self.assertFalse(submissions[0]["notify_submitted"])
+        self.assertEqual({"yes-token": "order-1"}, batch.open_order_ids)
+
+    def test_live_single_manager_continues_after_partial_fill(self):
+        manager = bot.LiveTradingManager(self.config)
+        offers = iter([
+            SimpleNamespace(best_ask=0.48, ask_size=13.0),
+            SimpleNamespace(best_ask=0.49, ask_size=100.0),
+        ])
+        manager.market_feed = SimpleNamespace(
+            get_price=lambda _token: next(offers)
+        )
+        submissions = []
+
+        def submit_buy_trade(
+            _config,
+            _cycle_id,
+            _market,
+            _wu_source,
+            _station,
+            _side,
+            entry_price,
+            _observed_high,
+            _observed_low,
+            _reason,
+            amount_usd=None,
+            shares=None,
+            notify_submitted=True,
+        ):
+            order_id = f"order-{len(submissions) + 1}"
+            submissions.append((entry_price, amount_usd, shares))
+            return SimpleNamespace(live_buy_order_id=order_id)
+
+        manager.submit_buy_trade = submit_buy_trade
+        batch = bot.ModelAwcHourlyBatch(
+            batch_id="Miami:KMIA:2026-07-06:hour_12:single",
+            city="Miami",
+            station="KMIA",
+            event_date="2026-07-06",
+            local_hour=12,
+            mode="single",
+            markets=(self.market,),
+            sides=("YES",),
+            token_ids=("yes-token",),
+            target_shares=0.0,
+            target_notional_usd=20.0,
+            predicted_high_f=89.96,
+            cycle_id="cycle-1",
+            reason="model_awc_managed_single_hour_12",
+            baseline_balances={"yes-token": 0.0},
+            acquired_shares={"yes-token": 0.0},
+            acquired_cost_usd={"yes-token": 0.0},
+            average_prices={"yes-token": 0.0},
+            open_order_ids={},
+            expires_ts=bot.time.time() + 60,
+        )
+
+        with mock.patch.object(bot, "read_trades", return_value=[]), \
+            mock.patch.object(bot, "write_csv"), \
+            mock.patch.object(bot, "write_performance_reports"):
+            manager._manage_single_hourly_batch(batch)
+            batch.open_order_ids.clear()
+            batch.acquired_shares["yes-token"] = 13.0
+            batch.acquired_cost_usd["yes-token"] = 6.24
+            batch.next_action_ts = 0.0
+            manager._manage_single_hourly_batch(batch)
+
+        self.assertEqual(2, len(submissions))
+        self.assertEqual((0.48, 6.24, 13.0), submissions[0])
+        self.assertEqual(0.49, submissions[1][0])
+        self.assertEqual(13.72, submissions[1][1])
+        self.assertEqual(28.0, submissions[1][2])
+
+    def test_managed_partial_fill_accounting_uses_cumulative_delta(self):
+        manager = bot.LiveTradingManager(self.config)
+        pending = bot.LivePendingOrder(
+            kind="BUY",
+            trade_id="trade-1",
+            order_id="order-1",
+            token_id="yes-token",
+            condition_id="condition-1",
+            price=0.49,
+            shares=40.0,
+            created_ts=bot.time.time(),
+        )
+        batch = bot.ModelAwcHourlyBatch(
+            batch_id="Miami:KMIA:2026-07-06:hour_12:single",
+            city="Miami",
+            station="KMIA",
+            event_date="2026-07-06",
+            local_hour=12,
+            mode="single",
+            markets=(self.market,),
+            sides=("YES",),
+            token_ids=("yes-token",),
+            target_shares=0.0,
+            target_notional_usd=20.0,
+            predicted_high_f=89.96,
+            cycle_id="cycle-1",
+            reason="model_awc_managed_single_hour_12",
+            baseline_balances={"yes-token": 0.0},
+            acquired_shares={"yes-token": 0.0},
+            acquired_cost_usd={"yes-token": 0.0},
+            average_prices={"yes-token": 0.0},
+            open_order_ids={"yes-token": "order-1"},
+            expires_ts=bot.time.time() + 60,
+        )
+        manager._hourly_batches[batch.batch_id] = batch
+        manager._managed_order_ids.add("order-1")
+
+        manager._record_managed_buy_fill(
+            pending,
+            {
+                "shares": 13.0,
+                "amount_usd": 6.24,
+                "status": "PARTIAL",
+                "shares_remaining": 27.0,
+            },
+        )
+        manager._record_managed_buy_fill(
+            pending,
+            {
+                "shares": 20.0,
+                "amount_usd": 9.80,
+                "status": "PARTIAL",
+                "shares_remaining": 20.0,
+            },
+        )
+
+        self.assertEqual(20.0, batch.acquired_shares["yes-token"])
+        self.assertAlmostEqual(9.80, batch.acquired_cost_usd["yes-token"])
         self.assertEqual({"yes-token": "order-1"}, batch.open_order_ids)
 
     def test_live_single_manager_closes_when_yes_falls_below_confidence_floor(self):
@@ -718,12 +840,14 @@ class ModelAwcLiveAdjacentSelectionTest(unittest.TestCase):
 
         manager, result = self._run(prices)
 
-        self.assertIsNotNone(result)
-        self.assertEqual([], manager.batches)
-        self.assertEqual(1, len(manager.submissions))
-        self.assertEqual("market-90-91", manager.submissions[0]["market_id"])
-        self.assertEqual("YES", manager.submissions[0]["side"])
-        self.assertEqual(0.35, manager.submissions[0]["price"])
+        self.assertIsNone(result)
+        self.assertEqual([], manager.submissions)
+        self.assertEqual(1, len(manager.batches))
+        args, kwargs = manager.batches[0]
+        self.assertEqual(("market-90-91",), tuple(m.market_id for m in args[4]))
+        self.assertEqual(("YES",), args[5])
+        self.assertEqual("single", args[8])
+        self.assertEqual(10.0, kwargs["target_notional_usd"])
 
     def test_live_adjacent_one_yes_below_floor_can_choose_cheaper_other_no(self):
         self.config["trading"]["model_awc_min_yes_price"] = 0.16
@@ -735,12 +859,14 @@ class ModelAwcLiveAdjacentSelectionTest(unittest.TestCase):
 
         manager, result = self._run(prices)
 
-        self.assertIsNotNone(result)
-        self.assertEqual([], manager.batches)
-        self.assertEqual(1, len(manager.submissions))
-        self.assertEqual("market-86-87", manager.submissions[0]["market_id"])
-        self.assertEqual("NO", manager.submissions[0]["side"])
-        self.assertEqual(0.20, manager.submissions[0]["price"])
+        self.assertIsNone(result)
+        self.assertEqual([], manager.submissions)
+        self.assertEqual(1, len(manager.batches))
+        args, kwargs = manager.batches[0]
+        self.assertEqual(("market-86-87",), tuple(m.market_id for m in args[4]))
+        self.assertEqual(("NO",), args[5])
+        self.assertEqual("single", args[8])
+        self.assertEqual(10.0, kwargs["target_notional_usd"])
 
     def test_live_adjacent_both_yes_below_floor_skips_all_trading(self):
         self.config["trading"]["model_awc_min_yes_price"] = 0.16

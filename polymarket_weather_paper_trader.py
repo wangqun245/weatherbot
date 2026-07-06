@@ -369,6 +369,7 @@ def default_config() -> dict[str, Any]:
         "live_order_timeout_seconds": 20,
         "live_order_check_seconds": 5,
         "max_buy_price": 0.85,
+        "model_awc_min_yes_price": 0.16,
         "source_station_check_enabled": True,
         "source_station_check_hour_ct": 3,
         "source_station_check_timezone": "America/Chicago",
@@ -2478,6 +2479,18 @@ def configured_max_buy_price(config: dict[str, Any]) -> float:
     return value
 
 
+def configured_model_awc_min_yes_price(config: dict[str, Any]) -> float:
+    """Return the model confidence floor for a predicted interval's YES price."""
+    raw = config.get("trading", {}).get("model_awc_min_yes_price", 0.16)
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return 0.16
+    if value < 0 or value >= 1:
+        return 0.16
+    return value
+
+
 def model_awc_load_model(config: dict[str, Any]) -> Any:
     """Load and cache the latest trained LightGBM model."""
     global MODEL_AWC_MODEL, MODEL_AWC_MODEL_PATH
@@ -3138,6 +3151,19 @@ def process_model_awc_prediction(
         partial = partial_buy_fillable_now(config, market, side, target_notional)
         partial_trade = None
         remaining_notional = target_notional
+        if (
+            partial is not None
+            and side.upper() == "YES"
+            and float(partial["price"]) < configured_model_awc_min_yes_price(config)
+        ):
+            LOGGER.info(
+                "model awc skip immediate partial yes below confidence floor "
+                "market=%s price=%.4f min_yes_price=%.4f",
+                market.market_id,
+                float(partial["price"]),
+                configured_model_awc_min_yes_price(config),
+            )
+            partial = None
         if partial is not None:
             partial_trade = submit_model_awc_trade(
                 market,
@@ -3187,23 +3213,60 @@ def process_model_awc_prediction(
         )
         return partial_trade
 
-    predicted_yes_market = model_awc_predicted_yes_market(markets, predicted_high_f, event_unit)
-    if predicted_yes_market is not None:
-        if duplicate_window:
-            LOGGER.info("model awc skip duplicate city=%s station=%s event_date=%s local_hour=%s", city, station, event_date, local_hour)
+    def process_single_interval(
+        predicted_market: TemperatureMarket,
+        reason: str,
+    ) -> Optional[PaperTrade]:
+        yes_price = best_buy_price(config, predicted_market, "YES")
+        min_yes_price = configured_model_awc_min_yes_price(config)
+        if yes_price is not None and 0 < float(yes_price) < min_yes_price:
+            LOGGER.info(
+                "model awc skip single interval yes below confidence floor "
+                "city=%s station=%s event_date=%s local_hour=%s "
+                "predicted_high_f=%r market=%s yes_price=%.4f min_yes_price=%.4f",
+                city,
+                station,
+                event_date,
+                local_hour,
+                predicted_high_f,
+                predicted_market.market_id,
+                float(yes_price),
+                min_yes_price,
+            )
             return None
+
         candidates = []
         for market in markets:
-            candidate = model_awc_market_candidate(config, market, predicted_high_f, event_unit, predicted_yes_market.market_id)
+            candidate = model_awc_market_candidate(
+                config,
+                market,
+                predicted_high_f,
+                event_unit,
+                predicted_market.market_id,
+            )
             if candidate:
                 candidates.append(candidate)
         if not candidates:
             partial_trade = start_single_notional_manager(
-                predicted_yes_market, "YES", "insufficient_current_depth"
+                predicted_market, "YES", "insufficient_current_depth"
             )
-            LOGGER.info("model awc skip no priced candidates city=%s station=%s predicted_high_f=%r", city, station, predicted_high_f)
+            LOGGER.info(
+                "model awc skip no priced single candidates city=%s station=%s "
+                "predicted_high_f=%r market=%s",
+                city,
+                station,
+                predicted_high_f,
+                predicted_market.market_id,
+            )
             return partial_trade
-        candidates.sort(key=lambda item: (float(item["price"]), str(item["market"].market_id), str(item["side"])))
+
+        candidates.sort(
+            key=lambda item: (
+                float(item["price"]),
+                str(item["market"].market_id),
+                str(item["side"]),
+            )
+        )
         selected = candidates[0]
         market = selected["market"]
         side = str(selected["side"])
@@ -3212,8 +3275,15 @@ def process_model_awc_prediction(
             return start_single_notional_manager(
                 market, side, "current_price_above_configured_max"
             )
-        reason = f"model_awc_high_predicted_{predicted_high_f:.2f}_market_{predicted_yes_market.market_id}_local_hour_{local_hour:02d}"
         return submit_model_awc_trade(market, side, price, reason)
+
+    predicted_yes_market = model_awc_predicted_yes_market(markets, predicted_high_f, event_unit)
+    if predicted_yes_market is not None:
+        if duplicate_window:
+            LOGGER.info("model awc skip duplicate city=%s station=%s event_date=%s local_hour=%s", city, station, event_date, local_hour)
+            return None
+        reason = f"model_awc_high_predicted_{predicted_high_f:.2f}_market_{predicted_yes_market.market_id}_local_hour_{local_hour:02d}"
+        return process_single_interval(predicted_yes_market, reason)
 
     snapped = model_awc_boundary_snap_market(config, markets, predicted_high_f, event_unit)
     if snapped is not None:
@@ -3222,6 +3292,22 @@ def process_model_awc_prediction(
             return None
         snap_market, snap_distance = snapped
         yes_price = best_buy_price(config, snap_market, "YES")
+        min_yes_price = configured_model_awc_min_yes_price(config)
+        if yes_price is not None and 0 < float(yes_price) < min_yes_price:
+            LOGGER.info(
+                "model awc skip snapped interval yes below confidence floor "
+                "city=%s station=%s event_date=%s local_hour=%s predicted_high_f=%r "
+                "market=%s yes_price=%.4f min_yes_price=%.4f",
+                city,
+                station,
+                event_date,
+                local_hour,
+                predicted_high_f,
+                snap_market.market_id,
+                float(yes_price),
+                min_yes_price,
+            )
+            return None
         if yes_price is None or yes_price <= 0:
             partial_trade = start_single_notional_manager(
                 snap_market, "YES", "snap_insufficient_current_depth"
@@ -3301,6 +3387,54 @@ def process_model_awc_prediction(
     if duplicate_window:
         LOGGER.info("model awc skip duplicate city=%s station=%s event_date=%s local_hour=%s", city, station, event_date, local_hour)
         return None
+    min_yes_price = configured_model_awc_min_yes_price(config)
+    below_floor = [
+        (market, price)
+        for market, price in adjacent_prices
+        if price < min_yes_price
+    ]
+    if len(below_floor) == 2:
+        LOGGER.info(
+            "model awc skip adjacent both yes below confidence floor city=%s "
+            "station=%s event_date=%s local_hour=%s predicted_high_f=%r "
+            "prices=%s min_yes_price=%.4f",
+            city,
+            station,
+            event_date,
+            local_hour,
+            predicted_high_f,
+            [(market.market_id, price) for market, price in adjacent_prices],
+            min_yes_price,
+        )
+        return None
+    if len(below_floor) == 1:
+        rejected_market, rejected_price = below_floor[0]
+        remaining_market = next(
+            market
+            for market, _price in adjacent_prices
+            if market.market_id != rejected_market.market_id
+        )
+        reason = (
+            f"model_awc_high_predicted_{predicted_high_f:.2f}_adjacent_floor_reject_"
+            f"{rejected_market.market_id}_{rejected_price:.2f}_single_"
+            f"{remaining_market.market_id}_local_hour_{local_hour:02d}"
+        )
+        LOGGER.info(
+            "model awc adjacent yes below confidence floor; treating other interval "
+            "as single city=%s station=%s event_date=%s local_hour=%s "
+            "predicted_high_f=%r rejected_market=%s rejected_price=%.4f "
+            "remaining_market=%s min_yes_price=%.4f",
+            city,
+            station,
+            event_date,
+            local_hour,
+            predicted_high_f,
+            rejected_market.market_id,
+            rejected_price,
+            remaining_market.market_id,
+            min_yes_price,
+        )
+        return process_single_interval(remaining_market, reason)
     non_adjacent_no = (
         model_awc_best_non_adjacent_no_candidate(config, markets, adjacent_markets)
         if not matched_prediction_markets
@@ -4771,11 +4905,21 @@ class LiveTradingManager:
             if token in batch.open_order_ids:
                 return
             max_price = configured_max_buy_price(self.config)
+            min_yes_price = configured_model_awc_min_yes_price(self.config)
             offer = self._live_offer(token)
+            if (
+                batch.sides[0].upper() == "YES"
+                and offer is not None
+                and offer[0] < min_yes_price
+            ):
+                self._close_hourly_batch(batch, "yes_below_confidence_floor")
+                return
             if offer is not None and offer[0] <= max_price:
                 price = float(offer[0])
                 shares = min(float(offer[1]), remaining_notional / price)
                 reason = f"{batch.reason}_single_websocket_offer"
+            elif batch.sides[0].upper() == "YES":
+                return
             else:
                 price = max_price
                 shares = remaining_notional / price

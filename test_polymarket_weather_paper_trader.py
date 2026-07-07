@@ -433,6 +433,71 @@ class ModelAwcLiveSingleIntervalTest(unittest.TestCase):
         self.assertEqual(125.0, submissions[0]["shares"])
         self.assertFalse(submissions[0]["notify_submitted"])
         self.assertEqual({"yes-token": "order-1"}, batch.open_order_ids)
+        self.assertEqual({"yes-token": 10.0}, batch.open_order_cost_usd)
+
+    def test_live_single_manager_does_not_rebuy_while_order_pending(self):
+        manager = bot.LiveTradingManager(self.config)
+        manager.market_feed = SimpleNamespace(
+            get_price=lambda _token: SimpleNamespace(best_ask=0.72, ask_size=100.0)
+        )
+        submissions = []
+
+        def submit_buy_trade(
+            _config,
+            _cycle_id,
+            _market,
+            _wu_source,
+            _station,
+            _side,
+            entry_price,
+            _observed_high,
+            _observed_low,
+            _reason,
+            amount_usd=None,
+            shares=None,
+            notify_submitted=True,
+        ):
+            submissions.append((entry_price, amount_usd, shares))
+            return SimpleNamespace(
+                live_buy_order_id=f"order-{len(submissions)}",
+                notional_usdc=amount_usd,
+                yes_price=entry_price,
+            )
+
+        manager.submit_buy_trade = submit_buy_trade
+        batch = bot.ModelAwcHourlyBatch(
+            batch_id="Seattle:KSEA:2026-07-07:hour_15:single",
+            city="Seattle",
+            station="KSEA",
+            event_date="2026-07-07",
+            local_hour=15,
+            mode="single",
+            markets=(self.market,),
+            sides=("YES",),
+            token_ids=("yes-token",),
+            target_shares=0.0,
+            target_notional_usd=20.0,
+            predicted_high_f=72.28,
+            cycle_id="cycle-1",
+            reason="model_awc_managed_single_hour_15",
+            baseline_balances={"yes-token": 0.0},
+            acquired_shares={"yes-token": 0.0},
+            acquired_cost_usd={"yes-token": 0.0},
+            average_prices={"yes-token": 0.0},
+            open_order_ids={},
+            expires_ts=bot.time.time() + 60,
+        )
+
+        with mock.patch.object(bot, "read_trades", return_value=[]), \
+            mock.patch.object(bot, "write_csv"), \
+            mock.patch.object(bot, "write_performance_reports"):
+            manager._manage_single_hourly_batch(batch)
+            batch.next_action_ts = 0.0
+            manager._manage_single_hourly_batch(batch)
+
+        self.assertEqual(1, len(submissions))
+        self.assertEqual({"yes-token": "order-1"}, batch.open_order_ids)
+        self.assertAlmostEqual(19.44, batch.open_order_cost_usd["yes-token"])
 
     def test_live_single_manager_continues_after_partial_fill(self):
         manager = bot.LiveTradingManager(self.config)
@@ -493,6 +558,7 @@ class ModelAwcLiveSingleIntervalTest(unittest.TestCase):
             mock.patch.object(bot, "write_performance_reports"):
             manager._manage_single_hourly_batch(batch)
             batch.open_order_ids.clear()
+            batch.open_order_cost_usd.clear()
             batch.acquired_shares["yes-token"] = 13.0
             batch.acquired_cost_usd["yes-token"] = 6.24
             batch.next_action_ts = 0.0
@@ -562,6 +628,7 @@ class ModelAwcLiveSingleIntervalTest(unittest.TestCase):
 
         self.assertEqual(20.0, batch.acquired_shares["yes-token"])
         self.assertAlmostEqual(9.80, batch.acquired_cost_usd["yes-token"])
+        self.assertAlmostEqual(9.80, batch.open_order_cost_usd["yes-token"])
         self.assertEqual({"yes-token": "order-1"}, batch.open_order_ids)
 
     def test_live_single_manager_closes_when_yes_falls_below_confidence_floor(self):

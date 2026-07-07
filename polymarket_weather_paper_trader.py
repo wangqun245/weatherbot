@@ -32,7 +32,7 @@ import threading
 import time
 import warnings
 from collections import Counter
-from dataclasses import MISSING, asdict, dataclass, fields
+from dataclasses import MISSING, asdict, dataclass, field, fields
 from datetime import date, datetime, timedelta, timezone
 from typing import Any, Iterable, Optional
 from urllib.parse import urljoin
@@ -298,6 +298,7 @@ class ModelAwcHourlyBatch:
     repair_token_id: str = ""
     next_action_ts: float = 0.0
     closed: bool = False
+    open_order_cost_usd: dict[str, float] = field(default_factory=dict)
 
 
 def deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
@@ -4749,7 +4750,7 @@ class LiveTradingManager:
         token_id: str,
         reason: str = "managed_reprice",
     ) -> None:
-        order_id = batch.open_order_ids.pop(token_id, "")
+        order_id = batch.open_order_ids.get(token_id, "")
         if not order_id:
             return
         with self._lock:
@@ -4769,6 +4770,8 @@ class LiveTradingManager:
                 )
                 with self._lock:
                     pending = self._pending.get(order_id)
+        batch.open_order_ids.pop(token_id, None)
+        batch.open_order_cost_usd.pop(token_id, None)
         cancelled = self.executor.cancel_order(order_id)
         with self._lock:
             self._managed_order_ids.discard(order_id)
@@ -4814,8 +4817,16 @@ class LiveTradingManager:
                 )
                 if status == "FILLED" or shares_remaining < 1:
                     batch.open_order_ids.pop(token_id, None)
+                    batch.open_order_cost_usd.pop(token_id, None)
                     with self._lock:
                         self._managed_order_ids.discard(pending.order_id)
+                else:
+                    remaining_cost = round(
+                        max(0.0, shares_remaining)
+                        * float(_result_value(result, "price", pending.price) or pending.price),
+                        2,
+                    )
+                    batch.open_order_cost_usd[token_id] = remaining_cost
                 LOGGER.info(
                     "model awc managed fill batch=%s token=%s shares=%s amount_usd=%.4f acquired_cost_usd=%.4f target_notional_usd=%.4f",
                     batch.batch_id,
@@ -4866,6 +4877,19 @@ class LiveTradingManager:
         write_performance_reports(self.config, trades)
         token_id = batch.token_ids[leg_index]
         batch.open_order_ids[token_id] = trade.live_buy_order_id
+        reserved_cost = float(
+            getattr(
+                trade,
+                "notional_usdc",
+                round(
+                    order_shares
+                    * float(getattr(trade, "yes_price", price) or price),
+                    2,
+                ),
+            )
+            or 0.0
+        )
+        batch.open_order_cost_usd[token_id] = round(reserved_cost, 2)
         batch.average_prices[token_id] = float(price)
         with self._lock:
             self._managed_order_ids.add(trade.live_buy_order_id)
@@ -4904,7 +4928,10 @@ class LiveTradingManager:
         token = batch.token_ids[0]
         if batch.target_notional_usd > 0:
             spent = batch.acquired_cost_usd.get(token, 0.0)
-            remaining_notional = max(0.0, batch.target_notional_usd - spent)
+            reserved = batch.open_order_cost_usd.get(token, 0.0)
+            remaining_notional = max(0.0, batch.target_notional_usd - spent - reserved)
+            if token in batch.open_order_ids:
+                return
             if remaining_notional < 0.01:
                 self._close_hourly_batch(batch, "target_filled")
                 return
@@ -4915,20 +4942,11 @@ class LiveTradingManager:
             )
             offer = self._live_offer(token)
             if side in {"YES", "NO"}:
-                if token in batch.open_order_ids:
-                    self._cancel_batch_order(
-                        batch,
-                        token,
-                        reason="confidence_floor_requires_live_offer",
-                    )
-                    return
                 if offer is not None and offer[0] < min_side_price:
                     self._close_hourly_batch(
                         batch, f"{side.lower()}_below_confidence_floor"
                     )
                     return
-            elif token in batch.open_order_ids:
-                return
             if offer is not None and offer[0] <= max_price:
                 price = float(offer[0])
                 shares = min(float(offer[1]), remaining_notional / price)

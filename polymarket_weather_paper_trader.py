@@ -25,6 +25,7 @@ import csv
 import json
 import logging
 from logging.handlers import RotatingFileHandler
+import math
 import os
 import queue
 import re
@@ -90,6 +91,9 @@ WEATHER_RECORD_ACTIVE_WINDOWS: dict[tuple[str, str], dict[str, Any]] = {}
 TWC_VERIFY_NEXT_AT: dict[str, float] = {}
 MODEL_AWC_MODEL: Any = None
 MODEL_AWC_MODEL_PATH: str = ""
+MODEL_AWC_CLASSIFIER: Any = None
+MODEL_AWC_CLASSIFIER_PATH: str = ""
+MODEL_AWC_CLASSIFIER_CLASSES: tuple[int, ...] = ()
 HTTP_EXECUTOR = concurrent.futures.ThreadPoolExecutor(max_workers=8, thread_name_prefix="weather-http")
 TGFTP_EXECUTOR = concurrent.futures.ThreadPoolExecutor(max_workers=32, thread_name_prefix="tgftp-http")
 CLOB_POLL_EXECUTOR = concurrent.futures.ThreadPoolExecutor(max_workers=32, thread_name_prefix="clob-poll")
@@ -372,7 +376,8 @@ def default_config() -> dict[str, Any]:
         "live_order_timeout_seconds": 20,
         "live_order_check_seconds": 5,
         "max_buy_price": 0.85,
-        "model_awc_min_yes_price": 0.16,
+        "model_awc_min_yes_price": 0.03,
+        "model_awc_min_no_price": 0.03,
         "source_station_check_enabled": True,
         "source_station_check_hour_ct": 3,
         "source_station_check_timezone": "America/Chicago",
@@ -380,6 +385,10 @@ def default_config() -> dict[str, Any]:
         "depth_price_extra_levels": 0,
         "model_awc_enabled": True,
         "model_awc_model_path": "models/lightgbm_rolling_6y_holdout_24h_lag10_speci_context_regular_prevday_20260630/lightgbm_metar_high_rolling_6y_best.pkl",
+        "model_awc_classifier_enabled": False,
+        "model_awc_classifier_model_path": "models/polymarket_rounded_high_classifier_lag10_prevday_hour10_18_light_excl2026_gpu_20260707/lightgbm_polymarket_rounded_high_classifier.pkl",
+        "model_awc_classifier_metadata_path": "models/polymarket_rounded_high_classifier_lag10_prevday_hour10_18_light_excl2026_gpu_20260707/classifier_metadata.json",
+        "model_awc_classifier_min_interval_probability": 0.01,
         "model_awc_live_stations": [
             "KATL", "KAUS", "KDAL", "KBKF", "KHOU", "KLAX",
             "KLGA", "KMIA", "KORD", "KSEA", "KSFO",
@@ -430,7 +439,6 @@ def default_config() -> dict[str, Any]:
         "model_awc_adjacent_yes_max_total_price": 0.9,
         "model_awc_adjacent_yes_shares": 10,
         "model_awc_order_management_window_minutes": 40,
-        "model_awc_interval_snap_tolerance_f": 0.15,
     }
     return {
     "api": {
@@ -2484,13 +2492,13 @@ def configured_max_buy_price(config: dict[str, Any]) -> float:
 
 def configured_model_awc_min_yes_price(config: dict[str, Any]) -> float:
     """Return the model confidence floor for a predicted interval's YES price."""
-    raw = config.get("trading", {}).get("model_awc_min_yes_price", 0.16)
+    raw = config.get("trading", {}).get("model_awc_min_yes_price", 0.03)
     try:
         value = float(raw)
     except (TypeError, ValueError):
-        return 0.16
+        return 0.03
     if value < 0 or value >= 1:
-        return 0.16
+        return 0.03
     return value
 
 
@@ -2530,6 +2538,73 @@ def model_awc_load_model(config: dict[str, Any]) -> Any:
         MODEL_AWC_MODEL_PATH = abs_path
         LOGGER.info("model awc loaded path=%s features=%s", abs_path, len(getattr(MODEL_AWC_MODEL, "feature_name_", [])))
     return MODEL_AWC_MODEL
+
+
+def model_awc_classifier_enabled(config: dict[str, Any]) -> bool:
+    """Return whether the second-stage rounded-temperature classifier is enabled."""
+    return bool(config.get("trading", {}).get("model_awc_classifier_enabled", False))
+
+
+def model_awc_load_classifier(config: dict[str, Any]) -> tuple[Any, tuple[int, ...]]:
+    """Load and cache the second-stage rounded-temperature classifier and class labels."""
+    global MODEL_AWC_CLASSIFIER, MODEL_AWC_CLASSIFIER_PATH, MODEL_AWC_CLASSIFIER_CLASSES
+    path = str(config.get("trading", {}).get("model_awc_classifier_model_path") or "").strip()
+    if not path:
+        raise RuntimeError("trading.model_awc_classifier_model_path is required when classifier is enabled")
+    if os.sep == "/" and "\\" in path:
+        path = path.replace("\\", "/")
+    abs_path = os.path.abspath(path)
+    metadata_path = str(config.get("trading", {}).get("model_awc_classifier_metadata_path") or "").strip()
+    if metadata_path:
+        if os.sep == "/" and "\\" in metadata_path:
+            metadata_path = metadata_path.replace("\\", "/")
+        abs_metadata_path = os.path.abspath(metadata_path)
+    else:
+        abs_metadata_path = os.path.join(os.path.dirname(abs_path), "classifier_metadata.json")
+    cache_key = f"{abs_path}|{abs_metadata_path}"
+    if MODEL_AWC_CLASSIFIER is None or MODEL_AWC_CLASSIFIER_PATH != cache_key:
+        classifier = joblib.load(abs_path)
+        with open(abs_metadata_path, "r", encoding="utf-8") as handle:
+            metadata = json.load(handle)
+        classes = tuple(int(value) for value in metadata.get("classes", []))
+        if not classes:
+            raise RuntimeError(f"classifier metadata has no classes: {abs_metadata_path}")
+        model_classes = getattr(classifier, "classes_", [])
+        if len(model_classes) != len(classes):
+            raise RuntimeError(
+                f"classifier class count mismatch model={len(model_classes)} metadata={len(classes)}"
+            )
+        MODEL_AWC_CLASSIFIER = classifier
+        MODEL_AWC_CLASSIFIER_PATH = cache_key
+        MODEL_AWC_CLASSIFIER_CLASSES = classes
+        LOGGER.info(
+            "model awc classifier loaded path=%s metadata=%s features=%s classes=%s range=%s..%s",
+            abs_path,
+            abs_metadata_path,
+            len(getattr(classifier, "feature_name_", [])),
+            len(classes),
+            classes[0],
+            classes[-1],
+        )
+    return MODEL_AWC_CLASSIFIER, MODEL_AWC_CLASSIFIER_CLASSES
+
+
+def model_awc_feature_vector(model: Any, features: dict[str, Any]) -> tuple[list[float], list[str]]:
+    """Build a numeric model input row from a feature dict using the model's feature order."""
+    feature_names = [str(name) for name in getattr(model, "feature_name_", [])]
+    if not feature_names:
+        raise RuntimeError("Loaded model does not expose feature_name_")
+    row = []
+    for name in feature_names:
+        value = features.get(name)
+        if value in (None, ""):
+            row.append(float("nan"))
+        else:
+            try:
+                row.append(float(value))
+            except (TypeError, ValueError):
+                row.append(float("nan"))
+    return row, feature_names
 
 
 def model_awc_model_unit(config: dict[str, Any]) -> str:
@@ -2828,19 +2903,7 @@ def model_awc_feature_row(
 def model_awc_predict_high(config: dict[str, Any], features: dict[str, Any]) -> float:
     """Return the model high, bounded below by the factual observed high."""
     model = model_awc_load_model(config)
-    feature_names = list(getattr(model, "feature_name_", []))
-    if not feature_names:
-        raise RuntimeError("Loaded model does not expose feature_name_")
-    row = []
-    for name in feature_names:
-        value = features.get(name)
-        if value in (None, ""):
-            row.append(float("nan"))
-        else:
-            try:
-                row.append(float(value))
-            except (TypeError, ValueError):
-                row.append(float("nan"))
+    row, _feature_names = model_awc_feature_vector(model, features)
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", UserWarning)
         prediction = model.predict([row], num_iteration=getattr(model, "best_iteration_", None))
@@ -2972,6 +3035,110 @@ def model_awc_predicted_yes_market(
     return matches[0]
 
 
+def model_awc_rounded_prediction_value_f(predicted_high_f: float) -> Optional[int]:
+    """Round a model high prediction using Polymarket's whole-F settlement rule."""
+    try:
+        predicted = float(predicted_high_f)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(predicted):
+        return None
+    return int(math.floor(predicted + 0.5))
+
+
+def model_awc_rounded_prediction_market(
+    markets: list[TemperatureMarket],
+    predicted_high_f: float,
+    event_unit: str,
+) -> tuple[Optional[TemperatureMarket], Optional[int]]:
+    """Return the unique market containing the rounded whole-F model prediction."""
+    rounded_f = model_awc_rounded_prediction_value_f(predicted_high_f)
+    if rounded_f is None:
+        return None, None
+    rounded_for_event = convert_temperature(float(rounded_f), "F", event_unit)
+    if rounded_for_event is None:
+        return None, rounded_f
+    matches = [
+        market
+        for market in markets
+        if market_contains_temperature(market, float(rounded_for_event), event_unit)
+    ]
+    if len(matches) != 1:
+        return None, rounded_f
+    return matches[0], rounded_f
+
+
+def model_awc_classifier_min_interval_probability(config: dict[str, Any]) -> float:
+    """Return the minimum interval probability considered active for classifier selection."""
+    raw = config.get("trading", {}).get("model_awc_classifier_min_interval_probability", 0.01)
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return 0.01
+    return min(1.0, max(0.0, value))
+
+
+def model_awc_classifier_temperature_probabilities(
+    config: dict[str, Any],
+    features: dict[str, Any],
+) -> tuple[dict[int, float], dict[str, float]]:
+    """Return integer-F probabilities from the second-stage classifier."""
+    classifier, classes = model_awc_load_classifier(config)
+    row, _feature_names = model_awc_feature_vector(classifier, features)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", UserWarning)
+        probabilities = classifier.predict_proba([row])[0]
+    temp_probabilities = {
+        int(label): float(probabilities[index])
+        for index, label in enumerate(classes)
+    }
+    return temp_probabilities, {
+        "max_probability": max(temp_probabilities.values(), default=0.0),
+    }
+
+
+def model_awc_classifier_interval_choice(
+    config: dict[str, Any],
+    markets: list[TemperatureMarket],
+    features: dict[str, Any],
+    event_unit: str,
+) -> Optional[dict[str, Any]]:
+    """Choose the market interval with the largest classifier probability mass."""
+    temp_probabilities, metadata = model_awc_classifier_temperature_probabilities(config, features)
+    min_probability = model_awc_classifier_min_interval_probability(config)
+    candidates: list[dict[str, Any]] = []
+    for market in markets:
+        interval_probability = 0.0
+        included_temperatures: list[int] = []
+        for temp_f, probability in temp_probabilities.items():
+            temp_for_event = convert_temperature(float(temp_f), "F", event_unit)
+            if temp_for_event is None:
+                continue
+            if market_contains_temperature(market, float(temp_for_event), event_unit):
+                interval_probability += probability
+                included_temperatures.append(temp_f)
+        if interval_probability >= min_probability:
+            candidates.append(
+                {
+                    "market": market,
+                    "probability": interval_probability,
+                    "temperatures_f": tuple(sorted(included_temperatures)),
+                }
+            )
+    if not candidates:
+        return None
+    candidates.sort(
+        key=lambda item: (
+            -float(item["probability"]),
+            str(item["market"].market_id),
+        )
+    )
+    selected = dict(candidates[0])
+    selected["active_candidates"] = candidates
+    selected["max_temperature_probability"] = metadata["max_probability"]
+    return selected
+
+
 def model_awc_prediction_matches(
     markets: list[TemperatureMarket],
     predicted_high_f: float,
@@ -2988,7 +3155,7 @@ def model_awc_interval_snap_tolerance(config: dict[str, Any], event_unit: str) -
     """Return the configured boundary snap tolerance in the event market unit."""
     if event_unit.upper() == "C" and "model_awc_interval_snap_tolerance_c" in config["trading"]:
         return max(0.0, float(config["trading"]["model_awc_interval_snap_tolerance_c"]))
-    tolerance_f = max(0.0, float(config["trading"].get("model_awc_interval_snap_tolerance_f", 0.15)))
+    tolerance_f = max(0.0, float(config["trading"].get("model_awc_interval_snap_tolerance_f", 0.0)))
     return tolerance_f * 5.0 / 9.0 if event_unit.upper() == "C" else tolerance_f
 
 
@@ -3086,6 +3253,7 @@ def process_model_awc_prediction(
     predicted_high_f: float,
     latest_row: FeatureMetarRow,
     latest_local: datetime,
+    features: Optional[dict[str, Any]] = None,
 ) -> Optional[PaperTrade]:
     """Choose and persist/submit the model-implied buy.
 
@@ -3270,13 +3438,111 @@ def process_model_awc_prediction(
             )
         return submit_model_awc_trade(market, side, price, reason)
 
-    predicted_yes_market = model_awc_predicted_yes_market(markets, predicted_high_f, event_unit)
+    predicted_yes_market, rounded_prediction_f = model_awc_rounded_prediction_market(
+        markets, predicted_high_f, event_unit
+    )
     if predicted_yes_market is not None:
         if duplicate_window:
             LOGGER.info("model awc skip duplicate city=%s station=%s event_date=%s local_hour=%s", city, station, event_date, local_hour)
             return None
-        reason = f"model_awc_high_predicted_{predicted_high_f:.2f}_market_{predicted_yes_market.market_id}_local_hour_{local_hour:02d}"
+        classifier_probability: Optional[float] = None
+        classifier_temperatures: tuple[int, ...] = ()
+        if model_awc_classifier_enabled(config):
+            if features is None:
+                LOGGER.info(
+                    "model awc skip classifier enabled without feature row city=%s station=%s "
+                    "event_date=%s local_hour=%s predicted_high_f=%r rounded_high_f=%s market=%s",
+                    city,
+                    station,
+                    event_date,
+                    local_hour,
+                    predicted_high_f,
+                    rounded_prediction_f,
+                    predicted_yes_market.market_id,
+                )
+                return None
+            classifier_choice = model_awc_classifier_interval_choice(
+                config, markets, features, event_unit
+            )
+            if classifier_choice is None:
+                LOGGER.info(
+                    "model awc skip classifier no active interval city=%s station=%s "
+                    "event_date=%s local_hour=%s predicted_high_f=%r rounded_high_f=%s "
+                    "regression_market=%s min_interval_probability=%.4f",
+                    city,
+                    station,
+                    event_date,
+                    local_hour,
+                    predicted_high_f,
+                    rounded_prediction_f,
+                    predicted_yes_market.market_id,
+                    model_awc_classifier_min_interval_probability(config),
+                )
+                return None
+            classifier_market = classifier_choice["market"]
+            classifier_probability = float(classifier_choice["probability"])
+            classifier_temperatures = tuple(classifier_choice.get("temperatures_f") or ())
+            if classifier_market.market_id != predicted_yes_market.market_id:
+                LOGGER.info(
+                    "model awc skip classifier disagreement city=%s station=%s "
+                    "event_date=%s local_hour=%s predicted_high_f=%r rounded_high_f=%s "
+                    "regression_market=%s classifier_market=%s classifier_probability=%.6f "
+                    "classifier_temperatures=%s active_candidates=%s",
+                    city,
+                    station,
+                    event_date,
+                    local_hour,
+                    predicted_high_f,
+                    rounded_prediction_f,
+                    predicted_yes_market.market_id,
+                    classifier_market.market_id,
+                    classifier_probability,
+                    classifier_temperatures,
+                    [
+                        (
+                            item["market"].market_id,
+                            round(float(item["probability"]), 6),
+                            item.get("temperatures_f"),
+                        )
+                        for item in classifier_choice.get("active_candidates", [])[:5]
+                    ],
+                )
+                return None
+        reason = (
+            f"model_awc_high_predicted_{predicted_high_f:.2f}_rounded_{rounded_prediction_f}"
+            f"_market_{predicted_yes_market.market_id}_local_hour_{local_hour:02d}"
+        )
+        if classifier_probability is not None:
+            reason += f"_classifier_prob_{classifier_probability:.4f}"
+        LOGGER.info(
+            "model awc rounded prediction mapped city=%s station=%s event_date=%s "
+            "local_hour=%s predicted_high_f=%r rounded_high_f=%s market=%s "
+            "classifier_enabled=%s classifier_probability=%s classifier_temperatures=%s",
+            city,
+            station,
+            event_date,
+            local_hour,
+            predicted_high_f,
+            rounded_prediction_f,
+            predicted_yes_market.market_id,
+            model_awc_classifier_enabled(config),
+            None if classifier_probability is None else round(classifier_probability, 6),
+            classifier_temperatures,
+        )
         return process_single_interval(predicted_yes_market, reason)
+
+    LOGGER.info(
+        "model awc skip rounded prediction without unique market city=%s station=%s "
+        "event_date=%s local_hour=%s predicted_high_f=%r rounded_high_f=%s event_unit=%s",
+        city,
+        station,
+        event_date,
+        local_hour,
+        predicted_high_f,
+        rounded_prediction_f,
+        event_unit,
+    )
+    return None
 
     snapped = model_awc_boundary_snap_market(config, markets, predicted_high_f, event_unit)
     if snapped is not None:
@@ -8041,7 +8307,16 @@ def model_awc_run_prediction_rows(
             continue
         got_latest_metar = True
         predicted_high_f = model_awc_predict_high(config, features)
-        process_model_awc_prediction(config, event, city, station, predicted_high_f, latest_row, latest_local)
+        process_model_awc_prediction(
+            config,
+            event,
+            city,
+            station,
+            predicted_high_f,
+            latest_row,
+            latest_local,
+            features,
+        )
     return got_latest_metar
 
 
@@ -8350,7 +8625,16 @@ def model_awc_supervisor(config: dict[str, Any]) -> None:
                                     continue
                                 got_latest_metar = True
                                 predicted_high_f = model_awc_predict_high(config, features)
-                                process_model_awc_prediction(config, event, city, station, predicted_high_f, latest_row, latest_local)
+                                process_model_awc_prediction(
+                                    config,
+                                    event,
+                                    city,
+                                    station,
+                                    predicted_high_f,
+                                    latest_row,
+                                    latest_local,
+                                    features,
+                                )
                             if got_latest_metar:
                                 state["done"] = True
                             LOGGER.info(

@@ -61,7 +61,7 @@
     "trading":  {
                     "strategy_name":  "model_awc_high",
                     "strategy_mode":  "model_awc_high",
-                    "buy_notional_usdc":  20,
+                    "buy_notional_usdc":  10,
                     "fee_rate":  0.05,
                     "fee_enabled":  true,
                     "deterministic_min_yes_price":  0.01,
@@ -98,8 +98,8 @@
                     "live_order_timeout_seconds":  20,
                     "live_order_check_seconds":  5,
                     "max_buy_price":  0.85,
-                    "model_awc_min_yes_price":  0.16,
-                    "model_awc_min_no_price":  0.16,
+                    "model_awc_min_yes_price":  0.03,
+                    "model_awc_min_no_price":  0.03,
                     "source_station_check_enabled":  true,
                     "source_station_check_hour_ct":  3,
                     "source_station_check_timezone":  "America/Chicago",
@@ -110,6 +110,10 @@
                     "tgftp_window_max_inflight_per_station":  10
                     ,"model_awc_enabled": true
                     ,"model_awc_model_path": "models/lightgbm_rolling_6y_holdout_24h_lag10_speci_context_regular_prevday_20260630/lightgbm_metar_high_rolling_6y_best.pkl"
+                    ,"model_awc_classifier_enabled": true
+                    ,"model_awc_classifier_model_path": "models/polymarket_rounded_high_classifier_lag10_prevday_hour10_18_light_excl2026_gpu_20260707/lightgbm_polymarket_rounded_high_classifier.pkl"
+                    ,"model_awc_classifier_metadata_path": "models/polymarket_rounded_high_classifier_lag10_prevday_hour10_18_light_excl2026_gpu_20260707/classifier_metadata.json"
+                    ,"model_awc_classifier_min_interval_probability": 0.01
                     ,"model_awc_live_stations": [
                         "KATL",
                         "KAUS",
@@ -169,7 +173,6 @@
                     ,"model_awc_adjacent_yes_max_total_price": 0.9
                     ,"model_awc_adjacent_yes_shares": 20
                     ,"model_awc_order_management_window_minutes": 40
-                    ,"model_awc_interval_snap_tolerance_f": 0.15
                 },
     "scheduler":  {
                       "poll_interval_minutes":  15,
@@ -245,7 +248,7 @@
                            "trading":  {
                                            "strategy_name":  "model_awc_high",
                                            "strategy_mode":  "model_awc_high",
-                                           "buy_notional_usdc":  20,
+                                           "buy_notional_usdc":  10,
                                            "fee_rate":  0.05,
                                            "fee_enabled":  true,
                                            "deterministic_min_yes_price":  0.01,
@@ -282,8 +285,8 @@
                                            "live_order_timeout_seconds":  20,
                                            "live_order_check_seconds":  5,
                                            "max_buy_price":  0.85,
-                                           "model_awc_min_yes_price":  0.16,
-                                           "model_awc_min_no_price":  0.16,
+                                           "model_awc_min_yes_price":  0.03,
+                                           "model_awc_min_no_price":  0.03,
                                            "source_station_check_enabled":  true,
                                            "source_station_check_hour_ct":  3,
                                            "source_station_check_timezone":  "America/Chicago",
@@ -292,6 +295,10 @@
                                            "tgftp_window_max_inflight_per_station":  10
                                            ,"model_awc_enabled": true
                                            ,"model_awc_model_path": "models/lightgbm_rolling_6y_holdout_24h_lag10_speci_context_regular_prevday_20260630/lightgbm_metar_high_rolling_6y_best.pkl"
+                                           ,"model_awc_classifier_enabled": true
+                                           ,"model_awc_classifier_model_path": "models/polymarket_rounded_high_classifier_lag10_prevday_hour10_18_light_excl2026_gpu_20260707/lightgbm_polymarket_rounded_high_classifier.pkl"
+                                           ,"model_awc_classifier_metadata_path": "models/polymarket_rounded_high_classifier_lag10_prevday_hour10_18_light_excl2026_gpu_20260707/classifier_metadata.json"
+                                           ,"model_awc_classifier_min_interval_probability": 0.01
                                            ,"model_awc_live_stations": [
                                                "KATL",
                                                "KAUS",
@@ -351,7 +358,6 @@
                                            ,"model_awc_adjacent_yes_max_total_price": 0.9
                                            ,"model_awc_adjacent_yes_shares": 20
                                            ,"model_awc_order_management_window_minutes": 40
-                                           ,"model_awc_interval_snap_tolerance_f": 0.15
                                        }
                        }
                    ]

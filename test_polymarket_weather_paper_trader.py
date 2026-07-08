@@ -72,7 +72,10 @@ class ClobPricingTest(unittest.TestCase):
             "KMIA": (11, 16),
         }
 
-        self.assertEqual(20.0, float(config["trading"]["buy_notional_usdc"]))
+        self.assertEqual(10.0, float(config["trading"]["buy_notional_usdc"]))
+        self.assertEqual(0.03, float(config["trading"]["model_awc_min_yes_price"]))
+        self.assertEqual(0.03, float(config["trading"]["model_awc_min_no_price"]))
+        self.assertTrue(config["trading"]["model_awc_classifier_enabled"])
         self.assertEqual(
             20.0,
             float(config["trading"]["model_awc_adjacent_yes_shares"]),
@@ -750,6 +753,127 @@ class ModelAwcLiveSingleIntervalTest(unittest.TestCase):
         self.assertEqual(10, submissions[0][1])
 
 
+class ModelAwcRoundedPredictionMarketTest(unittest.TestCase):
+    def _market(self, market_id, low, high):
+        return bot.TemperatureMarket(
+            event_id="event-test",
+            market_id=market_id,
+            condition_id=f"condition-{market_id}",
+            city="Austin",
+            kind="Highest",
+            event_date="2026-07-03",
+            event_title="Highest temperature in Austin on July 3",
+            market_question=f"Will Austin be between {low}-{high}F?",
+            polymarket_url="https://polymarket.com/event/austin-high-july-3",
+            yes_price=0.4,
+            rule_min=float(low),
+            rule_max=float(high),
+            unit="F",
+            raw_market_json='{"outcomes":["Yes","No"],"clobTokenIds":["yes","no"]}',
+        )
+
+    def test_rounded_prediction_uses_whole_f_bucket(self):
+        markets = [
+            self._market("market-94-95", 94, 95),
+            self._market("market-96-97", 96, 97),
+            self._market("market-98-99", 98, 99),
+        ]
+
+        market, rounded_f = bot.model_awc_rounded_prediction_market(markets, 95.4, "F")
+        self.assertEqual(95, rounded_f)
+        self.assertEqual("market-94-95", market.market_id)
+
+        market, rounded_f = bot.model_awc_rounded_prediction_market(markets, 95.5, "F")
+        self.assertEqual(96, rounded_f)
+        self.assertEqual("market-96-97", market.market_id)
+
+    def test_rounded_prediction_does_not_use_boundary_snap_tolerance(self):
+        markets = [
+            self._market("market-94-95", 94, 95),
+            self._market("market-96-97", 96, 97),
+        ]
+
+        market, rounded_f = bot.model_awc_rounded_prediction_market(markets, 95.49, "F")
+
+        self.assertEqual(95, rounded_f)
+        self.assertEqual("market-94-95", market.market_id)
+
+    def test_classifier_interval_choice_sums_integer_temperature_probabilities(self):
+        config = bot.default_config()
+        markets = [
+            self._market("market-94-95", 94, 95),
+            self._market("market-96-97", 96, 97),
+            self._market("market-98-99", 98, 99),
+        ]
+
+        with mock.patch.object(
+            bot,
+            "model_awc_classifier_temperature_probabilities",
+            return_value=(
+                {94: 0.20, 95: 0.21, 96: 0.33, 97: 0.20, 98: 0.01, 99: 0.0},
+                {"max_probability": 0.33},
+            ),
+        ):
+            choice = bot.model_awc_classifier_interval_choice(config, markets, {}, "F")
+
+        self.assertEqual("market-96-97", choice["market"].market_id)
+        self.assertAlmostEqual(0.53, choice["probability"])
+        self.assertEqual((96, 97), choice["temperatures_f"])
+
+    def test_classifier_disagreement_blocks_single_interval_buy(self):
+        config = bot.default_config()
+        config["trading"]["live_trading_enabled"] = True
+        config["trading"]["model_awc_classifier_enabled"] = True
+        market_94_95 = self._market("market-94-95", 94, 95)
+        market_96_97 = self._market("market-96-97", 96, 97)
+        event = {
+            "id": "event-austin",
+            "slug": "austin-high-july-3",
+            "_parsed_kind": "Highest",
+            "_parsed_event_date": "2026-07-03",
+        }
+        latest_utc = bot.datetime(2026, 7, 3, 18, 53, tzinfo=bot.timezone.utc)
+        latest_local = latest_utc.astimezone(bot.ZoneInfo("America/Chicago"))
+        latest_row = bot.FeatureMetarRow(
+            daily_high_f="96.0",
+            station="KAUS",
+            valid_utc=latest_utc,
+            valid_text="2026-07-03T18:53:00+00:00",
+            metar="KAUS 031853Z 16010KT 10SM 36/22 A2992",
+        )
+        fake_live_trader = SimpleNamespace(batches=[], submissions=[])
+        fake_live_trader.start_model_awc_hourly_batch = lambda *args, **kwargs: fake_live_trader.batches.append((args, kwargs))
+
+        with mock.patch.object(bot, "get_live_trader", return_value=fake_live_trader), \
+            mock.patch.object(bot, "markets_for_event", return_value=[market_94_95, market_96_97]), \
+            mock.patch.object(bot, "read_trades", return_value=[]), \
+            mock.patch.object(
+                bot,
+                "model_awc_classifier_interval_choice",
+                return_value={
+                    "market": market_94_95,
+                    "probability": 0.62,
+                    "temperatures_f": (94, 95),
+                    "active_candidates": [],
+                },
+            ):
+            result = bot.process_model_awc_prediction(
+                config,
+                event,
+                "Austin",
+                "KAUS",
+                96.2,
+                latest_row,
+                latest_local,
+                {"temp_f": 96.0},
+            )
+
+        self.assertIsNone(result)
+        self.assertEqual([], fake_live_trader.batches)
+        self.assertEqual([], fake_live_trader.submissions)
+
+
+@unittest.skip("Adjacent two-interval model-AWC production path is disabled; rounded single-interval routing is used instead.")
 class ModelAwcLiveAdjacentSelectionTest(unittest.TestCase):
     def setUp(self):
         self.config = bot.default_config()

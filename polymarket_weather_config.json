@@ -61,7 +61,7 @@
     "trading":  {
                     "strategy_name":  "model_awc_high",
                     "strategy_mode":  "model_awc_high",
-                    "buy_notional_usdc":  10,
+                    "buy_notional_usdc":  20,
                     "fee_rate":  0.05,
                     "fee_enabled":  true,
                     "deterministic_min_yes_price":  0.01,
@@ -248,7 +248,7 @@
                            "trading":  {
                                            "strategy_name":  "model_awc_high",
                                            "strategy_mode":  "model_awc_high",
-                                           "buy_notional_usdc":  10,
+                                           "buy_notional_usdc":  20,
                                            "fee_rate":  0.05,
                                            "fee_enabled":  true,
                                            "deterministic_min_yes_price":  0.01,

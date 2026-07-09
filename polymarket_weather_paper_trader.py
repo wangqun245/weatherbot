@@ -586,6 +586,21 @@ def redacted_config(config: dict[str, Any]) -> dict[str, Any]:
     return redact(config)
 
 
+def current_process_rss_mb() -> Optional[float]:
+    """Return current process RSS in MB on Linux, if available."""
+    status_path = "/proc/self/status"
+    try:
+        with open(status_path, "r", encoding="utf-8") as handle:
+            for line in handle:
+                if line.startswith("VmRSS:"):
+                    parts = line.split()
+                    if len(parts) >= 2:
+                        return float(parts[1]) / 1024.0
+    except OSError:
+        return None
+    return None
+
+
 def setup_logging(config: dict[str, Any]) -> None:
     """Configure file and optional console logging for the bot process.
     
@@ -2589,6 +2604,49 @@ def model_awc_load_classifier(config: dict[str, Any]) -> tuple[Any, tuple[int, .
     return MODEL_AWC_CLASSIFIER, MODEL_AWC_CLASSIFIER_CLASSES
 
 
+def model_awc_preload_models(config: dict[str, Any], reason: str = "startup") -> None:
+    """Load model-AWC models at startup and validate their feature compatibility."""
+    rss_before = current_process_rss_mb()
+    LOGGER.info(
+        "model awc preload start reason=%s rss_mb=%s classifier_enabled=%s",
+        reason,
+        None if rss_before is None else round(rss_before, 1),
+        model_awc_classifier_enabled(config),
+    )
+    model = model_awc_load_model(config)
+    model_features = [str(name) for name in getattr(model, "feature_name_", [])]
+    if not model_awc_classifier_enabled(config):
+        rss_after_regression = current_process_rss_mb()
+        LOGGER.info(
+            "model awc preload completed reason=%s classifier disabled regression_features=%s rss_mb=%s rss_delta_mb=%s",
+            reason,
+            len(model_features),
+            None if rss_after_regression is None else round(rss_after_regression, 1),
+            None if rss_before is None or rss_after_regression is None else round(rss_after_regression - rss_before, 1),
+        )
+        return
+    classifier, classes = model_awc_load_classifier(config)
+    classifier_features = [str(name) for name in getattr(classifier, "feature_name_", [])]
+    if model_features != classifier_features:
+        raise RuntimeError(
+            "model AWC classifier feature columns do not match regression model "
+            f"regression_features={len(model_features)} classifier_features={len(classifier_features)}"
+        )
+    rss_after = current_process_rss_mb()
+    LOGGER.info(
+        "model awc preload completed reason=%s regression_features=%s classifier_features=%s "
+        "classifier_classes=%s classifier_range=%s..%s rss_mb=%s rss_delta_mb=%s",
+        reason,
+        len(model_features),
+        len(classifier_features),
+        len(classes),
+        classes[0],
+        classes[-1],
+        None if rss_after is None else round(rss_after, 1),
+        None if rss_before is None or rss_after is None else round(rss_after - rss_before, 1),
+    )
+
+
 def model_awc_feature_vector(model: Any, features: dict[str, Any]) -> tuple[list[float], list[str]]:
     """Build a numeric model input row from a feature dict using the model's feature order."""
     feature_names = [str(name) for name in getattr(model, "feature_name_", [])]
@@ -3139,6 +3197,21 @@ def model_awc_classifier_interval_choice(
     return selected
 
 
+def model_awc_classifier_candidate_log_items(
+    classifier_choice: Optional[dict[str, Any]],
+    limit: int = 8,
+) -> list[tuple[str, float, tuple[int, ...]]]:
+    if not classifier_choice:
+        return []
+    items: list[tuple[str, float, tuple[int, ...]]] = []
+    for item in classifier_choice.get("active_candidates", [])[:limit]:
+        market = item.get("market")
+        market_id = str(getattr(market, "market_id", ""))
+        temperatures = tuple(item.get("temperatures_f") or ())
+        items.append((market_id, round(float(item["probability"]), 6), temperatures))
+    return items
+
+
 def model_awc_prediction_matches(
     markets: list[TemperatureMarket],
     predicted_high_f: float,
@@ -3447,6 +3520,7 @@ def process_model_awc_prediction(
             return None
         classifier_probability: Optional[float] = None
         classifier_temperatures: tuple[int, ...] = ()
+        classifier_active_candidates: list[tuple[str, float, tuple[int, ...]]] = []
         if model_awc_classifier_enabled(config):
             if features is None:
                 LOGGER.info(
@@ -3482,6 +3556,9 @@ def process_model_awc_prediction(
             classifier_market = classifier_choice["market"]
             classifier_probability = float(classifier_choice["probability"])
             classifier_temperatures = tuple(classifier_choice.get("temperatures_f") or ())
+            classifier_active_candidates = model_awc_classifier_candidate_log_items(
+                classifier_choice
+            )
             if classifier_market.market_id != predicted_yes_market.market_id:
                 LOGGER.info(
                     "model awc skip classifier disagreement city=%s station=%s "
@@ -3498,14 +3575,7 @@ def process_model_awc_prediction(
                     classifier_market.market_id,
                     classifier_probability,
                     classifier_temperatures,
-                    [
-                        (
-                            item["market"].market_id,
-                            round(float(item["probability"]), 6),
-                            item.get("temperatures_f"),
-                        )
-                        for item in classifier_choice.get("active_candidates", [])[:5]
-                    ],
+                    classifier_active_candidates,
                 )
                 return None
         reason = (
@@ -3517,7 +3587,8 @@ def process_model_awc_prediction(
         LOGGER.info(
             "model awc rounded prediction mapped city=%s station=%s event_date=%s "
             "local_hour=%s predicted_high_f=%r rounded_high_f=%s market=%s "
-            "classifier_enabled=%s classifier_probability=%s classifier_temperatures=%s",
+            "classifier_enabled=%s classifier_probability=%s classifier_temperatures=%s "
+            "classifier_active_candidates=%s",
             city,
             station,
             event_date,
@@ -3528,6 +3599,7 @@ def process_model_awc_prediction(
             model_awc_classifier_enabled(config),
             None if classifier_probability is None else round(classifier_probability, 6),
             classifier_temperatures,
+            classifier_active_candidates,
         )
         return process_single_interval(predicted_yes_market, reason)
 
@@ -5662,6 +5734,17 @@ class LiveTradingManager:
         Returns:
             None: This function is executed for its side effects.
         """
+        result = self._normalize_order_result_for_pending(pending, result)
+        if self._is_duplicate_order_result(pending, result):
+            LOGGER.info(
+                "live order duplicate confirmation skipped order=%s kind=%s shares=%s confirmed_shares=%s source=%s",
+                pending.order_id,
+                pending.kind,
+                _result_value(result, "shares", 0.0),
+                pending.confirmed_shares,
+                source,
+            )
+            return
         status = str(_result_value(result, "status", "FILLED") or "FILLED").upper()
         shares_remaining = float(
             _result_value(result, "shares_remaining", 0.0) or 0.0
@@ -5697,6 +5780,65 @@ class LiveTradingManager:
             pending.kind,
             "PARTIAL" if partial else "FILLED",
             source=source,
+        )
+
+    def _normalize_order_result_for_pending(self, pending: LivePendingOrder, result: Any) -> dict[str, Any]:
+        """Clamp a live confirmation to the local order target before persistence."""
+        normalized = dict(result) if isinstance(result, dict) else {
+            "success": _result_value(result, "success", True),
+            "order_id": _result_value(result, "order_id", pending.order_id),
+            "status": _result_value(result, "status", "FILLED"),
+            "side": _result_value(result, "side", pending.kind),
+            "price": _result_value(result, "price", pending.price),
+            "amount_usd": _result_value(result, "amount_usd", 0.0),
+            "shares": _result_value(result, "shares", 0.0),
+            "shares_remaining": _result_value(result, "shares_remaining", 0.0),
+            "dry_run": _result_value(result, "dry_run", False),
+        }
+        price = float(_result_value(normalized, "price", pending.price) or pending.price or 0.0)
+        shares = max(0.0, float(_result_value(normalized, "shares", 0.0) or 0.0))
+        target_shares = max(0.0, float(pending.shares or 0.0))
+        if target_shares > 0 and shares > target_shares:
+            LOGGER.warning(
+                "live order confirmation shares exceeded target; clamping order=%s kind=%s reported_shares=%s target_shares=%s price=%s",
+                pending.order_id,
+                pending.kind,
+                shares,
+                target_shares,
+                price,
+            )
+            shares = target_shares
+        amount = float(_result_value(normalized, "amount_usd", shares * price) or 0.0)
+        expected_amount = shares * price
+        if price > 0 and amount > expected_amount + max(0.01, price):
+            LOGGER.warning(
+                "live order confirmation amount exceeded normalized shares; clamping order=%s kind=%s reported_amount=%.4f normalized_amount=%.4f shares=%s price=%s",
+                pending.order_id,
+                pending.kind,
+                amount,
+                expected_amount,
+                shares,
+                price,
+            )
+            amount = expected_amount
+        shares_remaining = max(0.0, target_shares - shares) if target_shares > 0 else float(
+            _result_value(normalized, "shares_remaining", 0.0) or 0.0
+        )
+        normalized["price"] = price
+        normalized["shares"] = shares
+        normalized["amount_usd"] = amount
+        normalized["shares_remaining"] = shares_remaining
+        normalized["status"] = "FILLED" if shares_remaining < 1 else "PARTIAL"
+        return normalized
+
+    def _is_duplicate_order_result(self, pending: LivePendingOrder, result: Any) -> bool:
+        if pending.kind != "BUY":
+            return False
+        shares = float(_result_value(result, "shares", 0.0) or 0.0)
+        amount = float(_result_value(result, "amount_usd", 0.0) or 0.0)
+        return (
+            shares <= float(pending.confirmed_shares or 0.0) + 1e-9
+            and amount <= float(pending.confirmed_cost_usd or 0.0) + 1e-9
         )
 
     def _apply_buy_result_to_trade(self, trade: PaperTrade, result: Any, pending: bool) -> None:
@@ -8443,7 +8585,7 @@ def model_awc_supervisor(config: dict[str, Any]) -> None:
         if not model_awc_enabled(config):
             LOGGER.info("model awc supervisor disabled")
             return
-        model_awc_load_model(config)
+        model_awc_preload_models(config, reason="supervisor_startup")
     except Exception:
         LOGGER.exception("model awc supervisor failed during startup")
         return
@@ -9395,6 +9537,8 @@ def run(config: dict[str, Any]) -> None:
     cycle_num = 0
     max_cycles = int(config["scheduler"].get("max_cycles", 0))
     LOGGER.info("bot started config=%s", json.dumps(redacted_config(config), ensure_ascii=False, sort_keys=True))
+    if model_awc_enabled(config):
+        model_awc_preload_models(config, reason="service_startup")
     start_live_trader(config)
     sync_polymarket_positions_to_disk(config, reason="start")
     start_source_station_guard_thread(config)

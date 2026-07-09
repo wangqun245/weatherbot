@@ -634,6 +634,39 @@ class ModelAwcLiveSingleIntervalTest(unittest.TestCase):
         self.assertAlmostEqual(9.80, batch.open_order_cost_usd["yes-token"])
         self.assertEqual({"yes-token": "order-1"}, batch.open_order_ids)
 
+    def test_live_order_result_is_clamped_to_pending_order_target(self):
+        manager = bot.LiveTradingManager(self.config)
+        pending = bot.LivePendingOrder(
+            kind="BUY",
+            trade_id="trade-1",
+            order_id="order-1",
+            token_id="yes-token",
+            condition_id="condition-1",
+            price=0.21,
+            shares=47.0,
+            created_ts=bot.time.time(),
+            confirmed_shares=45.0,
+            confirmed_cost_usd=9.45,
+        )
+
+        normalized = manager._normalize_order_result_for_pending(
+            pending,
+            {
+                "success": True,
+                "order_id": "order-1",
+                "status": "FILLED",
+                "price": 0.21,
+                "shares": 90.0,
+                "amount_usd": 18.90,
+                "shares_remaining": 0.0,
+            },
+        )
+
+        self.assertEqual(47.0, normalized["shares"])
+        self.assertAlmostEqual(9.87, normalized["amount_usd"])
+        self.assertEqual(0.0, normalized["shares_remaining"])
+        self.assertEqual("FILLED", normalized["status"])
+
     def test_live_single_manager_closes_when_yes_falls_below_confidence_floor(self):
         self.config["trading"]["model_awc_min_yes_price"] = 0.16
         manager = bot.LiveTradingManager(self.config)

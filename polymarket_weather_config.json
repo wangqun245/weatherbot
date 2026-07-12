@@ -114,6 +114,16 @@
                     ,"model_awc_classifier_model_path": "models/polymarket_rounded_high_classifier_lag10_prevday_hour10_18_light_excl2026_gpu_20260707/lightgbm_polymarket_rounded_high_classifier.pkl"
                     ,"model_awc_classifier_metadata_path": "models/polymarket_rounded_high_classifier_lag10_prevday_hour10_18_light_excl2026_gpu_20260707/classifier_metadata.json"
                     ,"model_awc_classifier_min_interval_probability": 0.01
+                    ,"model_awc_regressor_calibration_enabled": true
+                    ,"model_awc_regressor_calibration_path": "models/lightgbm_rolling_6y_holdout_24h_lag10_speci_context_regular_prevday_20260630/regressor_error_calibration_station_month_hour.csv"
+                    ,"model_awc_regressor_calibration_sigma_column": "error_robust_sigma_f"
+                    ,"model_awc_classifier_probability_weight": 0.5
+                    ,"model_awc_regressor_probability_weight": 0.5
+                    ,"model_awc_agree_min_regressor_confidence": 0.60
+                    ,"model_awc_agree_min_classifier_probability": 0.70
+                    ,"model_awc_disagree_takeover_min_probability": 0.80
+                    ,"model_awc_disagree_takeover_min_gap": 0.30
+                    ,"model_awc_observation_window_max_buy_prices": [0.60, 0.70, 0.80]
                     ,"model_awc_live_stations": [
                         "KATL",
                         "KAUS",
@@ -127,20 +137,20 @@
                         "KSEA",
                         "KSFO"
                     ]
-                    ,"model_awc_buy_start_hour": 12
-                    ,"model_awc_buy_end_hour": 17
+                    ,"model_awc_buy_start_hour": 10
+                    ,"model_awc_buy_end_hour": 16
                     ,"model_awc_station_buy_hours": {
-                        "KATL": [14, 17],
-                        "KAUS": [13, 17],
-                        "KHOU": [14, 17],
-                        "KORD": [13, 16],
-                        "KDAL": [14, 17],
-                        "KBKF": [15, 17],
-                        "KLGA": [14, 17],
-                        "KLAX": [11, 15],
-                        "KSEA": [15, 17],
-                        "KSFO": [13, 16],
-                        "KMIA": [11, 16]
+                        "KATL": [12, 14],
+                        "KAUS": [12, 16],
+                        "KHOU": [12, 16],
+                        "KORD": [12, 16],
+                        "KDAL": [12, 16],
+                        "KBKF": [13, 16],
+                        "KLGA": [12, 16],
+                        "KLAX": [10, 14],
+                        "KSEA": [13, 16],
+                        "KSFO": [11, 15],
+                        "KMIA": [10, 15]
                     }
                     ,"model_awc_metar_lookback_hours": 48
                     ,"model_awc_observation_minute": 53
@@ -299,6 +309,16 @@
                                            ,"model_awc_classifier_model_path": "models/polymarket_rounded_high_classifier_lag10_prevday_hour10_18_light_excl2026_gpu_20260707/lightgbm_polymarket_rounded_high_classifier.pkl"
                                            ,"model_awc_classifier_metadata_path": "models/polymarket_rounded_high_classifier_lag10_prevday_hour10_18_light_excl2026_gpu_20260707/classifier_metadata.json"
                                            ,"model_awc_classifier_min_interval_probability": 0.01
+                                           ,"model_awc_regressor_calibration_enabled": true
+                                           ,"model_awc_regressor_calibration_path": "models/lightgbm_rolling_6y_holdout_24h_lag10_speci_context_regular_prevday_20260630/regressor_error_calibration_station_month_hour.csv"
+                                           ,"model_awc_regressor_calibration_sigma_column": "error_robust_sigma_f"
+                                           ,"model_awc_classifier_probability_weight": 0.5
+                                           ,"model_awc_regressor_probability_weight": 0.5
+                                           ,"model_awc_agree_min_regressor_confidence": 0.60
+                                           ,"model_awc_agree_min_classifier_probability": 0.70
+                                           ,"model_awc_disagree_takeover_min_probability": 0.80
+                                           ,"model_awc_disagree_takeover_min_gap": 0.30
+                                           ,"model_awc_observation_window_max_buy_prices": [0.60, 0.70, 0.80]
                                            ,"model_awc_live_stations": [
                                                "KATL",
                                                "KAUS",
@@ -312,20 +332,20 @@
                                                "KSEA",
                                                "KSFO"
                                            ]
-                                           ,"model_awc_buy_start_hour": 12
-                                           ,"model_awc_buy_end_hour": 17
+                                           ,"model_awc_buy_start_hour": 10
+                                           ,"model_awc_buy_end_hour": 16
                                            ,"model_awc_station_buy_hours": {
-                                        "KATL": [14, 17],
-                        "KAUS": [13, 17],
-                        "KHOU": [14, 17],
-                        "KORD": [13, 16],
-                        "KDAL": [14, 17],
-                        "KBKF": [15, 17],
-                        "KLGA": [14, 17],
-                        "KLAX": [11, 15],
-                        "KSEA": [15, 17],
-                        "KSFO": [13, 16],
-                        "KMIA": [11, 16]
+                                               "KATL": [12, 14],
+                                               "KAUS": [12, 16],
+                                               "KHOU": [12, 16],
+                                               "KORD": [12, 16],
+                                               "KDAL": [12, 16],
+                                               "KBKF": [13, 16],
+                                               "KLGA": [12, 16],
+                                               "KLAX": [10, 14],
+                                               "KSEA": [13, 16],
+                                               "KSFO": [11, 15],
+                                               "KMIA": [10, 15]
                                            }
                                            ,"model_awc_metar_lookback_hours": 48
                                            ,"model_awc_observation_minute": 53

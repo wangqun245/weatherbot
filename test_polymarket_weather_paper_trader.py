@@ -33,17 +33,17 @@ class ClobPricingTest(unittest.TestCase):
         config = bot.default_config()
 
         expected = {
-            "KATL": (14, 17),
-            "KAUS": (14, 17),
-            "KHOU": (14, 17),
-            "KORD": (14, 17),
-            "KDAL": (15, 17),
-            "KBKF": (15, 17),
-            "KLGA": (14, 17),
-            "KLAX": (12, 16),
-            "KSEA": (14, 17),
-            "KSFO": (13, 16),
-            "KMIA": (12, 16),
+            "KATL": (12, 14),
+            "KAUS": (12, 16),
+            "KHOU": (12, 16),
+            "KORD": (12, 16),
+            "KDAL": (12, 16),
+            "KBKF": (13, 16),
+            "KLGA": (12, 16),
+            "KLAX": (10, 14),
+            "KSEA": (13, 16),
+            "KSFO": (11, 15),
+            "KMIA": (10, 15),
         }
         for station, hours in expected.items():
             self.assertEqual(hours, bot.model_awc_station_buy_hours(config, station))
@@ -59,20 +59,20 @@ class ClobPricingTest(unittest.TestCase):
     def test_production_model_awc_sizing_and_station_hours(self):
         config = bot.load_config("polymarket_weather_config.json")
         expected_hours = {
-            "KATL": (14, 17),
-            "KAUS": (13, 17),
-            "KHOU": (14, 17),
-            "KORD": (13, 16),
-            "KDAL": (14, 17),
-            "KBKF": (15, 17),
-            "KLGA": (14, 17),
-            "KLAX": (11, 15),
-            "KSEA": (15, 17),
-            "KSFO": (13, 16),
-            "KMIA": (11, 16),
+            "KATL": (12, 14),
+            "KAUS": (12, 16),
+            "KHOU": (12, 16),
+            "KORD": (12, 16),
+            "KDAL": (12, 16),
+            "KBKF": (13, 16),
+            "KLGA": (12, 16),
+            "KLAX": (10, 14),
+            "KSEA": (13, 16),
+            "KSFO": (11, 15),
+            "KMIA": (10, 15),
         }
 
-        self.assertEqual(10.0, float(config["trading"]["buy_notional_usdc"]))
+        self.assertEqual(20.0, float(config["trading"]["buy_notional_usdc"]))
         self.assertEqual(0.03, float(config["trading"]["model_awc_min_yes_price"]))
         self.assertEqual(0.03, float(config["trading"]["model_awc_min_no_price"]))
         self.assertTrue(config["trading"]["model_awc_classifier_enabled"])
@@ -87,6 +87,91 @@ class ClobPricingTest(unittest.TestCase):
                 for station in expected_hours
             },
         )
+
+    def test_telegram_notification_includes_model_details(self):
+        config = bot.default_config()
+        config["notifications"]["telegram_enabled"] = True
+        trade = bot.make_trade(
+            config,
+            "cycle-1",
+            self.market,
+            "",
+            "KAUS",
+            "YES",
+            0.42,
+            91.0,
+            None,
+            "test_reason",
+        )
+        trade.model_details = "\n".join(
+            [
+                "Regression: 92.31F -> 92F / 92-93F",
+                "Regression prob: 87.03%",
+                "Classifier: 92-93F prob 97.16%",
+                "Combined YES prob: 92.10%",
+                "Max YES buy cap: 92.10%",
+                "Cap room: 3.25%",
+            ]
+        )
+        messages = []
+        notifier = SimpleNamespace(send=lambda text: messages.append(text))
+
+        with mock.patch.object(bot, "get_telegram_notifier", return_value=notifier):
+            bot.notify_trade(config, trade, "BUY", "FILLED", "test_reason")
+
+        self.assertEqual(1, len(messages))
+        self.assertIn("Models:", messages[0])
+        self.assertIn("Regression: 92.31F", messages[0])
+        self.assertIn("Classifier: 92-93F prob 97.16%", messages[0])
+        self.assertIn("Max YES buy cap: 92.10%", messages[0])
+
+    def test_model_awc_regressor_interval_confidence_uses_predicted_minus_actual_error(self):
+        config = bot.default_config()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "calibration.csv"
+            path.write_text(
+                "\n".join(
+                    [
+                        "station,month,local_hour,rows,error_definition,error_mean_f,error_median_f,error_std_f,error_robust_sigma_f,mae_f,median_abs_error_f,within_1f_pct,within_2f_pct",
+                        "KAUS,7,15,100,predicted_minus_actual,0.0,0.0,1.0,1.0,0.8,0.6,70.0,95.0",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            config["trading"]["model_awc_regressor_calibration_enabled"] = True
+            config["trading"]["model_awc_regressor_calibration_path"] = str(path)
+            config["trading"]["model_awc_regressor_calibration_sigma_column"] = "error_robust_sigma_f"
+            bot.MODEL_AWC_REGRESSOR_CALIBRATION = {}
+            bot.MODEL_AWC_REGRESSOR_CALIBRATION_PATH = ""
+
+            market = bot.TemperatureMarket(
+                event_id="event-1",
+                market_id="market-1",
+                condition_id="condition-1",
+                city="Austin",
+                kind="Highest",
+                event_date="2026-07-09",
+                event_title="Highest temperature in Austin on July 9",
+                market_question="Will the highest temperature in Austin be between 92-93F on July 9?",
+                polymarket_url="https://polymarket.com/event/example",
+                yes_price=0.2,
+                rule_min=92.0,
+                rule_max=93.0,
+                unit="F",
+                raw_market_json="{}",
+            )
+
+            confidence = bot.model_awc_regressor_interval_confidence(
+                config, "KAUS", 7, 15, 92.16, market
+            )
+
+        expected = bot.normal_cdf(0.66) - bot.normal_cdf(-1.34)
+        self.assertTrue(confidence["available"])
+        self.assertAlmostEqual(expected, confidence["probability"], places=6)
+        self.assertAlmostEqual(91.5, confidence["interval_lower_f"])
+        self.assertAlmostEqual(93.5, confidence["interval_upper_f"])
+        self.assertAlmostEqual(-1.34, confidence["error_lower_f"])
+        self.assertAlmostEqual(0.66, confidence["error_upper_f"])
 
     def test_model_awc_prediction_cannot_be_below_observed_high(self):
         model = SimpleNamespace(
@@ -247,6 +332,8 @@ class ModelAwcLiveSingleIntervalTest(unittest.TestCase):
             reason,
             amount_usd=None,
             shares=None,
+            max_buy_price=None,
+            model_details=None,
         ):
             fake_live_trader.submissions.append({
                 "market_id": market.market_id,
@@ -391,6 +478,8 @@ class ModelAwcLiveSingleIntervalTest(unittest.TestCase):
             amount_usd=None,
             shares=None,
             notify_submitted=True,
+            max_buy_price=None,
+            model_details=None,
         ):
             submissions.append({
                 "price": entry_price,
@@ -459,6 +548,8 @@ class ModelAwcLiveSingleIntervalTest(unittest.TestCase):
             amount_usd=None,
             shares=None,
             notify_submitted=True,
+            max_buy_price=None,
+            model_details=None,
         ):
             submissions.append((entry_price, amount_usd, shares))
             return SimpleNamespace(
@@ -527,6 +618,8 @@ class ModelAwcLiveSingleIntervalTest(unittest.TestCase):
             amount_usd=None,
             shares=None,
             notify_submitted=True,
+            max_buy_price=None,
+            model_details=None,
         ):
             order_id = f"order-{len(submissions) + 1}"
             submissions.append((entry_price, amount_usd, shares))
@@ -853,6 +946,89 @@ class ModelAwcRoundedPredictionMarketTest(unittest.TestCase):
         self.assertAlmostEqual(0.53, choice["probability"])
         self.assertEqual((96, 97), choice["temperatures_f"])
 
+    def test_model_awc_market_candidate_requires_observation_cap_for_yes(self):
+        config = bot.default_config()
+        market = self._market("market-96-97", 96, 97)
+        combined = {
+            market.market_id: {
+                "combined_yes_probability": 0.60,
+            }
+        }
+
+        with mock.patch.object(bot, "best_buy_price", return_value=0.58):
+            candidate = bot.model_awc_market_candidate(
+                config,
+                market,
+                96.2,
+                "F",
+                market.market_id,
+                combined,
+                0.60,
+            )
+        self.assertIsNotNone(candidate)
+        self.assertEqual("YES", candidate["side"])
+        self.assertAlmostEqual(0.60, candidate["fair_price"])
+        self.assertGreater(candidate["edge"], 0.0)
+
+        with mock.patch.object(bot, "best_buy_price", return_value=0.61):
+            candidate = bot.model_awc_market_candidate(
+                config,
+                market,
+                96.2,
+                "F",
+                market.market_id,
+                combined,
+                0.60,
+            )
+        self.assertIsNone(candidate)
+
+    def test_model_awc_market_candidate_uses_executable_rounded_price_for_edge(self):
+        config = bot.default_config()
+        market = self._market("market-96-97", 96, 97)
+        combined = {
+            market.market_id: {
+                "combined_yes_probability": 0.9991,
+            }
+        }
+
+        with mock.patch.object(bot, "best_buy_price", return_value=0.999):
+            candidate = bot.model_awc_market_candidate(
+                config,
+                market,
+                96.2,
+                "F",
+                market.market_id,
+                combined,
+            )
+
+        self.assertIsNone(candidate)
+
+    def test_model_awc_market_candidate_prices_no_from_inverse_combined_yes_probability(self):
+        config = bot.default_config()
+        selected_market = self._market("market-96-97", 96, 97)
+        no_market = self._market("market-94-95", 94, 95)
+        combined = {
+            no_market.market_id: {
+                "combined_yes_probability": 0.20,
+            }
+        }
+
+        with mock.patch.object(bot, "best_buy_price", return_value=0.70):
+            candidate = bot.model_awc_market_candidate(
+                config,
+                no_market,
+                96.2,
+                "F",
+                selected_market.market_id,
+                combined,
+                0.80,
+            )
+
+        self.assertIsNotNone(candidate)
+        self.assertEqual("NO", candidate["side"])
+        self.assertAlmostEqual(0.80, candidate["fair_price"])
+        self.assertGreater(candidate["edge"], 0.0)
+
     def test_classifier_disagreement_blocks_single_interval_buy(self):
         config = bot.default_config()
         config["trading"]["live_trading_enabled"] = True
@@ -978,6 +1154,7 @@ class ModelAwcLiveAdjacentSelectionTest(unittest.TestCase):
             reason,
             amount_usd=None,
             shares=None,
+            model_details=None,
         ):
             fake_live_trader.submissions.append({
                 "market_id": market.market_id,

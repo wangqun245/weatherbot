@@ -94,6 +94,8 @@ MODEL_AWC_MODEL_PATH: str = ""
 MODEL_AWC_CLASSIFIER: Any = None
 MODEL_AWC_CLASSIFIER_PATH: str = ""
 MODEL_AWC_CLASSIFIER_CLASSES: tuple[int, ...] = ()
+MODEL_AWC_REGRESSOR_CALIBRATION: dict[tuple[str, int, int], dict[str, float]] = {}
+MODEL_AWC_REGRESSOR_CALIBRATION_PATH: str = ""
 HTTP_EXECUTOR = concurrent.futures.ThreadPoolExecutor(max_workers=8, thread_name_prefix="weather-http")
 TGFTP_EXECUTOR = concurrent.futures.ThreadPoolExecutor(max_workers=32, thread_name_prefix="tgftp-http")
 CLOB_POLL_EXECUTOR = concurrent.futures.ThreadPoolExecutor(max_workers=32, thread_name_prefix="clob-poll")
@@ -243,6 +245,7 @@ class PaperTrade:
     live_sell_order_id: str = ""
     live_order_status: str = ""
     live_order_error: str = ""
+    model_details: str = ""
 
 
 @dataclass
@@ -303,6 +306,8 @@ class ModelAwcHourlyBatch:
     next_action_ts: float = 0.0
     closed: bool = False
     open_order_cost_usd: dict[str, float] = field(default_factory=dict)
+    max_buy_prices: dict[str, float] = field(default_factory=dict)
+    model_details: str = ""
 
 
 def deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
@@ -389,24 +394,34 @@ def default_config() -> dict[str, Any]:
         "model_awc_classifier_model_path": "models/polymarket_rounded_high_classifier_lag10_prevday_hour10_18_light_excl2026_gpu_20260707/lightgbm_polymarket_rounded_high_classifier.pkl",
         "model_awc_classifier_metadata_path": "models/polymarket_rounded_high_classifier_lag10_prevday_hour10_18_light_excl2026_gpu_20260707/classifier_metadata.json",
         "model_awc_classifier_min_interval_probability": 0.01,
+        "model_awc_regressor_calibration_enabled": True,
+        "model_awc_regressor_calibration_path": "models/lightgbm_rolling_6y_holdout_24h_lag10_speci_context_regular_prevday_20260630/regressor_error_calibration_station_month_hour.csv",
+        "model_awc_regressor_calibration_sigma_column": "error_robust_sigma_f",
+        "model_awc_classifier_probability_weight": 0.5,
+        "model_awc_regressor_probability_weight": 0.5,
+        "model_awc_agree_min_regressor_confidence": 0.60,
+        "model_awc_agree_min_classifier_probability": 0.70,
+        "model_awc_disagree_takeover_min_probability": 0.80,
+        "model_awc_disagree_takeover_min_gap": 0.30,
+        "model_awc_observation_window_max_buy_prices": [0.60, 0.70, 0.80],
         "model_awc_live_stations": [
             "KATL", "KAUS", "KDAL", "KBKF", "KHOU", "KLAX",
             "KLGA", "KMIA", "KORD", "KSEA", "KSFO",
         ],
-        "model_awc_buy_start_hour": 12,
-        "model_awc_buy_end_hour": 17,
+        "model_awc_buy_start_hour": 10,
+        "model_awc_buy_end_hour": 16,
         "model_awc_station_buy_hours": {
-            "KATL": [14, 17],
-            "KAUS": [14, 17],
-            "KHOU": [14, 17],
-            "KORD": [14, 17],
-            "KDAL": [15, 17],
-            "KBKF": [15, 17],
-            "KLGA": [14, 17],
-            "KLAX": [12, 16],
-            "KSEA": [14, 17],
-            "KSFO": [13, 16],
-            "KMIA": [12, 16],
+            "KATL": [12, 14],
+            "KAUS": [12, 16],
+            "KHOU": [12, 16],
+            "KORD": [12, 16],
+            "KDAL": [12, 16],
+            "KBKF": [13, 16],
+            "KLGA": [12, 16],
+            "KLAX": [10, 14],
+            "KSEA": [13, 16],
+            "KSFO": [11, 15],
+            "KMIA": [10, 15],
         },
         "model_awc_metar_lookback_hours": 48,
         "model_awc_observation_minute": 53,
@@ -2539,6 +2554,50 @@ def configured_model_awc_min_side_price(config: dict[str, Any], side: str) -> fl
     )
 
 
+def configured_model_awc_probability_threshold(
+    config: dict[str, Any],
+    key: str,
+    default: float,
+) -> float:
+    raw = config.get("trading", {}).get(key, default)
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return default
+    if value < 0 or value > 1:
+        return default
+    return value
+
+
+def model_awc_observation_window_max_buy_price(
+    config: dict[str, Any],
+    station: str,
+    local_hour: int,
+) -> float:
+    """Return the max buy price for this station's first/second/third+ observation."""
+    trading = config.get("trading", {})
+    raw_prices = trading.get(
+        "model_awc_observation_window_max_buy_prices",
+        [0.60, 0.70, 0.80],
+    )
+    if isinstance(raw_prices, (list, tuple)) and raw_prices:
+        prices = []
+        for raw in raw_prices:
+            try:
+                value = float(raw)
+            except (TypeError, ValueError):
+                continue
+            if 0 < value < 1:
+                prices.append(value)
+    else:
+        prices = []
+    if not prices:
+        prices = [0.60, 0.70, 0.80]
+    start_hour, _end_hour = model_awc_station_buy_hours(config, station)
+    index = max(0, int(local_hour) - int(start_hour))
+    return prices[min(index, len(prices) - 1)]
+
+
 def model_awc_load_model(config: dict[str, Any]) -> Any:
     """Load and cache the latest trained LightGBM model."""
     global MODEL_AWC_MODEL, MODEL_AWC_MODEL_PATH
@@ -2604,6 +2663,249 @@ def model_awc_load_classifier(config: dict[str, Any]) -> tuple[Any, tuple[int, .
     return MODEL_AWC_CLASSIFIER, MODEL_AWC_CLASSIFIER_CLASSES
 
 
+def model_awc_regressor_calibration_enabled(config: dict[str, Any]) -> bool:
+    return bool(config.get("trading", {}).get("model_awc_regressor_calibration_enabled", False))
+
+
+def model_awc_load_regressor_calibration(config: dict[str, Any]) -> dict[tuple[str, int, int], dict[str, float]]:
+    """Load station/month/hour residual calibration for the regression model."""
+    global MODEL_AWC_REGRESSOR_CALIBRATION, MODEL_AWC_REGRESSOR_CALIBRATION_PATH
+    if not model_awc_regressor_calibration_enabled(config):
+        return {}
+    path = str(config.get("trading", {}).get("model_awc_regressor_calibration_path") or "").strip()
+    if not path:
+        raise RuntimeError("trading.model_awc_regressor_calibration_path is required when calibration is enabled")
+    if os.sep == "/" and "\\" in path:
+        path = path.replace("\\", "/")
+    abs_path = os.path.abspath(path)
+    sigma_column = str(
+        config.get("trading", {}).get(
+            "model_awc_regressor_calibration_sigma_column",
+            "error_robust_sigma_f",
+        )
+    )
+    cache_key = f"{abs_path}|{sigma_column}"
+    if MODEL_AWC_REGRESSOR_CALIBRATION_PATH == cache_key and MODEL_AWC_REGRESSOR_CALIBRATION:
+        return MODEL_AWC_REGRESSOR_CALIBRATION
+    calibration: dict[tuple[str, int, int], dict[str, float]] = {}
+    with open(abs_path, "r", encoding="utf-8", newline="") as handle:
+        reader = csv.DictReader(handle)
+        required = {"station", "month", "local_hour", "rows", "error_mean_f", sigma_column}
+        missing = required.difference(reader.fieldnames or [])
+        if missing:
+            raise RuntimeError(f"regressor calibration missing columns {sorted(missing)}: {abs_path}")
+        for row in reader:
+            station = str(row["station"]).upper()
+            month = int(float(row["month"]))
+            local_hour = int(float(row["local_hour"]))
+            sigma = float(row.get(sigma_column) or 0.0)
+            if sigma <= 0:
+                sigma = float(row.get("error_std_f") or 0.0)
+            calibration[(station, month, local_hour)] = {
+                "rows": float(row["rows"]),
+                "error_mean_f": float(row["error_mean_f"]),
+                "error_median_f": float(row.get("error_median_f") or row["error_mean_f"]),
+                "error_std_f": float(row.get("error_std_f") or sigma),
+                "error_sigma_f": sigma,
+                "mae_f": float(row.get("mae_f") or 0.0),
+                "median_abs_error_f": float(row.get("median_abs_error_f") or 0.0),
+                "within_1f_pct": float(row.get("within_1f_pct") or 0.0),
+                "within_2f_pct": float(row.get("within_2f_pct") or 0.0),
+            }
+    MODEL_AWC_REGRESSOR_CALIBRATION = calibration
+    MODEL_AWC_REGRESSOR_CALIBRATION_PATH = cache_key
+    rows_values = [value["rows"] for value in calibration.values()]
+    LOGGER.info(
+        "model awc regressor calibration loaded path=%s groups=%s sigma_column=%s min_rows=%s max_rows=%s",
+        abs_path,
+        len(calibration),
+        sigma_column,
+        None if not rows_values else int(min(rows_values)),
+        None if not rows_values else int(max(rows_values)),
+    )
+    return MODEL_AWC_REGRESSOR_CALIBRATION
+
+
+def normal_cdf(value: float) -> float:
+    if math.isinf(value):
+        return 0.0 if value < 0 else 1.0
+    return 0.5 * (1.0 + math.erf(value / math.sqrt(2.0)))
+
+
+def model_awc_market_rounding_bounds_f(market: TemperatureMarket) -> tuple[float, float]:
+    """Return continuous Fahrenheit bounds implied by rounded Polymarket integers."""
+    lo = convert_temperature(market.rule_min, market.unit, "F")
+    hi = convert_temperature(market.rule_max, market.unit, "F")
+    lower = -math.inf if lo is None else float(lo) - 0.5
+    upper = math.inf if hi is None else float(hi) + 0.5
+    return lower, upper
+
+
+def model_awc_regressor_interval_confidence(
+    config: dict[str, Any],
+    station: str,
+    local_month: int,
+    local_hour: int,
+    predicted_high_f: float,
+    market: TemperatureMarket,
+) -> Optional[dict[str, Any]]:
+    """Return calibrated regression probability for the selected market interval."""
+    if not model_awc_regressor_calibration_enabled(config):
+        return None
+    calibration = model_awc_load_regressor_calibration(config)
+    key = (station.upper(), int(local_month), int(local_hour))
+    params = calibration.get(key)
+    if not params:
+        return {
+            "key": key,
+            "available": False,
+            "probability": None,
+        }
+    sigma = float(params.get("error_sigma_f") or 0.0)
+    if sigma <= 0:
+        return {
+            "key": key,
+            "available": False,
+            "probability": None,
+            "rows": params.get("rows"),
+            "error_mean_f": params.get("error_mean_f"),
+            "error_sigma_f": sigma,
+        }
+    error_mean = float(params.get("error_mean_f") or 0.0)
+    lower_f, upper_f = model_awc_market_rounding_bounds_f(market)
+    # Calibration error is predicted - actual. A market hit means the error is
+    # between predicted - upper_bound and predicted - lower_bound.
+    error_lower = -math.inf if math.isinf(upper_f) else float(predicted_high_f) - upper_f
+    error_upper = math.inf if math.isinf(lower_f) else float(predicted_high_f) - lower_f
+    probability = normal_cdf((error_upper - error_mean) / sigma) - normal_cdf(
+        (error_lower - error_mean) / sigma
+    )
+    probability = max(0.0, min(1.0, probability))
+    return {
+        "key": key,
+        "available": True,
+        "probability": probability,
+        "rows": int(params.get("rows") or 0),
+        "error_mean_f": error_mean,
+        "error_sigma_f": sigma,
+        "error_std_f": float(params.get("error_std_f") or 0.0),
+        "mae_f": float(params.get("mae_f") or 0.0),
+        "interval_lower_f": lower_f,
+        "interval_upper_f": upper_f,
+        "error_lower_f": error_lower,
+        "error_upper_f": error_upper,
+    }
+
+
+def model_awc_probability_weights(config: dict[str, Any]) -> tuple[float, float]:
+    trading = config.get("trading", {})
+    classifier_weight = float(trading.get("model_awc_classifier_probability_weight", 0.5))
+    regressor_weight = float(trading.get("model_awc_regressor_probability_weight", 0.5))
+    total = classifier_weight + regressor_weight
+    if total <= 0:
+        return 0.5, 0.5
+    return classifier_weight / total, regressor_weight / total
+
+
+def model_awc_combined_yes_probability(
+    config: dict[str, Any],
+    classifier_probability: Optional[float],
+    regressor_probability: Optional[float],
+) -> Optional[float]:
+    if classifier_probability is None or regressor_probability is None:
+        return None
+    classifier_weight, regressor_weight = model_awc_probability_weights(config)
+    probability = (
+        classifier_weight * float(classifier_probability)
+        + regressor_weight * float(regressor_probability)
+    )
+    return max(0.0, min(1.0, probability))
+
+
+def model_awc_fee_adjusted_edge(
+    config: dict[str, Any],
+    fair_probability: float,
+    price: float,
+) -> float:
+    fee_rate = float(config.get("trading", {}).get("fee_rate", 0.0))
+    fee_enabled = bool(config.get("trading", {}).get("fee_enabled", True))
+    fee_per_share = taker_fee_usdc(1.0, float(price), fee_rate, fee_enabled)
+    return float(fair_probability) - float(price) - fee_per_share
+
+
+def model_awc_dynamic_side_price(
+    config: dict[str, Any],
+    combined_yes_probability: Optional[float],
+    side: str,
+) -> Optional[float]:
+    if combined_yes_probability is None:
+        return None
+    yes_probability = max(0.0, min(1.0, float(combined_yes_probability)))
+    return yes_probability if side.strip().upper() == "YES" else 1.0 - yes_probability
+
+
+def model_awc_dynamic_price_allows_buy(
+    config: dict[str, Any],
+    fair_probability: Optional[float],
+    price: float,
+) -> tuple[bool, Optional[float]]:
+    if fair_probability is None:
+        return False, None
+    fair = max(0.0, min(1.0, float(fair_probability)))
+    edge = model_awc_fee_adjusted_edge(config, fair, float(price))
+    return float(price) < fair and edge > 0.0, edge
+
+
+def model_awc_market_label(market: TemperatureMarket) -> str:
+    if market.rule_min is None and market.rule_max is None:
+        return market.market_id
+    if market.rule_min is None:
+        return f"<={market.rule_max:g}{market.unit}"
+    if market.rule_max is None:
+        return f">={market.rule_min:g}{market.unit}"
+    return f"{market.rule_min:g}-{market.rule_max:g}{market.unit}"
+
+
+def model_awc_probability_pct(value: Any) -> str:
+    try:
+        if value is None:
+            return "n/a"
+        return f"{float(value) * 100.0:.2f}%"
+    except Exception:
+        return "n/a"
+
+
+def model_awc_build_trade_model_details(
+    *,
+    predicted_high_f: float,
+    rounded_prediction_f: Optional[int],
+    regression_market: TemperatureMarket,
+    classifier_market: Optional[TemperatureMarket],
+    classifier_probability: Optional[float],
+    regressor_probability: Optional[float],
+    selected_market: TemperatureMarket,
+    selected_side: str,
+    selected_price: float,
+    fair_price: Optional[float],
+    edge: Optional[float],
+    combined_yes_probability: Optional[float],
+) -> str:
+    classifier_label = model_awc_market_label(classifier_market) if classifier_market else "n/a"
+    regression_label = model_awc_market_label(regression_market)
+    selected_label = model_awc_market_label(selected_market)
+    return "\n".join(
+        [
+            f"Regression: {predicted_high_f:.2f}F -> {rounded_prediction_f}F / {regression_label}",
+            f"Regression prob: {model_awc_probability_pct(regressor_probability)}",
+            f"Classifier: {classifier_label} prob {model_awc_probability_pct(classifier_probability)}",
+            f"Selected: {selected_side.upper()} {selected_label} @ ${selected_price:.4f}",
+            f"Combined YES prob: {model_awc_probability_pct(combined_yes_probability)}",
+            f"Max {selected_side.upper()} buy cap: {model_awc_probability_pct(fair_price)}",
+            f"Cap room: {model_awc_probability_pct(edge)}",
+        ]
+    )
+
+
 def model_awc_preload_models(config: dict[str, Any], reason: str = "startup") -> None:
     """Load model-AWC models at startup and validate their feature compatibility."""
     rss_before = current_process_rss_mb()
@@ -2615,12 +2917,16 @@ def model_awc_preload_models(config: dict[str, Any], reason: str = "startup") ->
     )
     model = model_awc_load_model(config)
     model_features = [str(name) for name in getattr(model, "feature_name_", [])]
+    calibration_groups = 0
+    if model_awc_regressor_calibration_enabled(config):
+        calibration_groups = len(model_awc_load_regressor_calibration(config))
     if not model_awc_classifier_enabled(config):
         rss_after_regression = current_process_rss_mb()
         LOGGER.info(
-            "model awc preload completed reason=%s classifier disabled regression_features=%s rss_mb=%s rss_delta_mb=%s",
+            "model awc preload completed reason=%s classifier disabled regression_features=%s calibration_groups=%s rss_mb=%s rss_delta_mb=%s",
             reason,
             len(model_features),
+            calibration_groups,
             None if rss_after_regression is None else round(rss_after_regression, 1),
             None if rss_before is None or rss_after_regression is None else round(rss_after_regression - rss_before, 1),
         )
@@ -2635,13 +2941,14 @@ def model_awc_preload_models(config: dict[str, Any], reason: str = "startup") ->
     rss_after = current_process_rss_mb()
     LOGGER.info(
         "model awc preload completed reason=%s regression_features=%s classifier_features=%s "
-        "classifier_classes=%s classifier_range=%s..%s rss_mb=%s rss_delta_mb=%s",
+        "classifier_classes=%s classifier_range=%s..%s calibration_groups=%s rss_mb=%s rss_delta_mb=%s",
         reason,
         len(model_features),
         len(classifier_features),
         len(classes),
         classes[0],
         classes[-1],
+        calibration_groups,
         None if rss_after is None else round(rss_after, 1),
         None if rss_before is None or rss_after is None else round(rss_after - rss_before, 1),
     )
@@ -3060,6 +3367,8 @@ def model_awc_market_candidate(
     predicted_high_f: float,
     event_unit: str,
     predicted_yes_market_id: str,
+    combined_yes_probabilities: Optional[dict[str, dict[str, Any]]] = None,
+    max_buy_price: Optional[float] = None,
 ) -> Optional[dict[str, Any]]:
     """Return the YES/NO side and executable price implied by one market range."""
     predicted = convert_temperature(predicted_high_f, "F", event_unit)
@@ -3069,10 +3378,34 @@ def model_awc_market_candidate(
     price = best_buy_price(config, market, side)
     if price is None or price <= 0:
         return None
+    executable_price = round(float(price), 2)
     min_side_price = configured_model_awc_min_side_price(config, side)
-    if float(price) < min_side_price:
+    if executable_price < min_side_price:
         return None
-    return {"market": market, "side": side, "price": float(price)}
+    combined_yes = None
+    if combined_yes_probabilities is not None:
+        combined_yes = combined_yes_probabilities.get(market.market_id, {}).get("combined_yes_probability")
+    cap_price = float(max_buy_price) if max_buy_price is not None else configured_max_buy_price(config)
+    if executable_price > cap_price:
+        LOGGER.info(
+            "model awc skip candidate above observation cap market=%s side=%s price=%.4f "
+            "max_buy_price=%.4f combined_yes_probability=%s",
+            market.market_id,
+            side,
+            executable_price,
+            cap_price,
+            None if combined_yes is None else round(float(combined_yes), 6),
+        )
+        return None
+    edge = cap_price - executable_price
+    return {
+        "market": market,
+        "side": side,
+        "price": executable_price,
+        "fair_price": cap_price,
+        "edge": edge,
+        "combined_yes_probability": combined_yes,
+    }
 
 
 def model_awc_predicted_yes_market(
@@ -3195,6 +3528,33 @@ def model_awc_classifier_interval_choice(
     selected["active_candidates"] = candidates
     selected["max_temperature_probability"] = metadata["max_probability"]
     return selected
+
+
+def model_awc_classifier_interval_probabilities(
+    config: dict[str, Any],
+    markets: list[TemperatureMarket],
+    features: dict[str, Any],
+    event_unit: str,
+) -> dict[str, dict[str, Any]]:
+    temp_probabilities, _metadata = model_awc_classifier_temperature_probabilities(
+        config, features
+    )
+    probabilities: dict[str, dict[str, Any]] = {}
+    for market in markets:
+        interval_probability = 0.0
+        included_temperatures: list[int] = []
+        for temp_f, probability in temp_probabilities.items():
+            temp_for_event = convert_temperature(float(temp_f), "F", event_unit)
+            if temp_for_event is None:
+                continue
+            if market_contains_temperature(market, float(temp_for_event), event_unit):
+                interval_probability += float(probability)
+                included_temperatures.append(int(temp_f))
+        probabilities[market.market_id] = {
+            "probability": max(0.0, min(1.0, interval_probability)),
+            "temperatures_f": tuple(sorted(included_temperatures)),
+        }
+    return probabilities
 
 
 def model_awc_classifier_candidate_log_items(
@@ -3362,6 +3722,10 @@ def process_model_awc_prediction(
         return None
     event_unit = event_market_unit(markets)
     live_trader = get_live_trader() if live_trading_enabled(config) and station.upper() in model_awc_live_stations(config) else None
+    combined_yes_probabilities: dict[str, dict[str, Any]] = {}
+    observation_max_buy_price = model_awc_observation_window_max_buy_price(
+        config, station, local_hour
+    )
 
     def submit_model_awc_trade(
         market: TemperatureMarket,
@@ -3370,6 +3734,8 @@ def process_model_awc_prediction(
         reason: str,
         amount_usd: Optional[float] = None,
         shares: Optional[float] = None,
+        max_buy_price: Optional[float] = None,
+        model_details: str = "",
     ) -> Optional[PaperTrade]:
         cycle_id = (
             f"{datetime.now().strftime('%Y%m%dT%H%M%S')}:model_awc_high:{city}:{station}:{event_date}:"
@@ -3378,12 +3744,29 @@ def process_model_awc_prediction(
         if duplicate_minute is not None:
             cycle_id += f"_minute_{local_minute:02d}"
         trade = (
-            live_trader.submit_buy_trade(config, cycle_id, market, "", station, side, price, predicted_high_f, None, reason, amount_usd=amount_usd, shares=shares)
+            live_trader.submit_buy_trade(
+                config,
+                cycle_id,
+                market,
+                "",
+                station,
+                side,
+                price,
+                predicted_high_f,
+                None,
+                reason,
+                amount_usd=amount_usd,
+                shares=shares,
+                max_buy_price=max_buy_price,
+                model_details=model_details,
+            )
             if live_trader
             else make_trade(config, cycle_id, market, "", station, side, price, predicted_high_f, None, reason, notional_usdc=amount_usd, shares_override=shares)
         )
         if not trade:
             return None
+        if model_details:
+            trade.model_details = model_details
         trade.forecast_source = f"model_awc_high_lightgbm:{MODEL_AWC_MODEL_PATH or config['trading'].get('model_awc_model_path', '')}"
         trade.forecast_observed_at = latest_row.valid_utc.astimezone(timezone.utc).isoformat(timespec="seconds")
         trade.forecast_first_valid_time_local = latest_local.isoformat(timespec="seconds")
@@ -3416,36 +3799,54 @@ def process_model_awc_prediction(
         market: TemperatureMarket,
         side: str,
         reason: str,
+        max_buy_price: Optional[float] = None,
+        model_details: str = "",
+        managed_markets: Optional[tuple[TemperatureMarket, ...]] = None,
+        managed_sides: Optional[tuple[str, ...]] = None,
     ) -> Optional[PaperTrade]:
         if not live_trader:
             return None
         target_notional = float(config["trading"].get("buy_notional_usdc", 10.0))
+        batch_markets = managed_markets or (market,)
+        batch_sides = managed_sides or (side,)
+        max_buy_prices = {}
+        if max_buy_price is not None:
+            for batch_market, batch_side in zip(batch_markets, batch_sides):
+                token_id = asset_id_for_market_side(batch_market, batch_side)
+                if token_id:
+                    max_buy_prices[token_id] = float(max_buy_price)
         batch_id = live_trader.start_model_awc_hourly_batch(
             city,
             station,
             event_date,
             local_hour,
-            (market,),
-            (side,),
+            tuple(batch_markets),
+            tuple(batch_sides),
             0.0,
             predicted_high_f,
             "single",
             target_notional_usd=target_notional,
             local_minute=local_minute,
+            max_buy_prices=max_buy_prices or None,
+            model_details=model_details,
         )
         LOGGER.info(
             "model awc single interval delegated to notional websocket manager "
-            "batch=%s market=%s target_notional_usd=%.2f reason=%s",
+            "batch=%s markets=%s sides=%s target_notional_usd=%.2f max_buy_price=%s reason=%s model_details=%r",
             batch_id,
-            market.market_id,
+            [item.market_id for item in batch_markets],
+            list(batch_sides),
             target_notional,
+            None if max_buy_price is None else round(float(max_buy_price), 6),
             reason,
+            model_details,
         )
         return None
 
     def process_single_interval(
         predicted_market: TemperatureMarket,
         reason: str,
+        signal_source: str = "agreement",
     ) -> Optional[PaperTrade]:
         yes_price = best_buy_price(config, predicted_market, "YES")
         min_yes_price = configured_model_awc_min_yes_price(config)
@@ -3465,28 +3866,64 @@ def process_model_awc_prediction(
             )
             return None
 
+        side_candidates: list[tuple[TemperatureMarket, str]] = [
+            (market, "YES" if market.market_id == predicted_market.market_id else "NO")
+            for market in markets
+        ]
         candidates = []
-        for market in markets:
+        for market, _side in side_candidates:
             candidate = model_awc_market_candidate(
                 config,
                 market,
                 predicted_high_f,
                 event_unit,
                 predicted_market.market_id,
+                combined_yes_probabilities,
+                observation_max_buy_price,
             )
             if candidate:
                 candidates.append(candidate)
         if not candidates:
+            selected_prob = combined_yes_probabilities.get(
+                predicted_market.market_id, {}
+            ).get("combined_yes_probability")
+            selected_fair_price = model_awc_dynamic_side_price(
+                config, selected_prob, "YES"
+            )
+            selected_model_details = model_awc_build_trade_model_details(
+                predicted_high_f=predicted_high_f,
+                rounded_prediction_f=rounded_prediction_f,
+                regression_market=predicted_yes_market,
+                classifier_market=classifier_market if model_awc_classifier_enabled(config) else None,
+                classifier_probability=classifier_probability,
+                regressor_probability=None if not regressor_confidence else regressor_confidence.get("probability"),
+                selected_market=predicted_market,
+                selected_side="YES",
+                selected_price=0.0,
+                fair_price=observation_max_buy_price,
+                edge=None,
+                combined_yes_probability=selected_prob,
+            )
             partial_trade = start_single_notional_manager(
-                predicted_market, "YES", "insufficient_current_depth"
+                predicted_market,
+                "YES",
+                "insufficient_current_depth_or_price_above_observation_cap",
+                max_buy_price=observation_max_buy_price,
+                model_details=selected_model_details,
+                managed_markets=tuple(market for market, _side in side_candidates),
+                managed_sides=tuple(side for _market, side in side_candidates),
             )
             LOGGER.info(
                 "model awc skip no priced single candidates city=%s station=%s "
-                "predicted_high_f=%r market=%s",
+                "predicted_high_f=%r market=%s observation_max_buy_price=%.4f "
+                "combined_yes_probability=%s signal_source=%s",
                 city,
                 station,
                 predicted_high_f,
                 predicted_market.market_id,
+                observation_max_buy_price,
+                None if selected_prob is None else round(float(selected_prob), 6),
+                signal_source,
             )
             return partial_trade
 
@@ -3501,15 +3938,66 @@ def process_model_awc_prediction(
         market = selected["market"]
         side = str(selected["side"])
         price = round(float(selected["price"]), 2)
-        if price > configured_max_buy_price(config):
-            return start_single_notional_manager(
-                market, side, "current_price_above_configured_max"
+        fair_price = selected.get("fair_price")
+        edge = selected.get("edge")
+        selected_probability_info = combined_yes_probabilities.get(market.market_id, {})
+        ordered_pairs = [(market, side)] + [
+            (candidate_market, candidate_side)
+            for candidate_market, candidate_side in side_candidates
+            if not (
+                candidate_market.market_id == market.market_id
+                and candidate_side.upper() == side.upper()
             )
+        ]
+        model_details = model_awc_build_trade_model_details(
+            predicted_high_f=predicted_high_f,
+            rounded_prediction_f=rounded_prediction_f,
+            regression_market=predicted_yes_market,
+            classifier_market=classifier_market if model_awc_classifier_enabled(config) else None,
+            classifier_probability=classifier_probability,
+            regressor_probability=None if not regressor_confidence else regressor_confidence.get("probability"),
+            selected_market=market,
+            selected_side=side,
+            selected_price=price,
+            fair_price=fair_price,
+            edge=edge,
+            combined_yes_probability=selected_probability_info.get("combined_yes_probability"),
+        )
+        LOGGER.info(
+            "model awc selected observation-cap candidate city=%s station=%s event_date=%s "
+            "local_hour=%s market=%s side=%s price=%.4f fair_price=%s "
+            "edge=%s combined_yes_probability=%s observation_max_buy_price=%.4f signal_source=%s",
+            city,
+            station,
+            event_date,
+            local_hour,
+            market.market_id,
+            side,
+            price,
+            None if fair_price is None else round(float(fair_price), 6),
+            None if edge is None else round(float(edge), 6),
+            None if selected.get("combined_yes_probability") is None else round(float(selected["combined_yes_probability"]), 6),
+            observation_max_buy_price,
+            signal_source,
+        )
         if live_trader:
             return start_single_notional_manager(
-                market, side, "single_interval_managed"
+                market,
+                side,
+                "single_interval_managed",
+                max_buy_price=observation_max_buy_price,
+                model_details=model_details,
+                managed_markets=tuple(item[0] for item in ordered_pairs),
+                managed_sides=tuple(item[1] for item in ordered_pairs),
             )
-        return submit_model_awc_trade(market, side, price, reason)
+        return submit_model_awc_trade(
+            market,
+            side,
+            price,
+            reason,
+            max_buy_price=observation_max_buy_price,
+            model_details=model_details,
+        )
 
     predicted_yes_market, rounded_prediction_f = model_awc_rounded_prediction_market(
         markets, predicted_high_f, event_unit
@@ -3518,14 +4006,29 @@ def process_model_awc_prediction(
         if duplicate_window:
             LOGGER.info("model awc skip duplicate city=%s station=%s event_date=%s local_hour=%s", city, station, event_date, local_hour)
             return None
+        regressor_confidence = model_awc_regressor_interval_confidence(
+            config,
+            station,
+            int(latest_local.month),
+            local_hour,
+            predicted_high_f,
+            predicted_yes_market,
+        )
+        regressor_probability = (
+            None
+            if not regressor_confidence
+            else regressor_confidence.get("probability")
+        )
         classifier_probability: Optional[float] = None
+        classifier_market: Optional[TemperatureMarket] = None
         classifier_temperatures: tuple[int, ...] = ()
         classifier_active_candidates: list[tuple[str, float, tuple[int, ...]]] = []
         if model_awc_classifier_enabled(config):
             if features is None:
                 LOGGER.info(
                     "model awc skip classifier enabled without feature row city=%s station=%s "
-                    "event_date=%s local_hour=%s predicted_high_f=%r rounded_high_f=%s market=%s",
+                    "event_date=%s local_hour=%s predicted_high_f=%r rounded_high_f=%s market=%s "
+                    "regressor_confidence=%s regressor_calibration=%s",
                     city,
                     station,
                     event_date,
@@ -3533,16 +4036,47 @@ def process_model_awc_prediction(
                     predicted_high_f,
                     rounded_prediction_f,
                     predicted_yes_market.market_id,
+                    regressor_probability,
+                    regressor_confidence,
                 )
                 return None
-            classifier_choice = model_awc_classifier_interval_choice(
+            classifier_interval_probabilities = model_awc_classifier_interval_probabilities(
                 config, markets, features, event_unit
+            )
+            min_classifier_probability = model_awc_classifier_min_interval_probability(config)
+            active_classifier_candidates: list[dict[str, Any]] = []
+            for market in markets:
+                probability_info = classifier_interval_probabilities.get(market.market_id, {})
+                probability = float(probability_info.get("probability") or 0.0)
+                if probability < min_classifier_probability:
+                    continue
+                active_classifier_candidates.append(
+                    {
+                        "market": market,
+                        "probability": probability,
+                        "temperatures_f": tuple(probability_info.get("temperatures_f") or ()),
+                    }
+                )
+            active_classifier_candidates.sort(
+                key=lambda item: (
+                    -float(item["probability"]),
+                    str(item["market"].market_id),
+                )
+            )
+            classifier_choice = (
+                {
+                    **active_classifier_candidates[0],
+                    "active_candidates": active_classifier_candidates,
+                }
+                if active_classifier_candidates
+                else None
             )
             if classifier_choice is None:
                 LOGGER.info(
                     "model awc skip classifier no active interval city=%s station=%s "
                     "event_date=%s local_hour=%s predicted_high_f=%r rounded_high_f=%s "
-                    "regression_market=%s min_interval_probability=%.4f",
+                    "regression_market=%s min_interval_probability=%.4f "
+                    "regressor_confidence=%s regressor_calibration=%s",
                     city,
                     station,
                     event_date,
@@ -3550,21 +4084,163 @@ def process_model_awc_prediction(
                     predicted_high_f,
                     rounded_prediction_f,
                     predicted_yes_market.market_id,
-                    model_awc_classifier_min_interval_probability(config),
+                    min_classifier_probability,
+                    regressor_probability,
+                    regressor_confidence,
                 )
                 return None
+            for market in markets:
+                classifier_info = classifier_interval_probabilities.get(market.market_id, {})
+                market_regressor_confidence = model_awc_regressor_interval_confidence(
+                    config,
+                    station,
+                    int(latest_local.month),
+                    local_hour,
+                    predicted_high_f,
+                    market,
+                )
+                classifier_market_probability = float(classifier_info.get("probability") or 0.0)
+                regressor_market_probability = (
+                    None
+                    if not market_regressor_confidence
+                    else market_regressor_confidence.get("probability")
+                )
+                combined_yes_probabilities[market.market_id] = {
+                    "classifier_probability": classifier_market_probability,
+                    "classifier_temperatures_f": tuple(classifier_info.get("temperatures_f") or ()),
+                    "regressor_probability": regressor_market_probability,
+                    "regressor_calibration": market_regressor_confidence,
+                    "combined_yes_probability": model_awc_combined_yes_probability(
+                        config,
+                        classifier_market_probability,
+                        None if regressor_market_probability is None else float(regressor_market_probability),
+                    ),
+                }
             classifier_market = classifier_choice["market"]
             classifier_probability = float(classifier_choice["probability"])
             classifier_temperatures = tuple(classifier_choice.get("temperatures_f") or ())
             classifier_active_candidates = model_awc_classifier_candidate_log_items(
                 classifier_choice
             )
-            if classifier_market.market_id != predicted_yes_market.market_id:
+        agree_min_regressor = configured_model_awc_probability_threshold(
+            config, "model_awc_agree_min_regressor_confidence", 0.60
+        )
+        agree_min_classifier = configured_model_awc_probability_threshold(
+            config, "model_awc_agree_min_classifier_probability", 0.70
+        )
+        takeover_min_probability = configured_model_awc_probability_threshold(
+            config, "model_awc_disagree_takeover_min_probability", 0.80
+        )
+        takeover_min_gap = configured_model_awc_probability_threshold(
+            config, "model_awc_disagree_takeover_min_gap", 0.30
+        )
+        signal_market = predicted_yes_market
+        signal_source = "regressor_only"
+        if model_awc_classifier_enabled(config):
+            assert classifier_market is not None
+            if classifier_market.market_id == predicted_yes_market.market_id:
+                regressor_ok = (
+                    regressor_probability is not None
+                    and float(regressor_probability) >= agree_min_regressor
+                )
+                classifier_ok = classifier_probability is not None and (
+                    float(classifier_probability) >= agree_min_classifier
+                )
+                if not (regressor_ok or classifier_ok):
+                    LOGGER.info(
+                        "model awc skip agreement below confidence thresholds "
+                        "city=%s station=%s event_date=%s local_hour=%s "
+                        "predicted_high_f=%r rounded_high_f=%s market=%s "
+                        "regressor_probability=%s classifier_probability=%s "
+                        "agree_min_regressor=%.4f agree_min_classifier=%.4f "
+                        "classifier_temperatures=%s active_candidates=%s "
+                        "regressor_calibration=%s",
+                        city,
+                        station,
+                        event_date,
+                        local_hour,
+                        predicted_high_f,
+                        rounded_prediction_f,
+                        predicted_yes_market.market_id,
+                        None if regressor_probability is None else round(float(regressor_probability), 6),
+                        None if classifier_probability is None else round(float(classifier_probability), 6),
+                        agree_min_regressor,
+                        agree_min_classifier,
+                        classifier_temperatures,
+                        classifier_active_candidates,
+                        regressor_confidence,
+                    )
+                    return None
+                signal_source = "agreement"
+            else:
+                regressor_available = regressor_probability is not None
+                classifier_available = classifier_probability is not None
+                signal_market = None
+                if not regressor_available and classifier_available:
+                    if float(classifier_probability) >= takeover_min_probability:
+                        signal_market = classifier_market
+                        signal_source = "classifier_takeover_missing_regressor_confidence"
+                    else:
+                        signal_source = "skip_classifier_below_takeover_without_regressor"
+                elif regressor_available and not classifier_available:
+                    if float(regressor_probability) >= takeover_min_probability:
+                        signal_market = predicted_yes_market
+                        signal_source = "regressor_takeover_missing_classifier_probability"
+                    else:
+                        signal_source = "skip_regressor_below_takeover_without_classifier"
+                elif regressor_available and classifier_available:
+                    confidence_gap = abs(float(regressor_probability) - float(classifier_probability))
+                    if confidence_gap <= takeover_min_gap:
+                        signal_source = "skip_disagreement_gap_too_small"
+                    elif float(classifier_probability) > float(regressor_probability):
+                        if float(classifier_probability) >= takeover_min_probability:
+                            signal_market = classifier_market
+                            signal_source = "classifier_takeover"
+                        else:
+                            signal_source = "skip_classifier_takeover_below_threshold"
+                    elif float(regressor_probability) >= takeover_min_probability:
+                        signal_market = predicted_yes_market
+                        signal_source = "regressor_takeover"
+                    else:
+                        signal_source = "skip_regressor_takeover_below_threshold"
+                if signal_market is None:
+                    LOGGER.info(
+                        "model awc skip classifier disagreement no strong takeover "
+                        "city=%s station=%s event_date=%s local_hour=%s "
+                        "predicted_high_f=%r rounded_high_f=%s regression_market=%s "
+                        "classifier_market=%s classifier_probability=%s "
+                        "regressor_probability=%s gap=%s takeover_min_probability=%.4f "
+                        "takeover_min_gap=%.4f signal_source=%s "
+                        "classifier_temperatures=%s active_candidates=%s "
+                        "regressor_calibration=%s",
+                        city,
+                        station,
+                        event_date,
+                        local_hour,
+                        predicted_high_f,
+                        rounded_prediction_f,
+                        predicted_yes_market.market_id,
+                        classifier_market.market_id,
+                        None if classifier_probability is None else round(float(classifier_probability), 6),
+                        None if regressor_probability is None else round(float(regressor_probability), 6),
+                        None
+                        if regressor_probability is None or classifier_probability is None
+                        else round(abs(float(regressor_probability) - float(classifier_probability)), 6),
+                        takeover_min_probability,
+                        takeover_min_gap,
+                        signal_source,
+                        classifier_temperatures,
+                        classifier_active_candidates,
+                        regressor_confidence,
+                    )
+                    return None
                 LOGGER.info(
-                    "model awc skip classifier disagreement city=%s station=%s "
+                    "model awc disagreement takeover selected city=%s station=%s "
                     "event_date=%s local_hour=%s predicted_high_f=%r rounded_high_f=%s "
-                    "regression_market=%s classifier_market=%s classifier_probability=%.6f "
-                    "classifier_temperatures=%s active_candidates=%s",
+                    "regression_market=%s classifier_market=%s signal_market=%s "
+                    "classifier_probability=%s regressor_probability=%s gap=%s "
+                    "takeover_min_probability=%.4f takeover_min_gap=%.4f signal_source=%s "
+                    "classifier_temperatures=%s active_candidates=%s regressor_calibration=%s",
                     city,
                     station,
                     event_date,
@@ -3573,22 +4249,35 @@ def process_model_awc_prediction(
                     rounded_prediction_f,
                     predicted_yes_market.market_id,
                     classifier_market.market_id,
-                    classifier_probability,
+                    signal_market.market_id,
+                    None if classifier_probability is None else round(float(classifier_probability), 6),
+                    None if regressor_probability is None else round(float(regressor_probability), 6),
+                    None
+                    if regressor_probability is None or classifier_probability is None
+                    else round(abs(float(regressor_probability) - float(classifier_probability)), 6),
+                    takeover_min_probability,
+                    takeover_min_gap,
+                    signal_source,
                     classifier_temperatures,
                     classifier_active_candidates,
+                    regressor_confidence,
                 )
-                return None
         reason = (
             f"model_awc_high_predicted_{predicted_high_f:.2f}_rounded_{rounded_prediction_f}"
-            f"_market_{predicted_yes_market.market_id}_local_hour_{local_hour:02d}"
+            f"_regression_market_{predicted_yes_market.market_id}"
+            f"_signal_market_{signal_market.market_id}_signal_{signal_source}"
+            f"_local_hour_{local_hour:02d}"
         )
         if classifier_probability is not None:
             reason += f"_classifier_prob_{classifier_probability:.4f}"
+        if regressor_probability is not None:
+            reason += f"_reg_conf_{float(regressor_probability):.4f}"
         LOGGER.info(
             "model awc rounded prediction mapped city=%s station=%s event_date=%s "
-            "local_hour=%s predicted_high_f=%r rounded_high_f=%s market=%s "
+            "local_hour=%s predicted_high_f=%r rounded_high_f=%s regression_market=%s signal_market=%s "
             "classifier_enabled=%s classifier_probability=%s classifier_temperatures=%s "
-            "classifier_active_candidates=%s",
+            "classifier_active_candidates=%s regressor_confidence=%s regressor_calibration=%s "
+            "signal_source=%s observation_max_buy_price=%.4f",
             city,
             station,
             event_date,
@@ -3596,12 +4285,17 @@ def process_model_awc_prediction(
             predicted_high_f,
             rounded_prediction_f,
             predicted_yes_market.market_id,
+            signal_market.market_id,
             model_awc_classifier_enabled(config),
             None if classifier_probability is None else round(classifier_probability, 6),
             classifier_temperatures,
             classifier_active_candidates,
+            regressor_probability,
+            regressor_confidence,
+            signal_source,
+            observation_max_buy_price,
         )
-        return process_single_interval(predicted_yes_market, reason)
+        return process_single_interval(signal_market, reason, signal_source)
 
     LOGGER.info(
         "model awc skip rounded prediction without unique market city=%s station=%s "
@@ -4670,8 +5364,10 @@ def notify_trade(config: dict[str, Any], trade: PaperTrade, action: str, status:
         f"Shares: {float(trade.shares or 0.0):.4f}",
         f"Market: {_telegram_escape(trade.city)} {_telegram_escape(trade.kind)} {trade.event_date}",
         f"Question: {_telegram_escape(trade.market_question)}",
-        f"Reason: {_telegram_escape(reason or trade.exit_reason or trade.forecast_source)}",
     ]
+    if getattr(trade, "model_details", ""):
+        lines.append(f"Models:\n{_telegram_escape(trade.model_details)}")
+    lines.append(f"Reason: {_telegram_escape(reason or trade.exit_reason or trade.forecast_source)}")
     if order_id:
         lines.append(f"Order: `{_telegram_escape(order_id)}`")
     if source:
@@ -4807,6 +5503,8 @@ class LiveTradingManager:
         amount_usd: Optional[float] = None,
         shares: Optional[float] = None,
         notify_submitted: bool = True,
+        max_buy_price: Optional[float] = None,
+        model_details: str = "",
     ) -> Optional[PaperTrade]:
         """Post a live buy order and return a BUY_PENDING trade row when accepted by the CLOB.
         
@@ -4840,14 +5538,19 @@ class LiveTradingManager:
                 side,
             )
             return None
-        max_price = configured_max_buy_price(config)
+        max_price = (
+            float(max_buy_price)
+            if max_buy_price is not None
+            else configured_max_buy_price(config)
+        )
         if float(entry_price) > max_price:
             LOGGER.info(
-                "live buy skipped price above configured max side=%s market=%s price=%.4f max_buy_price=%.4f",
+                "live buy skipped price above max side=%s market=%s price=%.4f max_buy_price=%.4f dynamic=%s",
                 side,
                 market.market_id,
                 float(entry_price),
                 max_price,
+                max_buy_price is not None,
             )
             return None
         neg_risk = market_neg_risk(market)
@@ -4862,7 +5565,13 @@ class LiveTradingManager:
                 amount,
                 neg_risk,
             )
-            result = self.executor.place_buy_order_shares(token_id, float(shares), price=entry_price, neg_risk=neg_risk)
+            result = self.executor.place_buy_order_shares(
+                token_id,
+                float(shares),
+                price=entry_price,
+                neg_risk=neg_risk,
+                max_buy_price=max_price,
+            )
         else:
             amount = float(amount_usd if amount_usd is not None else config["trading"]["buy_notional_usdc"])
             LOGGER.info(
@@ -4873,7 +5582,13 @@ class LiveTradingManager:
                 amount,
                 neg_risk,
             )
-            result = self.executor.place_buy_order(token_id, amount, price=entry_price, neg_risk=neg_risk)
+            result = self.executor.place_buy_order(
+                token_id,
+                amount,
+                price=entry_price,
+                neg_risk=neg_risk,
+                max_buy_price=max_price,
+            )
         if not _result_value(result, "success", False):
             LOGGER.error("live buy rejected side=%s market=%s price=%s neg_risk=%s error=%s", side, market.market_id, entry_price, neg_risk, _result_value(result, "error", ""))
             return None
@@ -4892,6 +5607,8 @@ class LiveTradingManager:
             notional_usdc=float(_result_value(result, "amount_usd", amount)),
             shares_override=float(_result_value(result, "shares", shares or 0.0)) if shares is not None else None,
         )
+        if model_details:
+            trade.model_details = model_details
         self._apply_buy_result_to_trade(trade, result, pending=True)
         self._register_pending(
             LivePendingOrder(
@@ -4925,6 +5642,8 @@ class LiveTradingManager:
         mode: str,
         target_notional_usd: float = 0.0,
         local_minute: int = 0,
+        max_buy_prices: Optional[dict[str, float]] = None,
+        model_details: str = "",
     ) -> str:
         """Replace the prior city/hour target and begin websocket order management."""
         if not self.executor or not self.market_feed:
@@ -4980,6 +5699,8 @@ class LiveTradingManager:
             acquired_cost_usd={token_id: 0.0 for token_id in token_ids},
             average_prices={token_id: 0.0 for token_id in token_ids},
             open_order_ids={},
+            max_buy_prices=dict(max_buy_prices or {}),
+            model_details=model_details,
             expires_ts=time.time()
             + max(
                 1.0,
@@ -4996,13 +5717,15 @@ class LiveTradingManager:
         self._refresh_hourly_market_subscriptions()
         LOGGER.info(
             "model awc hourly batch started batch=%s mode=%s tokens=%s "
-            "target_shares=%s target_notional_usd=%s predicted_high_f=%r window_minutes=%s",
+            "target_shares=%s target_notional_usd=%s predicted_high_f=%r "
+            "max_buy_prices=%s window_minutes=%s",
             batch_id,
             mode,
             [token[:16] for token in token_ids],
             target_shares,
             target_notional_usd,
             predicted_high_f,
+            {token[:16]: price for token, price in batch.max_buy_prices.items()},
             self.config["trading"].get(
                 "model_awc_order_management_window_minutes", 40
             ),
@@ -5205,6 +5928,8 @@ class LiveTradingManager:
             amount_usd=round(order_shares * float(price), 2),
             shares=order_shares,
             notify_submitted=False,
+            max_buy_price=batch.max_buy_prices.get(batch.token_ids[leg_index]),
+            model_details=batch.model_details,
         )
         if trade is None:
             return None
@@ -5265,42 +5990,87 @@ class LiveTradingManager:
     ) -> None:
         token = batch.token_ids[0]
         if batch.target_notional_usd > 0:
-            spent = batch.acquired_cost_usd.get(token, 0.0)
-            reserved = batch.open_order_cost_usd.get(token, 0.0)
+            spent = sum(float(value or 0.0) for value in batch.acquired_cost_usd.values())
+            reserved = sum(float(value or 0.0) for value in batch.open_order_cost_usd.values())
             remaining_notional = max(0.0, batch.target_notional_usd - spent - reserved)
-            if token in batch.open_order_ids:
+            if batch.open_order_ids:
                 return
             if remaining_notional < 0.01:
                 self._close_hourly_batch(batch, "target_filled")
                 return
-            max_price = configured_max_buy_price(self.config)
-            side = batch.sides[0].upper()
-            min_side_price = configured_model_awc_min_side_price(
-                self.config, side
-            )
-            offer = self._live_offer(token)
-            if side in {"YES", "NO"}:
-                if offer is not None and offer[0] < min_side_price:
-                    self._close_hourly_batch(
-                        batch, f"{side.lower()}_below_confidence_floor"
+
+            executable_candidates = []
+            resting_candidates = []
+            below_floor_sides = []
+            for leg_index, candidate_token in enumerate(batch.token_ids):
+                side = batch.sides[leg_index].upper()
+                max_price = float(
+                    batch.max_buy_prices.get(
+                        candidate_token,
+                        configured_max_buy_price(self.config),
                     )
-                    return
-            if offer is not None and offer[0] <= max_price:
+                )
+                min_side_price = configured_model_awc_min_side_price(
+                    self.config, side
+                )
+                if max_price < min_side_price:
+                    continue
+                offer = self._live_offer(candidate_token)
+                if side in {"YES", "NO"} and offer is not None and offer[0] < min_side_price:
+                    LOGGER.info(
+                        "model awc single websocket candidate skipped below confidence floor "
+                        "batch=%s token=%s side=%s offer_price=%.4f min_side_price=%.4f",
+                        batch.batch_id,
+                        candidate_token[:16],
+                        side,
+                        float(offer[0]),
+                        min_side_price,
+                    )
+                    below_floor_sides.append(side.lower())
+                    continue
+                resting_candidates.append((leg_index, max_price, side))
+                if offer is None:
+                    continue
+                if float(offer[0]) > max_price:
+                    LOGGER.info(
+                        "model awc single websocket candidate above observation cap "
+                        "batch=%s token=%s side=%s offer_price=%.4f "
+                        "max_buy_price=%.4f",
+                        batch.batch_id,
+                        candidate_token[:16],
+                        side,
+                        float(offer[0]),
+                        max_price,
+                    )
+                    continue
                 price = float(offer[0])
                 shares = min(float(offer[1]), remaining_notional / price)
+                if shares >= 1:
+                    executable_candidates.append(
+                        (price, str(batch.markets[leg_index].market_id), side, leg_index, shares)
+                    )
+
+            if executable_candidates:
+                executable_candidates.sort()
+                price, _market_id, _side, leg_index, shares = executable_candidates[0]
                 reason = f"{batch.reason}_single_websocket_offer"
-            elif side in {"YES", "NO"}:
-                return
-            else:
-                price = max_price
+            elif resting_candidates:
+                leg_index, price, _side = resting_candidates[0]
                 shares = remaining_notional / price
-                reason = f"{batch.reason}_single_limit_085"
+                reason = f"{batch.reason}_single_limit_observation_cap"
+            else:
+                if below_floor_sides:
+                    self._close_hourly_batch(
+                        batch,
+                        f"{below_floor_sides[0]}_below_confidence_floor",
+                    )
+                return
             if shares < 1:
                 self._close_hourly_batch(
                     batch, "target_unfillable_notional_remainder"
                 )
                 return
-            self._submit_batch_order(batch, 0, shares, price, reason)
+            self._submit_batch_order(batch, leg_index, shares, price, reason)
             batch.next_action_ts = time.time() + 2.0
             return
 

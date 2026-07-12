@@ -31,6 +31,48 @@ def test_fixed_share_buy_below_market_minimum_is_rejected() -> None:
     assert "below market minimum 5 shares" in result.error
 
 
+def test_fixed_share_buy_can_use_dynamic_max_buy_price_override() -> None:
+    executor = Executor("", dry_run=True)
+    executor._minimum_order_shares_cache[TOKEN] = 1.0
+
+    rejected = executor.place_buy_order_shares(
+        TOKEN, shares=10, price=0.99, neg_risk=True
+    )
+    assert not rejected.success
+    assert "cap $0.90" in rejected.error
+
+    accepted = executor.place_buy_order_shares(
+        TOKEN,
+        shares=10,
+        price=0.99,
+        neg_risk=True,
+        max_buy_price=0.995,
+    )
+    assert accepted.success
+    assert accepted.price == 0.99
+
+
+def test_notional_buy_can_use_dynamic_max_buy_price_override() -> None:
+    executor = Executor("", dry_run=True)
+    executor._minimum_order_shares_cache[TOKEN] = 1.0
+
+    rejected = executor.place_buy_order(
+        TOKEN, amount_usd=10, price=0.99, neg_risk=True
+    )
+    assert not rejected.success
+    assert "cap $0.90" in rejected.error
+
+    accepted = executor.place_buy_order(
+        TOKEN,
+        amount_usd=10,
+        price=0.99,
+        neg_risk=True,
+        max_buy_price=0.995,
+    )
+    assert accepted.success
+    assert accepted.price == 0.99
+
+
 class _BalanceClient:
     def __init__(self) -> None:
         self.balance_calls = 0

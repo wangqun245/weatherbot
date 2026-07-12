@@ -90,7 +90,23 @@ def _env(name: str) -> str:
     return os.getenv(name, "").strip()
 
 
-def max_buy_price() -> float:
+def max_buy_price(override: Optional[float] = None) -> float:
+    if override is not None:
+        try:
+            cap = float(override)
+            if cap <= 0 or cap >= 1:
+                print(
+                    f"[executor] Invalid max_buy_price override={override!r}; "
+                    f"using ${DEFAULT_MAX_BUY_PRICE:.2f}"
+                )
+                return DEFAULT_MAX_BUY_PRICE
+            return cap
+        except (TypeError, ValueError):
+            print(
+                f"[executor] Invalid max_buy_price override={override!r}; "
+                f"using ${DEFAULT_MAX_BUY_PRICE:.2f}"
+            )
+            return DEFAULT_MAX_BUY_PRICE
     raw = os.getenv("MAX_BUY_PRICE", str(DEFAULT_MAX_BUY_PRICE))
     raw = str(raw).split("#", 1)[0].strip()
     try:
@@ -676,7 +692,14 @@ class Executor:
                 side="BUY", price=market_price, token_id=token_id[:16] + "...",
             )
 
-    def place_buy_order(self, token_id: str, amount_usd: float, price: float = 0.0, neg_risk: bool = DEFAULT_NEG_RISK) -> OrderResult:
+    def place_buy_order(
+        self,
+        token_id: str,
+        amount_usd: float,
+        price: float = 0.0,
+        neg_risk: bool = DEFAULT_NEG_RISK,
+        max_buy_price: Optional[float] = None,
+    ) -> OrderResult:
         """Post a buy order and return immediately; caller verifies/cancels later."""
         amount_usd = round(float(amount_usd), 2)
         if amount_usd < MIN_AMOUNT_USD:
@@ -697,7 +720,7 @@ class Executor:
                 )
             market_price = round(market_price, 2)
 
-        cap_price = max_buy_price()
+        cap_price = globals()["max_buy_price"](max_buy_price)
         if market_price > cap_price:
             return OrderResult(
                 success=False, status=REJECTED,
@@ -779,7 +802,14 @@ class Executor:
                 token_balance_before=token_balance_before,
             )
 
-    def place_buy_order_shares(self, token_id: str, shares: float, price: float, neg_risk: bool = DEFAULT_NEG_RISK) -> OrderResult:
+    def place_buy_order_shares(
+        self,
+        token_id: str,
+        shares: float,
+        price: float,
+        neg_risk: bool = DEFAULT_NEG_RISK,
+        max_buy_price: Optional[float] = None,
+    ) -> OrderResult:
         """Post a buy order for an exact whole-share size."""
         market_price = round(float(price), 2)
         order_shares = int(float(shares))
@@ -795,7 +825,7 @@ class Executor:
             minimum_error.price = market_price
             minimum_error.amount_usd = clean_amount
             return minimum_error
-        cap_price = max_buy_price()
+        cap_price = globals()["max_buy_price"](max_buy_price)
         if market_price > cap_price:
             return OrderResult(
                 success=False, status=REJECTED,

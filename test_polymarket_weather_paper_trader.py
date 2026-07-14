@@ -76,6 +76,15 @@ class ClobPricingTest(unittest.TestCase):
         self.assertEqual(0.03, float(config["trading"]["model_awc_min_yes_price"]))
         self.assertEqual(0.03, float(config["trading"]["model_awc_min_no_price"]))
         self.assertTrue(config["trading"]["model_awc_classifier_enabled"])
+        self.assertTrue(config["trading"]["model_awc_kalshi_high_guard_enabled"])
+        self.assertEqual(
+            2.0,
+            float(config["trading"]["model_awc_kalshi_high_guard_max_higher_midpoint_f"]),
+        )
+        self.assertEqual(
+            "KXHIGHAUS",
+            config["trading"]["model_awc_kalshi_high_series_tickers"]["Austin"],
+        )
         self.assertEqual(
             20.0,
             float(config["trading"]["model_awc_adjacent_yes_shares"]),
@@ -124,6 +133,254 @@ class ClobPricingTest(unittest.TestCase):
         self.assertIn("Regression: 92.31F", messages[0])
         self.assertIn("Classifier: 92-93F prob 97.16%", messages[0])
         self.assertIn("Max YES buy cap: 92.10%", messages[0])
+
+    def test_kalshi_market_probability_and_interval_midpoint(self):
+        market = {
+            "strike_type": "between",
+            "floor_strike": 91,
+            "cap_strike": 92,
+            "yes_bid_dollars": "0.2200",
+            "yes_ask_dollars": "0.2600",
+            "last_price_dollars": "0.9900",
+        }
+
+        self.assertAlmostEqual(0.24, bot.kalshi_market_yes_probability(market))
+        self.assertAlmostEqual(91.5, bot.kalshi_market_interval_midpoint_f(market))
+
+    def test_kalshi_high_guard_allows_within_threshold(self):
+        config = bot.default_config()
+        config["trading"]["model_awc_kalshi_high_guard_enabled"] = True
+        config["trading"]["model_awc_kalshi_high_guard_max_higher_midpoint_f"] = 2.0
+        market = bot.TemperatureMarket(
+            event_id="event-1",
+            market_id="poly-90-91",
+            condition_id="condition-1",
+            city="Austin",
+            kind="Highest",
+            event_date="2026-07-14",
+            event_title="Highest temperature in Austin on July 14",
+            market_question="Will the highest temperature in Austin be between 90-91F on July 14?",
+            polymarket_url="https://polymarket.com/event/example",
+            yes_price=0.2,
+            rule_min=90.0,
+            rule_max=91.0,
+            unit="F",
+            raw_market_json="{}",
+        )
+        kalshi = {
+            "ticker": "KXHIGHAUS-26JUL14-B91.5",
+            "midpoint_f": 91.5,
+            "yes_probability": 0.42,
+        }
+
+        with mock.patch.object(bot, "model_awc_fetch_kalshi_top_high_market", return_value=kalshi):
+            allowed, details = bot.model_awc_kalshi_high_guard_allows_trade(
+                config, "Austin", "2026-07-14", market
+            )
+
+        self.assertTrue(allowed)
+        self.assertAlmostEqual(1.0, details["diff_f"])
+
+    def test_kalshi_high_guard_blocks_when_kalshi_more_than_two_f_hotter(self):
+        config = bot.default_config()
+        config["trading"]["model_awc_kalshi_high_guard_enabled"] = True
+        config["trading"]["model_awc_kalshi_high_guard_max_higher_midpoint_f"] = 2.0
+        market = bot.TemperatureMarket(
+            event_id="event-1",
+            market_id="poly-90-91",
+            condition_id="condition-1",
+            city="Austin",
+            kind="Highest",
+            event_date="2026-07-14",
+            event_title="Highest temperature in Austin on July 14",
+            market_question="Will the highest temperature in Austin be between 90-91F on July 14?",
+            polymarket_url="https://polymarket.com/event/example",
+            yes_price=0.2,
+            rule_min=90.0,
+            rule_max=91.0,
+            unit="F",
+            raw_market_json="{}",
+        )
+        kalshi = {
+            "ticker": "KXHIGHAUS-26JUL14-B93.5",
+            "midpoint_f": 93.5,
+            "yes_probability": 0.42,
+        }
+
+        with mock.patch.object(bot, "model_awc_fetch_kalshi_top_high_market", return_value=kalshi):
+            allowed, details = bot.model_awc_kalshi_high_guard_allows_trade(
+                config, "Austin", "2026-07-14", market
+            )
+
+        self.assertFalse(allowed)
+        self.assertEqual("kalshi_midpoint_too_high", details["reason"])
+        self.assertAlmostEqual(3.0, details["diff_f"])
+
+    def test_kalshi_high_guard_blocks_when_polymarket_hotter_than_kalshi(self):
+        config = bot.default_config()
+        config["trading"]["model_awc_kalshi_high_guard_enabled"] = True
+        config["trading"]["model_awc_kalshi_high_guard_max_higher_midpoint_f"] = 2.0
+        market = bot.TemperatureMarket(
+            event_id="event-1",
+            market_id="poly-92-93",
+            condition_id="condition-1",
+            city="Austin",
+            kind="Highest",
+            event_date="2026-07-14",
+            event_title="Highest temperature in Austin on July 14",
+            market_question="Will the highest temperature in Austin be between 92-93F on July 14?",
+            polymarket_url="https://polymarket.com/event/example",
+            yes_price=0.2,
+            rule_min=92.0,
+            rule_max=93.0,
+            unit="F",
+            raw_market_json="{}",
+        )
+        kalshi = {
+            "ticker": "KXHIGHAUS-26JUL14-B91.5",
+            "midpoint_f": 91.5,
+            "yes_probability": 0.42,
+        }
+
+        with mock.patch.object(bot, "model_awc_fetch_kalshi_top_high_market", return_value=kalshi):
+            allowed, details = bot.model_awc_kalshi_high_guard_allows_trade(
+                config, "Austin", "2026-07-14", market
+            )
+
+        self.assertFalse(allowed)
+        self.assertEqual("polymarket_midpoint_above_kalshi", details["reason"])
+        self.assertAlmostEqual(-1.0, details["diff_f"])
+
+    def test_kalshi_high_guard_blocks_open_ended_polymarket_boundary(self):
+        config = bot.default_config()
+        config["trading"]["model_awc_kalshi_high_guard_enabled"] = True
+        market = bot.TemperatureMarket(
+            event_id="event-1",
+            market_id="poly-77-below",
+            condition_id="condition-1",
+            city="NYC",
+            kind="Highest",
+            event_date="2026-07-14",
+            event_title="Highest temperature in NYC on July 14",
+            market_question="Will the highest temperature in NYC be 77F or below on July 14?",
+            polymarket_url="https://polymarket.com/event/example",
+            yes_price=0.001,
+            rule_min=None,
+            rule_max=77.0,
+            unit="F",
+            raw_market_json="{}",
+        )
+
+        allowed, details = bot.model_awc_kalshi_high_guard_allows_trade(
+            config, "NYC", "2026-07-14", market
+        )
+
+        self.assertFalse(allowed)
+        self.assertEqual("polymarket_interval_midpoint_unavailable", details["reason"])
+
+    def test_kalshi_prefetch_caches_event_ref_and_url(self):
+        config = bot.default_config()
+        bot.KALSHI_HIGH_EVENT_CACHE.clear()
+
+        def fake_kalshi_get(config, path, params=None):
+            self.assertEqual("/events", path)
+            self.assertEqual("KXHIGHAUS", params["series_ticker"])
+            return {
+                "events": [
+                    {
+                        "event_ticker": "KXHIGHAUS-26JUL14",
+                        "series_ticker": "KXHIGHAUS",
+                        "occurrence_datetime": "2026-07-14T14:00:00Z",
+                    }
+                ]
+            }
+
+        with mock.patch.object(bot, "kalshi_get", side_effect=fake_kalshi_get):
+            result = bot.model_awc_prefetch_kalshi_high_event_refs(
+                config, bot.date(2026, 7, 14), ["Austin"]
+            )
+
+        self.assertEqual(1, len(result["prefetched"]))
+        cached = bot.KALSHI_HIGH_EVENT_CACHE[("Austin", "2026-07-14")]
+        self.assertEqual("KXHIGHAUS-26JUL14", cached["event_ticker"])
+        self.assertEqual("https://kalshi.com/markets/KXHIGHAUS-26JUL14", cached["kalshi_url"])
+
+    def test_kalshi_top_market_uses_cached_event_ref(self):
+        config = bot.default_config()
+        config["trading"]["model_awc_kalshi_high_guard_cache_seconds"] = 0
+        bot.KALSHI_HIGH_EVENT_CACHE.clear()
+        bot.KALSHI_HIGH_GUARD_CACHE.clear()
+        bot.KALSHI_HIGH_EVENT_CACHE[("Austin", "2026-07-14")] = {
+            "city": "Austin",
+            "event_date": "2026-07-14",
+            "series_ticker": "KXHIGHAUS",
+            "event_ticker": "KXHIGHAUS-26JUL14",
+            "kalshi_url": "https://kalshi.com/markets/KXHIGHAUS-26JUL14",
+            "cached_at": 1.0,
+        }
+        calls = []
+
+        def fake_kalshi_get(config, path, params=None):
+            calls.append((path, dict(params or {})))
+            self.assertEqual("/events/KXHIGHAUS-26JUL14", path)
+            return {
+                "event": {
+                    "event_ticker": "KXHIGHAUS-26JUL14",
+                    "occurrence_datetime": "2026-07-14T14:00:00Z",
+                },
+                "markets": [
+                    {
+                        "ticker": "KXHIGHAUS-26JUL14-B91.5",
+                        "status": "active",
+                        "strike_type": "between",
+                        "floor_strike": 91,
+                        "cap_strike": 92,
+                        "yes_bid_dollars": "0.6100",
+                        "yes_ask_dollars": "0.6300",
+                    }
+                ],
+            }
+
+        with mock.patch.object(bot, "kalshi_get", side_effect=fake_kalshi_get):
+            market = bot.model_awc_fetch_kalshi_top_high_market(
+                config, "Austin", "2026-07-14"
+            )
+
+        self.assertEqual(1, len(calls))
+        self.assertEqual("/events/KXHIGHAUS-26JUL14", calls[0][0])
+        self.assertEqual("KXHIGHAUS-26JUL14-B91.5", market["ticker"])
+        self.assertEqual("https://kalshi.com/markets/KXHIGHAUS-26JUL14", market["kalshi_url"])
+        self.assertAlmostEqual(91.5, market["midpoint_f"])
+        self.assertAlmostEqual(0.62, market["yes_probability"])
+
+    def test_source_station_guard_runs_startup_check(self):
+        config = bot.default_config()
+        calls = []
+        sleeps = []
+
+        class FakeDateTime(bot.datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return bot.datetime(2026, 7, 13, 1, 5, tzinfo=tz)
+
+        def fake_sleep(seconds):
+            sleeps.append(seconds)
+            raise KeyboardInterrupt()
+
+        def fake_check(config, target):
+            calls.append(target.isoformat())
+            return {"target": target.isoformat()}
+
+        with (
+            mock.patch.object(bot, "datetime", FakeDateTime),
+            mock.patch.object(bot, "check_polymarket_source_stations", side_effect=fake_check),
+            mock.patch.object(bot.time, "sleep", side_effect=fake_sleep),
+        ):
+            with self.assertRaises(KeyboardInterrupt):
+                bot.source_station_guard_supervisor(config)
+
+        self.assertEqual(["2026-07-13"], calls)
+        self.assertTrue(sleeps)
 
     def test_model_awc_regressor_interval_confidence_uses_predicted_minus_actual_error(self):
         config = bot.default_config()
@@ -593,6 +850,121 @@ class ModelAwcLiveSingleIntervalTest(unittest.TestCase):
         self.assertEqual({"yes-token": "order-1"}, batch.open_order_ids)
         self.assertAlmostEqual(19.44, batch.open_order_cost_usd["yes-token"])
 
+    def test_live_hourly_batch_start_is_idempotent_for_same_city_hour_minute(self):
+        manager = bot.LiveTradingManager(self.config)
+        manager.executor = SimpleNamespace(
+            _get_token_balance_optional=lambda _token, refresh=False: 0.0
+        )
+        manager.market_feed = SimpleNamespace(subscribe=lambda *_args, **_kwargs: None)
+        manager._manage_hourly_batch = mock.Mock()
+
+        first = manager.start_model_awc_hourly_batch(
+            "Miami",
+            "KMIA",
+            "2026-07-13",
+            13,
+            (self.market,),
+            ("YES",),
+            0.0,
+            92.6,
+            "single",
+            target_notional_usd=20.0,
+            local_minute=53,
+        )
+        second = manager.start_model_awc_hourly_batch(
+            "Miami",
+            "KMIA",
+            "2026-07-13",
+            13,
+            (self.market,),
+            ("YES",),
+            0.0,
+            92.6,
+            "single",
+            target_notional_usd=20.0,
+            local_minute=53,
+        )
+
+        self.assertEqual(first, second)
+        self.assertEqual(1, len(manager._hourly_batches))
+        manager._manage_hourly_batch.assert_called_once()
+
+    def test_submit_buy_trade_skips_existing_active_trade_before_exchange_call(self):
+        manager = bot.LiveTradingManager(self.config)
+        manager.executor = SimpleNamespace(place_buy_order=mock.Mock())
+        existing = bot.make_trade(
+            self.config,
+            "cycle-1",
+            self.market,
+            "",
+            "KAUS",
+            "YES",
+            0.75,
+            98.0,
+            None,
+            "model_awc_managed_single_hour_13",
+            notional_usdc=20.0,
+        )
+        existing.status = "OPEN"
+
+        with mock.patch.object(bot, "read_trades", return_value=[existing]):
+            trade = manager.submit_buy_trade(
+                self.config,
+                "cycle-2",
+                self.market,
+                "",
+                "KAUS",
+                "YES",
+                0.75,
+                98.0,
+                None,
+                "model_awc_managed_single_hour_13",
+                amount_usd=20.0,
+                notify_submitted=False,
+            )
+
+        self.assertIsNone(trade)
+        manager.executor.place_buy_order.assert_not_called()
+        self.assertEqual(set(), manager._live_buy_intent_keys)
+
+    def test_live_single_manager_closes_unfillable_notional_remainder(self):
+        manager = bot.LiveTradingManager(self.config)
+        manager.executor = SimpleNamespace(minimum_order_shares=lambda _token: 5.0)
+        manager.market_feed = SimpleNamespace(
+            get_price=lambda _token: SimpleNamespace(best_ask=0.80, ask_size=100.0)
+        )
+        manager._close_hourly_batch = mock.Mock()
+        manager._submit_batch_order = mock.Mock()
+        batch = bot.ModelAwcHourlyBatch(
+            batch_id="Miami:KMIA:2026-07-13:hour_13:minute_53:single",
+            city="Miami",
+            station="KMIA",
+            event_date="2026-07-13",
+            local_hour=13,
+            mode="single",
+            markets=(self.market,),
+            sides=("YES",),
+            token_ids=("yes-token",),
+            target_shares=0.0,
+            target_notional_usd=20.0,
+            predicted_high_f=92.6,
+            cycle_id="cycle-1",
+            reason="model_awc_managed_single_hour_13_minute_53",
+            baseline_balances={"yes-token": 0.0},
+            acquired_shares={"yes-token": 24.0},
+            acquired_cost_usd={"yes-token": 19.2},
+            average_prices={"yes-token": 0.0},
+            open_order_ids={},
+            expires_ts=bot.time.time() + 60,
+        )
+
+        manager._manage_single_hourly_batch(batch)
+
+        manager._close_hourly_batch.assert_called_once_with(
+            batch, "target_unfillable_minimum_order_size"
+        )
+        manager._submit_batch_order.assert_not_called()
+
     def test_live_single_manager_continues_after_partial_fill(self):
         manager = bot.LiveTradingManager(self.config)
         offers = iter([
@@ -889,11 +1261,19 @@ class ModelAwcRoundedPredictionMarketTest(unittest.TestCase):
             kind="Highest",
             event_date="2026-07-03",
             event_title="Highest temperature in Austin on July 3",
-            market_question=f"Will Austin be between {low}-{high}F?",
+            market_question=(
+                f"Will Austin be between {low}-{high}F?"
+                if low is not None and high is not None
+                else (
+                    f"Will Austin be {high}F or below?"
+                    if low is None
+                    else f"Will Austin be {low}F or above?"
+                )
+            ),
             polymarket_url="https://polymarket.com/event/austin-high-july-3",
             yes_price=0.4,
-            rule_min=float(low),
-            rule_max=float(high),
+            rule_min=None if low is None else float(low),
+            rule_max=None if high is None else float(high),
             unit="F",
             raw_market_json='{"outcomes":["Yes","No"],"clobTokenIds":["yes","no"]}',
         )
@@ -924,6 +1304,17 @@ class ModelAwcRoundedPredictionMarketTest(unittest.TestCase):
         self.assertEqual(95, rounded_f)
         self.assertEqual("market-94-95", market.market_id)
 
+    def test_rounded_prediction_skips_open_ended_boundary_market(self):
+        markets = [
+            self._market("market-77-below", None, 77),
+            self._market("market-78-79", 78, 79),
+        ]
+
+        market, rounded_f = bot.model_awc_rounded_prediction_market(markets, 77.2, "F")
+
+        self.assertEqual(77, rounded_f)
+        self.assertIsNone(market)
+
     def test_classifier_interval_choice_sums_integer_temperature_probabilities(self):
         config = bot.default_config()
         markets = [
@@ -945,6 +1336,27 @@ class ModelAwcRoundedPredictionMarketTest(unittest.TestCase):
         self.assertEqual("market-96-97", choice["market"].market_id)
         self.assertAlmostEqual(0.53, choice["probability"])
         self.assertEqual((96, 97), choice["temperatures_f"])
+
+    def test_classifier_interval_choice_skips_open_ended_boundary_market(self):
+        config = bot.default_config()
+        markets = [
+            self._market("market-77-below", None, 77),
+            self._market("market-78-79", 78, 79),
+        ]
+
+        with mock.patch.object(
+            bot,
+            "model_awc_classifier_temperature_probabilities",
+            return_value=({76: 0.70, 77: 0.20, 78: 0.10}, {"max_probability": 0.70}),
+        ):
+            choice = bot.model_awc_classifier_interval_choice(config, markets, {}, "F")
+            probabilities = bot.model_awc_classifier_interval_probabilities(
+                config, markets, {}, "F"
+            )
+
+        self.assertEqual("market-78-79", choice["market"].market_id)
+        self.assertEqual(0.0, probabilities["market-77-below"]["probability"])
+        self.assertEqual("open_ended_boundary_market", probabilities["market-77-below"]["skipped"])
 
     def test_model_awc_market_candidate_requires_observation_cap_for_yes(self):
         config = bot.default_config()
@@ -980,6 +1392,23 @@ class ModelAwcRoundedPredictionMarketTest(unittest.TestCase):
                 combined,
                 0.60,
             )
+        self.assertIsNone(candidate)
+
+    def test_model_awc_market_candidate_skips_open_ended_boundary_market(self):
+        config = bot.default_config()
+        market = self._market("market-77-below", None, 77)
+
+        with mock.patch.object(bot, "best_buy_price", return_value=0.01):
+            candidate = bot.model_awc_market_candidate(
+                config,
+                market,
+                77.0,
+                "F",
+                market.market_id,
+                {market.market_id: {"combined_yes_probability": 0.90}},
+                0.80,
+            )
+
         self.assertIsNone(candidate)
 
     def test_model_awc_market_candidate_uses_executable_rounded_price_for_edge(self):

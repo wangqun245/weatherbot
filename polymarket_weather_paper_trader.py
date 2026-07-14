@@ -41,6 +41,7 @@ from zoneinfo import ZoneInfo
 
 import joblib
 import requests
+import urllib3
 import websocket
 from featurize_metar_history import (
     MetarRow as FeatureMetarRow,
@@ -96,6 +97,8 @@ MODEL_AWC_CLASSIFIER_PATH: str = ""
 MODEL_AWC_CLASSIFIER_CLASSES: tuple[int, ...] = ()
 MODEL_AWC_REGRESSOR_CALIBRATION: dict[tuple[str, int, int], dict[str, float]] = {}
 MODEL_AWC_REGRESSOR_CALIBRATION_PATH: str = ""
+KALSHI_HIGH_GUARD_CACHE: dict[tuple[str, str], dict[str, Any]] = {}
+KALSHI_HIGH_EVENT_CACHE: dict[tuple[str, str], dict[str, Any]] = {}
 HTTP_EXECUTOR = concurrent.futures.ThreadPoolExecutor(max_workers=8, thread_name_prefix="weather-http")
 TGFTP_EXECUTOR = concurrent.futures.ThreadPoolExecutor(max_workers=32, thread_name_prefix="tgftp-http")
 CLOB_POLL_EXECUTOR = concurrent.futures.ThreadPoolExecutor(max_workers=32, thread_name_prefix="clob-poll")
@@ -403,6 +406,26 @@ def default_config() -> dict[str, Any]:
         "model_awc_agree_min_classifier_probability": 0.70,
         "model_awc_disagree_takeover_min_probability": 0.80,
         "model_awc_disagree_takeover_min_gap": 0.30,
+        "model_awc_kalshi_high_guard_enabled": True,
+        "model_awc_kalshi_high_guard_max_higher_midpoint_f": 2.0,
+        "model_awc_kalshi_high_guard_fail_closed": False,
+        "model_awc_kalshi_high_guard_prefetch_enabled": True,
+        "model_awc_kalshi_high_guard_cache_seconds": 45,
+        "model_awc_kalshi_api_base": "https://api.elections.kalshi.com/trade-api/v2",
+        "model_awc_kalshi_tls_verify": True,
+        "model_awc_kalshi_high_series_tickers": {
+            "Atlanta": "KXHIGHTATL",
+            "Austin": "KXHIGHAUS",
+            "Chicago": "KXHIGHCHI",
+            "Dallas": "KXHIGHTDAL",
+            "Denver": "KXHIGHDEN",
+            "Houston": "KXHIGHTHOU",
+            "Los Angeles": "KXHIGHLAX",
+            "Miami": "KXHIGHMIA",
+            "NYC": "KXHIGHNY",
+            "San Francisco": "KXHIGHTSFO",
+            "Seattle": "KXHIGHTSEA",
+        },
         "model_awc_observation_window_max_buy_prices": [0.60, 0.70, 0.80],
         "model_awc_live_stations": [
             "KATL", "KAUS", "KDAL", "KBKF", "KHOU", "KLAX",
@@ -941,6 +964,17 @@ def parse_bool(value: Any) -> bool:
     return str(value).strip().lower() in {"1", "true", "yes"}
 
 
+def parse_float(value: Any) -> Optional[float]:
+    """Parse API numeric strings into float, returning None for blanks/bad values."""
+    if value in (None, ""):
+        return None
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if math.isfinite(parsed) else None
+
+
 def parse_event_title(title: str) -> Optional[tuple[str, str, str]]:
     """Parse a Polymarket weather event title into kind, city, and month/day components.
     
@@ -1160,6 +1194,19 @@ def check_polymarket_source_stations(config: dict[str, Any], target: date) -> di
     mismatches: list[dict[str, str]] = []
     checked: dict[str, dict[str, str]] = {}
     events = discover_temperature_events(config, target)
+    highest_cities = sorted(
+        {
+            str(event.get("_parsed_city") or "")
+            for event in events
+            if str(event.get("_parsed_kind") or "") == "Highest"
+            and str(event.get("_parsed_city") or "")
+        }
+    )
+    kalshi_prefetch = model_awc_prefetch_kalshi_high_event_refs(
+        config,
+        target,
+        highest_cities or None,
+    )
     for event in events:
         city = str(event.get("_parsed_city") or "")
         event_date = str(event.get("_parsed_event_date") or target.isoformat())
@@ -1218,6 +1265,7 @@ def check_polymarket_source_stations(config: dict[str, Any], target: date) -> di
         "events": len(events),
         "checked": list(checked.values()),
         "mismatches": mismatches,
+        "kalshi_prefetch": kalshi_prefetch,
     }
 
 
@@ -1235,7 +1283,7 @@ def next_source_station_check_time(config: dict[str, Any], now: Optional[datetim
 
 
 def source_station_guard_supervisor(config: dict[str, Any]) -> None:
-    """Run the Polymarket source-station guard once daily at the configured CT hour."""
+    """Run the Polymarket source-station guard at startup and once daily."""
     if not bool(config.get("trading", {}).get("source_station_check_enabled", True)):
         LOGGER.info("source station guard disabled")
         return
@@ -1244,6 +1292,14 @@ def source_station_guard_supervisor(config: dict[str, Any]) -> None:
     check_hour = int(config.get("trading", {}).get("source_station_check_hour_ct", 3))
     last_checked_date = ""
     LOGGER.info("source station guard started timezone=%s check_hour=%s", tz_name, check_hour)
+    try:
+        now_local = datetime.now(tz)
+        prune_source_station_blocks(now_local.date())
+        check_polymarket_source_stations(config, now_local.date())
+        last_checked_date = now_local.date().isoformat()
+        LOGGER.info("source station guard startup check complete target=%s", last_checked_date)
+    except Exception:
+        LOGGER.exception("source station guard startup check failed")
     while True:
         try:
             now_local = datetime.now(tz)
@@ -1425,6 +1481,11 @@ def comparable_rule_bounds(market: TemperatureMarket, target_unit: str) -> tuple
         tuple[Optional[float], Optional[float], str]: Converted lower bound, upper bound, and target unit.
     """
     return convert_temperature(market.rule_min, market.unit, target_unit), convert_temperature(market.rule_max, market.unit, target_unit), target_unit.upper()
+
+
+def finite_temperature_market(market: TemperatureMarket) -> bool:
+    """Return True for closed finite intervals such as 78-79F."""
+    return market.rule_min is not None and market.rule_max is not None
 
 
 def market_contains_temperature(market: TemperatureMarket, target_temp: float, target_unit: str) -> bool:
@@ -2866,6 +2927,15 @@ def model_awc_market_label(market: TemperatureMarket) -> str:
     return f"{market.rule_min:g}-{market.rule_max:g}{market.unit}"
 
 
+def model_awc_finite_market_midpoint_f(market: TemperatureMarket) -> Optional[float]:
+    """Return the midpoint of a finite temperature interval in Fahrenheit."""
+    lo = convert_temperature(market.rule_min, market.unit, "F")
+    hi = convert_temperature(market.rule_max, market.unit, "F")
+    if lo is None or hi is None:
+        return None
+    return (float(lo) + float(hi)) / 2.0
+
+
 def model_awc_probability_pct(value: Any) -> str:
     try:
         if value is None:
@@ -2873,6 +2943,460 @@ def model_awc_probability_pct(value: Any) -> str:
         return f"{float(value) * 100.0:.2f}%"
     except Exception:
         return "n/a"
+
+
+def model_awc_kalshi_high_guard_enabled(config: dict[str, Any]) -> bool:
+    return bool(
+        config.get("trading", {}).get("model_awc_kalshi_high_guard_enabled", True)
+    )
+
+
+def model_awc_kalshi_high_guard_threshold_f(config: dict[str, Any]) -> float:
+    raw = config.get("trading", {}).get(
+        "model_awc_kalshi_high_guard_max_higher_midpoint_f", 2.0
+    )
+    try:
+        return max(0.0, float(raw))
+    except (TypeError, ValueError):
+        return 2.0
+
+
+def model_awc_kalshi_high_guard_fail_closed(config: dict[str, Any]) -> bool:
+    return bool(
+        config.get("trading", {}).get("model_awc_kalshi_high_guard_fail_closed", False)
+    )
+
+
+def model_awc_kalshi_series_ticker(config: dict[str, Any], city: str) -> str:
+    mapping = config.get("trading", {}).get("model_awc_kalshi_high_series_tickers", {})
+    if isinstance(mapping, dict):
+        value = str(mapping.get(city) or mapping.get(city.strip()) or "").strip()
+        if value:
+            return value
+    compact = re.sub(r"[^A-Za-z0-9]", "", city).upper()
+    return f"KXHIGH{compact}"
+
+
+def model_awc_kalshi_market_url(event_ticker: str) -> str:
+    ticker = str(event_ticker or "").strip()
+    return f"https://kalshi.com/markets/{ticker}" if ticker else ""
+
+
+def kalshi_get(config: dict[str, Any], path: str, params: Optional[dict[str, Any]] = None) -> Any:
+    """Call the public Kalshi trade API used for the high-temperature guard."""
+    trading = config.get("trading", {})
+    base = str(
+        trading.get("model_awc_kalshi_api_base")
+        or "https://api.elections.kalshi.com/trade-api/v2"
+    ).rstrip("/")
+    timeout = int(config.get("api", {}).get("request_timeout_seconds", 30))
+    verify_tls = bool(trading.get("model_awc_kalshi_tls_verify", True))
+    if not verify_tls:
+        urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+    r = requests.get(
+        f"{base}{path}",
+        headers=HEADERS,
+        params=params,
+        timeout=timeout,
+        verify=verify_tls,
+    )
+    r.raise_for_status()
+    return r.json()
+
+
+def model_awc_kalshi_high_guard_prefetch_enabled(config: dict[str, Any]) -> bool:
+    trading = config.get("trading", {})
+    return bool(
+        trading.get(
+            "model_awc_kalshi_high_guard_prefetch_enabled",
+            trading.get("model_awc_kalshi_high_guard_enabled", True),
+        )
+    )
+
+
+def kalshi_market_yes_probability(market: dict[str, Any]) -> Optional[float]:
+    bid = parse_float(market.get("yes_bid_dollars"))
+    ask = parse_float(market.get("yes_ask_dollars"))
+    last = parse_float(market.get("last_price_dollars"))
+    if bid is not None and ask is not None and bid > 0 and ask > 0:
+        return max(0.0, min(1.0, (float(bid) + float(ask)) / 2.0))
+    if last is not None and last > 0:
+        return max(0.0, min(1.0, float(last)))
+    if bid is not None and bid > 0:
+        return max(0.0, min(1.0, float(bid)))
+    if ask is not None and ask > 0:
+        return max(0.0, min(1.0, float(ask)))
+    return None
+
+
+def kalshi_market_interval_midpoint_f(market: dict[str, Any]) -> Optional[float]:
+    strike_type = str(market.get("strike_type") or "").strip().lower()
+    floor = parse_float(market.get("floor_strike"))
+    cap = parse_float(market.get("cap_strike"))
+    if strike_type == "between" and floor is not None and cap is not None:
+        return (float(floor) + float(cap)) / 2.0
+    if floor is not None and cap is not None:
+        return (float(floor) + float(cap)) / 2.0
+    return None
+
+
+def kalshi_event_matches_date(event: dict[str, Any], event_date: str) -> bool:
+    occurrence = str(event.get("occurrence_datetime") or "").strip()
+    if occurrence.startswith(event_date):
+        return True
+    for market in event.get("markets") or []:
+        occurrence = str(market.get("occurrence_datetime") or "").strip()
+        if occurrence.startswith(event_date):
+            return True
+    ticker = str(event.get("event_ticker") or "")
+    try:
+        target = datetime.fromisoformat(event_date).date()
+    except ValueError:
+        return False
+    return target.strftime("%y%b%d").upper() in ticker.upper()
+
+
+def model_awc_kalshi_event_ref_from_event(
+    config: dict[str, Any],
+    city: str,
+    event_date: str,
+    event: dict[str, Any],
+) -> dict[str, Any]:
+    event_ticker = str(event.get("event_ticker") or "").strip()
+    series_ticker = str(event.get("series_ticker") or "").strip() or model_awc_kalshi_series_ticker(config, city)
+    return {
+        "city": city,
+        "event_date": event_date,
+        "series_ticker": series_ticker,
+        "event_ticker": event_ticker,
+        "kalshi_url": model_awc_kalshi_market_url(event_ticker),
+        "cached_at": time.monotonic(),
+        "cached_at_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+    }
+
+
+def model_awc_lookup_kalshi_high_event_ref(
+    config: dict[str, Any],
+    city: str,
+    event_date: str,
+) -> Optional[dict[str, Any]]:
+    series_ticker = model_awc_kalshi_series_ticker(config, city)
+    payload = kalshi_get(
+        config,
+        "/events",
+        {
+            "status": "open",
+            "series_ticker": series_ticker,
+            "with_nested_markets": "false",
+            "limit": 10,
+        },
+    )
+    events = [
+        event
+        for event in payload.get("events") or []
+        if kalshi_event_matches_date(event, event_date)
+    ]
+    if not events:
+        return None
+    events.sort(key=lambda item: str(item.get("event_ticker") or ""))
+    return model_awc_kalshi_event_ref_from_event(config, city, event_date, events[0])
+
+
+def model_awc_get_cached_kalshi_high_event_ref(
+    config: dict[str, Any],
+    city: str,
+    event_date: str,
+    *,
+    allow_network: bool = True,
+) -> Optional[dict[str, Any]]:
+    cache_key = (city, event_date)
+    cached = KALSHI_HIGH_EVENT_CACHE.get(cache_key)
+    if cached:
+        return cached
+    if not allow_network:
+        return None
+    ref = model_awc_lookup_kalshi_high_event_ref(config, city, event_date)
+    if ref:
+        KALSHI_HIGH_EVENT_CACHE[cache_key] = ref
+    return ref
+
+
+def model_awc_prefetch_kalshi_high_event_refs(
+    config: dict[str, Any],
+    target: date,
+    cities: Optional[Iterable[str]] = None,
+) -> dict[str, Any]:
+    if not model_awc_kalshi_high_guard_enabled(config):
+        return {"target": target.isoformat(), "enabled": False, "prefetched": [], "missing": [], "errors": []}
+    if not model_awc_kalshi_high_guard_prefetch_enabled(config):
+        return {"target": target.isoformat(), "enabled": False, "prefetched": [], "missing": [], "errors": []}
+    city_list = list(cities or config.get("events", {}).get("allowed_cities") or [])
+    prefetched: list[dict[str, Any]] = []
+    missing: list[dict[str, str]] = []
+    errors: list[dict[str, str]] = []
+    event_date = target.isoformat()
+    for city in sorted({str(item) for item in city_list if str(item).strip()}):
+        try:
+            ref = model_awc_lookup_kalshi_high_event_ref(config, city, event_date)
+        except Exception as exc:
+            errors.append({"city": city, "event_date": event_date, "error": str(exc)})
+            LOGGER.warning(
+                "kalshi high event prefetch failed city=%s event_date=%s error=%s",
+                city,
+                event_date,
+                exc,
+            )
+            continue
+        if not ref:
+            missing.append({"city": city, "event_date": event_date})
+            LOGGER.warning(
+                "kalshi high event prefetch missing city=%s event_date=%s series_ticker=%s",
+                city,
+                event_date,
+                model_awc_kalshi_series_ticker(config, city),
+            )
+            continue
+        KALSHI_HIGH_EVENT_CACHE[(city, event_date)] = ref
+        prefetched.append(ref)
+        LOGGER.info(
+            "kalshi high event prefetch ok city=%s event_date=%s event_ticker=%s url=%s",
+            city,
+            event_date,
+            ref.get("event_ticker"),
+            ref.get("kalshi_url"),
+        )
+    LOGGER.info(
+        "kalshi high event prefetch complete target=%s prefetched=%s missing=%s errors=%s",
+        event_date,
+        len(prefetched),
+        len(missing),
+        len(errors),
+    )
+    return {
+        "target": event_date,
+        "enabled": True,
+        "prefetched": prefetched,
+        "missing": missing,
+        "errors": errors,
+    }
+
+
+def model_awc_extract_kalshi_event_and_markets(payload: dict[str, Any]) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    event = payload.get("event") if isinstance(payload.get("event"), dict) else payload
+    markets = payload.get("markets") if isinstance(payload.get("markets"), list) else None
+    if markets is None:
+        markets = event.get("markets") if isinstance(event.get("markets"), list) else []
+    return event, markets
+
+
+def model_awc_fetch_kalshi_event_by_ref(
+    config: dict[str, Any],
+    ref: dict[str, Any],
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    event_ticker = str(ref.get("event_ticker") or "").strip()
+    if not event_ticker:
+        raise ValueError(f"Kalshi event ref has no event_ticker: {ref}")
+    payload = kalshi_get(
+        config,
+        f"/events/{event_ticker}",
+        {"with_nested_markets": "true"},
+    )
+    return model_awc_extract_kalshi_event_and_markets(payload)
+
+
+def model_awc_fetch_kalshi_top_high_market(
+    config: dict[str, Any],
+    city: str,
+    event_date: str,
+) -> Optional[dict[str, Any]]:
+    series_ticker = model_awc_kalshi_series_ticker(config, city)
+    cache_key = (series_ticker, event_date)
+    ttl = max(
+        0.0,
+        float(config.get("trading", {}).get("model_awc_kalshi_high_guard_cache_seconds", 45)),
+    )
+    cached = KALSHI_HIGH_GUARD_CACHE.get(cache_key)
+    if cached and ttl > 0 and time.monotonic() - float(cached.get("cached_at", 0.0)) <= ttl:
+        return cached.get("value")
+
+    events: list[dict[str, Any]] = []
+    ref = model_awc_get_cached_kalshi_high_event_ref(
+        config, city, event_date, allow_network=True
+    )
+    if ref:
+        try:
+            event, markets = model_awc_fetch_kalshi_event_by_ref(config, ref)
+            event = dict(event)
+            event["markets"] = markets
+            if kalshi_event_matches_date(event, event_date):
+                events = [event]
+            LOGGER.info(
+                "kalshi high guard using cached event ref city=%s event_date=%s event_ticker=%s url=%s markets=%s",
+                city,
+                event_date,
+                ref.get("event_ticker"),
+                ref.get("kalshi_url"),
+                len(markets),
+            )
+        except Exception as exc:
+            LOGGER.warning(
+                "kalshi high guard cached event ref failed city=%s event_date=%s event_ticker=%s error=%s; falling back to series search",
+                city,
+                event_date,
+                ref.get("event_ticker"),
+                exc,
+            )
+            events = []
+    if not events:
+        payload = kalshi_get(
+            config,
+            "/events",
+            {
+                "status": "open",
+                "series_ticker": series_ticker,
+                "with_nested_markets": "true",
+                "limit": 10,
+            },
+        )
+        events = [
+            event
+            for event in payload.get("events") or []
+            if kalshi_event_matches_date(event, event_date)
+        ]
+        if events:
+            ref = model_awc_kalshi_event_ref_from_event(config, city, event_date, events[0])
+            KALSHI_HIGH_EVENT_CACHE[(city, event_date)] = ref
+            LOGGER.info(
+                "kalshi high guard cached event ref from series fallback city=%s event_date=%s event_ticker=%s url=%s",
+                city,
+                event_date,
+                ref.get("event_ticker"),
+                ref.get("kalshi_url"),
+            )
+    candidates: list[dict[str, Any]] = []
+    for event in events:
+        for market in event.get("markets") or []:
+            if str(market.get("status") or "").lower() not in {"active", "open"}:
+                continue
+            probability = kalshi_market_yes_probability(market)
+            if probability is None:
+                continue
+            candidates.append(
+                {
+                    "event_ticker": event.get("event_ticker"),
+                    "series_ticker": series_ticker,
+                    "kalshi_url": model_awc_kalshi_market_url(str(event.get("event_ticker") or "")),
+                    "ticker": market.get("ticker"),
+                    "title": market.get("title"),
+                    "subtitle": market.get("subtitle"),
+                    "strike_type": market.get("strike_type"),
+                    "floor_strike": market.get("floor_strike"),
+                    "cap_strike": market.get("cap_strike"),
+                    "yes_probability": probability,
+                    "midpoint_f": kalshi_market_interval_midpoint_f(market),
+                    "yes_bid_dollars": market.get("yes_bid_dollars"),
+                    "yes_ask_dollars": market.get("yes_ask_dollars"),
+                    "last_price_dollars": market.get("last_price_dollars"),
+                }
+            )
+    if not candidates:
+        result = None
+    else:
+        candidates.sort(
+            key=lambda item: (
+                -float(item["yes_probability"]),
+                str(item.get("ticker") or ""),
+            )
+        )
+        result = candidates[0]
+    KALSHI_HIGH_GUARD_CACHE[cache_key] = {
+        "cached_at": time.monotonic(),
+        "value": result,
+    }
+    return result
+
+
+def model_awc_kalshi_high_guard_allows_trade(
+    config: dict[str, Any],
+    city: str,
+    event_date: str,
+    polymarket_market: TemperatureMarket,
+) -> tuple[bool, dict[str, Any]]:
+    """Return whether Kalshi's top high-temp interval allows this Polymarket trade."""
+    if not model_awc_kalshi_high_guard_enabled(config):
+        return True, {"enabled": False}
+    fail_closed = model_awc_kalshi_high_guard_fail_closed(config)
+    poly_midpoint = model_awc_finite_market_midpoint_f(polymarket_market)
+    if poly_midpoint is None:
+        return False, {
+            "enabled": True,
+            "available": False,
+            "reason": "polymarket_interval_midpoint_unavailable",
+            "polymarket_market": polymarket_market.market_id,
+        }
+    try:
+        kalshi_market = model_awc_fetch_kalshi_top_high_market(config, city, event_date)
+    except Exception as exc:
+        return (not fail_closed), {
+            "enabled": True,
+            "available": False,
+            "reason": "kalshi_fetch_failed",
+            "error": str(exc),
+            "polymarket_midpoint_f": poly_midpoint,
+        }
+    if not kalshi_market:
+        return (not fail_closed), {
+            "enabled": True,
+            "available": False,
+            "reason": "kalshi_market_not_found",
+            "polymarket_midpoint_f": poly_midpoint,
+        }
+    kalshi_midpoint = kalshi_market.get("midpoint_f")
+    if kalshi_midpoint is None:
+        return (not fail_closed), {
+            "enabled": True,
+            "available": False,
+            "reason": "kalshi_interval_midpoint_unavailable",
+            "polymarket_midpoint_f": poly_midpoint,
+            "kalshi_market": kalshi_market,
+        }
+    threshold = model_awc_kalshi_high_guard_threshold_f(config)
+    diff = float(kalshi_midpoint) - float(poly_midpoint)
+    allowed = 0.0 <= diff <= threshold
+    if diff < 0.0:
+        reason = "polymarket_midpoint_above_kalshi"
+    elif diff > threshold:
+        reason = "kalshi_midpoint_too_high"
+    else:
+        reason = "ok"
+    return allowed, {
+        "enabled": True,
+        "available": True,
+        "reason": reason,
+        "threshold_f": threshold,
+        "diff_f": diff,
+        "polymarket_midpoint_f": poly_midpoint,
+        "polymarket_market": polymarket_market.market_id,
+        "polymarket_label": model_awc_market_label(polymarket_market),
+        "kalshi_market": kalshi_market,
+    }
+
+
+def model_awc_kalshi_guard_details_line(details: dict[str, Any]) -> str:
+    if not details or not details.get("enabled"):
+        return "Kalshi guard: disabled"
+    if not details.get("available"):
+        return f"Kalshi guard: unavailable ({details.get('reason', 'unknown')})"
+    kalshi_market = details.get("kalshi_market") or {}
+    return (
+        "Kalshi guard: "
+        f"poly_mid={float(details['polymarket_midpoint_f']):.2f}F "
+        f"kalshi_mid={float(kalshi_market['midpoint_f']):.2f}F "
+        f"diff={float(details['diff_f']):.2f}F "
+        f"threshold={float(details['threshold_f']):.2f}F "
+        f"kalshi={kalshi_market.get('ticker')} "
+        f"prob={model_awc_probability_pct(kalshi_market.get('yes_probability'))}"
+    )
 
 
 def model_awc_build_trade_model_details(
@@ -2889,21 +3413,23 @@ def model_awc_build_trade_model_details(
     fair_price: Optional[float],
     edge: Optional[float],
     combined_yes_probability: Optional[float],
+    kalshi_guard_details: Optional[dict[str, Any]] = None,
 ) -> str:
     classifier_label = model_awc_market_label(classifier_market) if classifier_market else "n/a"
     regression_label = model_awc_market_label(regression_market)
     selected_label = model_awc_market_label(selected_market)
-    return "\n".join(
-        [
-            f"Regression: {predicted_high_f:.2f}F -> {rounded_prediction_f}F / {regression_label}",
-            f"Regression prob: {model_awc_probability_pct(regressor_probability)}",
-            f"Classifier: {classifier_label} prob {model_awc_probability_pct(classifier_probability)}",
-            f"Selected: {selected_side.upper()} {selected_label} @ ${selected_price:.4f}",
-            f"Combined YES prob: {model_awc_probability_pct(combined_yes_probability)}",
-            f"Max {selected_side.upper()} buy cap: {model_awc_probability_pct(fair_price)}",
-            f"Cap room: {model_awc_probability_pct(edge)}",
-        ]
-    )
+    lines = [
+        f"Regression: {predicted_high_f:.2f}F -> {rounded_prediction_f}F / {regression_label}",
+        f"Regression prob: {model_awc_probability_pct(regressor_probability)}",
+        f"Classifier: {classifier_label} prob {model_awc_probability_pct(classifier_probability)}",
+        f"Selected: {selected_side.upper()} {selected_label} @ ${selected_price:.4f}",
+        f"Combined YES prob: {model_awc_probability_pct(combined_yes_probability)}",
+        f"Max {selected_side.upper()} buy cap: {model_awc_probability_pct(fair_price)}",
+        f"Cap room: {model_awc_probability_pct(edge)}",
+    ]
+    if kalshi_guard_details:
+        lines.append(model_awc_kalshi_guard_details_line(kalshi_guard_details))
+    return "\n".join(lines)
 
 
 def model_awc_preload_models(config: dict[str, Any], reason: str = "startup") -> None:
@@ -3371,6 +3897,14 @@ def model_awc_market_candidate(
     max_buy_price: Optional[float] = None,
 ) -> Optional[dict[str, Any]]:
     """Return the YES/NO side and executable price implied by one market range."""
+    if not finite_temperature_market(market):
+        LOGGER.info(
+            "model awc skip open-ended boundary market market=%s side_candidate=%s question=%r",
+            market.market_id,
+            "YES" if market.market_id == predicted_yes_market_id else "NO",
+            market.market_question,
+        )
+        return None
     predicted = convert_temperature(predicted_high_f, "F", event_unit)
     if predicted is None:
         return None
@@ -3452,7 +3986,8 @@ def model_awc_rounded_prediction_market(
     matches = [
         market
         for market in markets
-        if market_contains_temperature(market, float(rounded_for_event), event_unit)
+        if finite_temperature_market(market)
+        and market_contains_temperature(market, float(rounded_for_event), event_unit)
     ]
     if len(matches) != 1:
         return None, rounded_f
@@ -3499,6 +4034,8 @@ def model_awc_classifier_interval_choice(
     min_probability = model_awc_classifier_min_interval_probability(config)
     candidates: list[dict[str, Any]] = []
     for market in markets:
+        if not finite_temperature_market(market):
+            continue
         interval_probability = 0.0
         included_temperatures: list[int] = []
         for temp_f, probability in temp_probabilities.items():
@@ -3541,6 +4078,13 @@ def model_awc_classifier_interval_probabilities(
     )
     probabilities: dict[str, dict[str, Any]] = {}
     for market in markets:
+        if not finite_temperature_market(market):
+            probabilities[market.market_id] = {
+                "probability": 0.0,
+                "temperatures_f": (),
+                "skipped": "open_ended_boundary_market",
+            }
+            continue
         interval_probability = 0.0
         included_temperatures: list[int] = []
         for temp_f, probability in temp_probabilities.items():
@@ -3581,7 +4125,12 @@ def model_awc_prediction_matches(
     predicted = convert_temperature(predicted_high_f, "F", event_unit)
     if predicted is None:
         return []
-    return [market for market in markets if market_contains_temperature(market, float(predicted), event_unit)]
+    return [
+        market
+        for market in markets
+        if finite_temperature_market(market)
+        and market_contains_temperature(market, float(predicted), event_unit)
+    ]
 
 
 def model_awc_interval_snap_tolerance(config: dict[str, Any], event_unit: str) -> float:
@@ -3608,6 +4157,8 @@ def model_awc_boundary_snap_market(
     epsilon = 1e-9
     candidates: list[tuple[float, TemperatureMarket]] = []
     for market in markets:
+        if not finite_temperature_market(market):
+            continue
         lo, hi, _ = comparable_rule_bounds(market, event_unit)
         if lo is not None and float(predicted) < lo:
             distance = lo - float(predicted)
@@ -3632,7 +4183,12 @@ def model_awc_adjacent_prediction_markets(
     predicted = convert_temperature(predicted_high_f, "F", event_unit)
     if predicted is None:
         return None
-    matched = [market for market in markets if market_contains_temperature(market, float(predicted), event_unit)]
+    finite_markets = [market for market in markets if finite_temperature_market(market)]
+    matched = [
+        market
+        for market in finite_markets
+        if market_contains_temperature(market, float(predicted), event_unit)
+    ]
     if len(matched) == 2:
         ordered = sorted_markets_for_unit(matched, event_unit)
         return ordered[0], ordered[1]
@@ -3641,7 +4197,7 @@ def model_awc_adjacent_prediction_markets(
 
     lower_candidates: list[tuple[float, TemperatureMarket]] = []
     upper_candidates: list[tuple[float, TemperatureMarket]] = []
-    for market in markets:
+    for market in finite_markets:
         lo, hi, _ = comparable_rule_bounds(market, event_unit)
         if hi is not None and hi < float(predicted):
             lower_candidates.append((hi, market))
@@ -3848,6 +4404,46 @@ def process_model_awc_prediction(
         reason: str,
         signal_source: str = "agreement",
     ) -> Optional[PaperTrade]:
+        kalshi_allowed, kalshi_guard_details = model_awc_kalshi_high_guard_allows_trade(
+            config,
+            city,
+            event_date,
+            predicted_market,
+        )
+        if not kalshi_allowed:
+            kalshi_market = kalshi_guard_details.get("kalshi_market") or {}
+            LOGGER.info(
+                "model awc skip kalshi high guard city=%s station=%s event_date=%s "
+                "local_hour=%s predicted_high_f=%r signal_market=%s signal_label=%s "
+                "polymarket_midpoint_f=%s kalshi_ticker=%s kalshi_midpoint_f=%s "
+                "kalshi_probability=%s diff_f=%s threshold_f=%s reason=%s",
+                city,
+                station,
+                event_date,
+                local_hour,
+                predicted_high_f,
+                predicted_market.market_id,
+                model_awc_market_label(predicted_market),
+                kalshi_guard_details.get("polymarket_midpoint_f"),
+                kalshi_market.get("ticker"),
+                kalshi_market.get("midpoint_f"),
+                kalshi_market.get("yes_probability"),
+                kalshi_guard_details.get("diff_f"),
+                kalshi_guard_details.get("threshold_f"),
+                kalshi_guard_details.get("reason"),
+            )
+            return None
+        if kalshi_guard_details.get("enabled"):
+            LOGGER.info(
+                "model awc kalshi high guard passed city=%s station=%s event_date=%s "
+                "local_hour=%s signal_market=%s details=%s",
+                city,
+                station,
+                event_date,
+                local_hour,
+                predicted_market.market_id,
+                model_awc_kalshi_guard_details_line(kalshi_guard_details),
+            )
         yes_price = best_buy_price(config, predicted_market, "YES")
         min_yes_price = configured_model_awc_min_yes_price(config)
         if yes_price is not None and 0 < float(yes_price) < min_yes_price:
@@ -3903,6 +4499,7 @@ def process_model_awc_prediction(
                 fair_price=observation_max_buy_price,
                 edge=None,
                 combined_yes_probability=selected_prob,
+                kalshi_guard_details=kalshi_guard_details,
             )
             partial_trade = start_single_notional_manager(
                 predicted_market,
@@ -3962,6 +4559,7 @@ def process_model_awc_prediction(
             fair_price=fair_price,
             edge=edge,
             combined_yes_probability=selected_probability_info.get("combined_yes_probability"),
+            kalshi_guard_details=kalshi_guard_details,
         )
         LOGGER.info(
             "model awc selected observation-cap candidate city=%s station=%s event_date=%s "
@@ -5406,6 +6004,7 @@ class LiveTradingManager:
         self._pending: dict[str, LivePendingOrder] = {}
         self._hourly_batches: dict[str, ModelAwcHourlyBatch] = {}
         self._managed_order_ids: set[str] = set()
+        self._live_buy_intent_keys: set[str] = set()
         self._market_wakeup = threading.Event()
         self._lock = threading.RLock()
         self._running = False
@@ -5538,96 +6137,144 @@ class LiveTradingManager:
                 side,
             )
             return None
-        max_price = (
-            float(max_buy_price)
-            if max_buy_price is not None
-            else configured_max_buy_price(config)
+        strategy_name = str(
+            config.get("trading", {}).get(
+                "strategy_name",
+                self.config.get("trading", {}).get("strategy_name", "weather_extreme"),
+            )
         )
-        if float(entry_price) > max_price:
-            LOGGER.info(
-                "live buy skipped price above max side=%s market=%s price=%.4f max_buy_price=%.4f dynamic=%s",
-                side,
-                market.market_id,
-                float(entry_price),
-                max_price,
-                max_buy_price is not None,
-            )
-            return None
-        neg_risk = market_neg_risk(market)
-        if shares is not None:
-            amount = round(float(shares) * float(entry_price), 2)
-            LOGGER.info(
-                "live buy target fixed shares side=%s market=%s price=%.4f target_shares=%s target_amount_usd=%.2f neg_risk=%s",
-                side,
-                market.market_id,
-                float(entry_price),
-                shares,
-                amount,
-                neg_risk,
-            )
-            result = self.executor.place_buy_order_shares(
-                token_id,
-                float(shares),
-                price=entry_price,
-                neg_risk=neg_risk,
-                max_buy_price=max_price,
-            )
-        else:
-            amount = float(amount_usd if amount_usd is not None else config["trading"]["buy_notional_usdc"])
-            LOGGER.info(
-                "live buy target notional side=%s market=%s price=%.4f target_amount_usd=%.2f neg_risk=%s",
-                side,
-                market.market_id,
-                float(entry_price),
-                amount,
-                neg_risk,
-            )
-            result = self.executor.place_buy_order(
-                token_id,
-                amount,
-                price=entry_price,
-                neg_risk=neg_risk,
-                max_buy_price=max_price,
-            )
-        if not _result_value(result, "success", False):
-            LOGGER.error("live buy rejected side=%s market=%s price=%s neg_risk=%s error=%s", side, market.market_id, entry_price, neg_risk, _result_value(result, "error", ""))
-            return None
-
-        trade = make_trade(
-            config,
-            cycle_id,
-            market,
-            wu_source,
-            station,
+        intent_key = self._live_buy_intent_key(
+            strategy_name,
+            market.event_date,
+            market.market_id,
             side,
-            float(_result_value(result, "price", entry_price)),
-            observed_high,
-            observed_low,
-            reason,
-            notional_usdc=float(_result_value(result, "amount_usd", amount)),
-            shares_override=float(_result_value(result, "shares", shares or 0.0)) if shares is not None else None,
         )
-        if model_details:
-            trade.model_details = model_details
-        self._apply_buy_result_to_trade(trade, result, pending=True)
-        self._register_pending(
-            LivePendingOrder(
-                kind="BUY",
-                trade_id=trade.trade_id,
-                order_id=str(_result_value(result, "order_id", "")),
-                token_id=token_id,
-                condition_id=market.condition_id,
-                price=float(_result_value(result, "price", entry_price)),
-                shares=float(_result_value(result, "shares", trade.shares)),
-                created_ts=time.time(),
-                balance_before=float(_result_value(result, "balance_before", 0.0) or 0.0),
-                token_balance_before=_result_value(result, "token_balance_before", None),
+        with self._lock:
+            if intent_key in self._live_buy_intent_keys:
+                LOGGER.warning(
+                    "live buy skipped duplicate in-flight intent strategy=%s event_date=%s market=%s side=%s",
+                    strategy_name,
+                    market.event_date,
+                    market.market_id,
+                    side,
+                )
+                return None
+            self._live_buy_intent_keys.add(intent_key)
+        intent_kept = False
+        try:
+            try:
+                current_trades = read_trades(config["outputs"]["trades_csv"])
+            except Exception:
+                LOGGER.exception(
+                    "live buy duplicate disk check failed market=%s side=%s",
+                    market.market_id,
+                    side,
+                )
+                current_trades = []
+            if open_trade_exists(current_trades, strategy_name, market.market_id, side):
+                LOGGER.warning(
+                    "live buy skipped duplicate active trade strategy=%s event_date=%s market=%s side=%s",
+                    strategy_name,
+                    market.event_date,
+                    market.market_id,
+                    side,
+                )
+                return None
+            max_price = (
+                float(max_buy_price)
+                if max_buy_price is not None
+                else configured_max_buy_price(config)
             )
-        )
-        LOGGER.info("live buy pending trade=%s order=%s side=%s market=%s price=%s shares=%s neg_risk=%s", trade.trade_id, trade.live_buy_order_id, side, market.market_id, trade.yes_price, trade.shares, neg_risk)
-        if notify_submitted:
-            notify_trade(config, trade, "BUY", "SUBMITTED", reason)
-        return trade
+            if float(entry_price) > max_price:
+                LOGGER.info(
+                    "live buy skipped price above max side=%s market=%s price=%.4f max_buy_price=%.4f dynamic=%s",
+                    side,
+                    market.market_id,
+                    float(entry_price),
+                    max_price,
+                    max_buy_price is not None,
+                )
+                return None
+            neg_risk = market_neg_risk(market)
+            if shares is not None:
+                amount = round(float(shares) * float(entry_price), 2)
+                LOGGER.info(
+                    "live buy target fixed shares side=%s market=%s price=%.4f target_shares=%s target_amount_usd=%.2f neg_risk=%s",
+                    side,
+                    market.market_id,
+                    float(entry_price),
+                    shares,
+                    amount,
+                    neg_risk,
+                )
+                result = self.executor.place_buy_order_shares(
+                    token_id,
+                    float(shares),
+                    price=entry_price,
+                    neg_risk=neg_risk,
+                    max_buy_price=max_price,
+                )
+            else:
+                amount = float(amount_usd if amount_usd is not None else config["trading"]["buy_notional_usdc"])
+                LOGGER.info(
+                    "live buy target notional side=%s market=%s price=%.4f target_amount_usd=%.2f neg_risk=%s",
+                    side,
+                    market.market_id,
+                    float(entry_price),
+                    amount,
+                    neg_risk,
+                )
+                result = self.executor.place_buy_order(
+                    token_id,
+                    amount,
+                    price=entry_price,
+                    neg_risk=neg_risk,
+                    max_buy_price=max_price,
+                )
+            if not _result_value(result, "success", False):
+                LOGGER.error("live buy rejected side=%s market=%s price=%s neg_risk=%s error=%s", side, market.market_id, entry_price, neg_risk, _result_value(result, "error", ""))
+                return None
+
+            trade = make_trade(
+                config,
+                cycle_id,
+                market,
+                wu_source,
+                station,
+                side,
+                float(_result_value(result, "price", entry_price)),
+                observed_high,
+                observed_low,
+                reason,
+                notional_usdc=float(_result_value(result, "amount_usd", amount)),
+                shares_override=float(_result_value(result, "shares", shares or 0.0)) if shares is not None else None,
+            )
+            if model_details:
+                trade.model_details = model_details
+            self._apply_buy_result_to_trade(trade, result, pending=True)
+            self._register_pending(
+                LivePendingOrder(
+                    kind="BUY",
+                    trade_id=trade.trade_id,
+                    order_id=str(_result_value(result, "order_id", "")),
+                    token_id=token_id,
+                    condition_id=market.condition_id,
+                    price=float(_result_value(result, "price", entry_price)),
+                    shares=float(_result_value(result, "shares", trade.shares)),
+                    created_ts=time.time(),
+                    balance_before=float(_result_value(result, "balance_before", 0.0) or 0.0),
+                    token_balance_before=_result_value(result, "token_balance_before", None),
+                )
+            )
+            LOGGER.info("live buy pending trade=%s order=%s side=%s market=%s price=%s shares=%s neg_risk=%s", trade.trade_id, trade.live_buy_order_id, side, market.market_id, trade.yes_price, trade.shares, neg_risk)
+            if notify_submitted:
+                notify_trade(config, trade, "BUY", "SUBMITTED", reason)
+            intent_kept = True
+            return trade
+        finally:
+            if not intent_kept:
+                with self._lock:
+                    self._live_buy_intent_keys.discard(intent_key)
 
     def start_model_awc_hourly_batch(
         self,
@@ -5659,10 +6306,18 @@ class LiveTradingManager:
         if not all(token_ids):
             raise RuntimeError(f"missing token id for managed batch {batch_id}")
         with self._lock:
+            existing = self._hourly_batches.get(batch_id)
+            if existing is not None and not existing.closed and time.time() < existing.expires_ts:
+                LOGGER.info(
+                    "model awc hourly batch duplicate skipped batch=%s mode=%s",
+                    batch_id,
+                    mode,
+                )
+                return batch_id
             old_batches = [
                 batch
                 for key, batch in self._hourly_batches.items()
-                if key.startswith(group_prefix)
+                if key.startswith(group_prefix) and key != batch_id
             ]
         for old in old_batches:
             self._close_hourly_batch(old, "next_hour_model_output")
@@ -5908,10 +6563,19 @@ class LiveTradingManager:
         reason: str,
     ) -> Optional[PaperTrade]:
         order_shares = float(int(max(0.0, shares)))
-        if order_shares < 1:
+        token_id = batch.token_ids[leg_index]
+        minimum_shares = self._minimum_order_shares(token_id)
+        if order_shares < minimum_shares:
+            LOGGER.info(
+                "model awc managed order skipped below minimum batch=%s token=%s shares=%.4f minimum=%.4f",
+                batch.batch_id,
+                token_id[:16],
+                order_shares,
+                minimum_shares,
+            )
             return None
-        if batch.token_ids[leg_index] in batch.open_order_ids:
-            self._cancel_batch_order(batch, batch.token_ids[leg_index])
+        if token_id in batch.open_order_ids:
+            self._cancel_batch_order(batch, token_id)
         market = batch.markets[leg_index]
         side = batch.sides[leg_index]
         trade = self.submit_buy_trade(
@@ -5938,7 +6602,6 @@ class LiveTradingManager:
         write_csv(self.config["outputs"]["trades_csv"], trades)
         write_csv(self.config["outputs"]["settled_trades_csv"], trades)
         write_performance_reports(self.config, trades)
-        token_id = batch.token_ids[leg_index]
         batch.open_order_ids[token_id] = trade.live_buy_order_id
         reserved_cost = float(
             getattr(
@@ -5967,6 +6630,22 @@ class LiveTradingManager:
         if price is None or price.best_ask <= 0 or price.ask_size <= 0:
             return None
         return float(price.best_ask), float(price.ask_size)
+
+    def _minimum_order_shares(self, token_id: str) -> float:
+        if not self.executor:
+            return 1.0
+        minimum_fn = getattr(self.executor, "minimum_order_shares", None)
+        if not callable(minimum_fn):
+            return 1.0
+        try:
+            return max(1.0, float(minimum_fn(token_id)))
+        except Exception:
+            LOGGER.exception("minimum order share lookup failed token=%s", token_id[:16])
+            return 1.0
+
+    @staticmethod
+    def _live_buy_intent_key(strategy_name: str, event_date: str, market_id: str, side: str) -> str:
+        return f"{strategy_name}:{event_date}:{market_id}:{side.upper()}"
 
     def _manage_hourly_batch(self, batch: ModelAwcHourlyBatch) -> None:
         if batch.closed:
@@ -6045,7 +6724,7 @@ class LiveTradingManager:
                     continue
                 price = float(offer[0])
                 shares = min(float(offer[1]), remaining_notional / price)
-                if shares >= 1:
+                if shares >= self._minimum_order_shares(candidate_token):
                     executable_candidates.append(
                         (price, str(batch.markets[leg_index].market_id), side, leg_index, shares)
                     )
@@ -6065,9 +6744,9 @@ class LiveTradingManager:
                         f"{below_floor_sides[0]}_below_confidence_floor",
                     )
                 return
-            if shares < 1:
+            if shares < self._minimum_order_shares(batch.token_ids[leg_index]):
                 self._close_hourly_batch(
-                    batch, "target_unfillable_notional_remainder"
+                    batch, "target_unfillable_minimum_order_size"
                 )
                 return
             self._submit_batch_order(batch, leg_index, shares, price, reason)
@@ -6099,7 +6778,7 @@ class LiveTradingManager:
             if offer[0] > max_price:
                 return
             shares = min(float(remaining), float(offer[1]))
-            if shares < 1:
+            if shares < self._minimum_order_shares(token):
                 return
             self._submit_batch_order(
                 batch,
@@ -6699,6 +7378,16 @@ class LiveTradingManager:
                     )
                 else:
                     trade.status = "BUY_CANCELLED" if cancelled else "BUY_CANCEL_FAILED"
+                    if cancelled:
+                        with self._lock:
+                            self._live_buy_intent_keys.discard(
+                                self._live_buy_intent_key(
+                                    trade.strategy,
+                                    trade.event_date,
+                                    trade.market_id,
+                                    trade.position_side or "YES",
+                                )
+                            )
             else:
                 trade.status = "OPEN"
             break

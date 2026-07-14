@@ -61,7 +61,7 @@
     "trading":  {
                     "strategy_name":  "model_awc_high",
                     "strategy_mode":  "model_awc_high",
-                    "buy_notional_usdc":  20,
+                    "buy_notional_usdc":  25,
                     "fee_rate":  0.05,
                     "fee_enabled":  true,
                     "deterministic_min_yes_price":  0.01,
@@ -123,7 +123,27 @@
                     ,"model_awc_agree_min_classifier_probability": 0.70
                     ,"model_awc_disagree_takeover_min_probability": 0.80
                     ,"model_awc_disagree_takeover_min_gap": 0.30
-                    ,"model_awc_observation_window_max_buy_prices": [0.60, 0.70, 0.80]
+                    ,"model_awc_kalshi_high_guard_enabled": true
+                    ,"model_awc_kalshi_high_guard_max_higher_midpoint_f": 2.0
+                    ,"model_awc_kalshi_high_guard_fail_closed": false
+                    ,"model_awc_kalshi_high_guard_prefetch_enabled": true
+                    ,"model_awc_kalshi_high_guard_cache_seconds": 45
+                    ,"model_awc_kalshi_api_base": "https://api.elections.kalshi.com/trade-api/v2"
+                    ,"model_awc_kalshi_tls_verify": false
+                    ,"model_awc_kalshi_high_series_tickers": {
+                        "Atlanta": "KXHIGHTATL",
+                        "Austin": "KXHIGHAUS",
+                        "Chicago": "KXHIGHCHI",
+                        "Dallas": "KXHIGHTDAL",
+                        "Denver": "KXHIGHDEN",
+                        "Houston": "KXHIGHTHOU",
+                        "Los Angeles": "KXHIGHLAX",
+                        "Miami": "KXHIGHMIA",
+                        "NYC": "KXHIGHNY",
+                        "San Francisco": "KXHIGHTSFO",
+                        "Seattle": "KXHIGHTSEA"
+                    }
+                    ,"model_awc_observation_window_max_buy_prices": [0.70, 0.80, 0.90]
                     ,"model_awc_live_stations": [
                         "KATL",
                         "KAUS",
@@ -258,7 +278,7 @@
                            "trading":  {
                                            "strategy_name":  "model_awc_high",
                                            "strategy_mode":  "model_awc_high",
-                                           "buy_notional_usdc":  20,
+                                           "buy_notional_usdc":  25,
                                            "fee_rate":  0.05,
                                            "fee_enabled":  true,
                                            "deterministic_min_yes_price":  0.01,
@@ -318,7 +338,7 @@
                                            ,"model_awc_agree_min_classifier_probability": 0.70
                                            ,"model_awc_disagree_takeover_min_probability": 0.80
                                            ,"model_awc_disagree_takeover_min_gap": 0.30
-                                           ,"model_awc_observation_window_max_buy_prices": [0.60, 0.70, 0.80]
+                                           ,"model_awc_observation_window_max_buy_prices": [0.70, 0.80, 0.90]
                                            ,"model_awc_live_stations": [
                                                "KATL",
                                                "KAUS",

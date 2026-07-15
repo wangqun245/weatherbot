@@ -72,11 +72,12 @@ class ClobPricingTest(unittest.TestCase):
             "KMIA": (10, 15),
         }
 
-        self.assertEqual(20.0, float(config["trading"]["buy_notional_usdc"]))
+        self.assertEqual(10.0, float(config["trading"]["buy_notional_usdc"]))
         self.assertEqual(0.03, float(config["trading"]["model_awc_min_yes_price"]))
         self.assertEqual(0.03, float(config["trading"]["model_awc_min_no_price"]))
         self.assertTrue(config["trading"]["model_awc_classifier_enabled"])
         self.assertTrue(config["trading"]["model_awc_kalshi_high_guard_enabled"])
+        self.assertTrue(config["trading"]["model_awc_kalshi_high_guard_fail_closed"])
         self.assertEqual(
             2.0,
             float(config["trading"]["model_awc_kalshi_high_guard_max_higher_midpoint_f"]),
@@ -278,6 +279,35 @@ class ClobPricingTest(unittest.TestCase):
         self.assertFalse(allowed)
         self.assertEqual("polymarket_interval_midpoint_unavailable", details["reason"])
 
+    def test_kalshi_high_guard_blocks_when_top_market_missing(self):
+        config = bot.default_config()
+        config["trading"]["model_awc_kalshi_high_guard_enabled"] = True
+        config["trading"]["model_awc_kalshi_high_guard_fail_closed"] = False
+        market = bot.TemperatureMarket(
+            event_id="event-1",
+            market_id="poly-90-91",
+            condition_id="condition-1",
+            city="Austin",
+            kind="Highest",
+            event_date="2026-07-14",
+            event_title="Highest temperature in Austin on July 14",
+            market_question="Will the highest temperature in Austin be between 90-91F on July 14?",
+            polymarket_url="https://polymarket.com/event/example",
+            yes_price=0.2,
+            rule_min=90.0,
+            rule_max=91.0,
+            unit="F",
+            raw_market_json="{}",
+        )
+
+        with mock.patch.object(bot, "model_awc_fetch_kalshi_top_high_market", return_value=None):
+            allowed, details = bot.model_awc_kalshi_high_guard_allows_trade(
+                config, "Austin", "2026-07-14", market
+            )
+
+        self.assertFalse(allowed)
+        self.assertEqual("kalshi_market_not_found", details["reason"])
+
     def test_kalshi_prefetch_caches_event_ref_and_url(self):
         config = bot.default_config()
         bot.KALSHI_HIGH_EVENT_CACHE.clear()
@@ -327,18 +357,19 @@ class ClobPricingTest(unittest.TestCase):
                 "event": {
                     "event_ticker": "KXHIGHAUS-26JUL14",
                     "occurrence_datetime": "2026-07-14T14:00:00Z",
+                    "markets": [
+                        {
+                            "ticker": "KXHIGHAUS-26JUL14-B91.5",
+                            "status": "active",
+                            "strike_type": "between",
+                            "floor_strike": 91,
+                            "cap_strike": 92,
+                            "yes_bid_dollars": "0.6100",
+                            "yes_ask_dollars": "0.6300",
+                        }
+                    ],
                 },
-                "markets": [
-                    {
-                        "ticker": "KXHIGHAUS-26JUL14-B91.5",
-                        "status": "active",
-                        "strike_type": "between",
-                        "floor_strike": 91,
-                        "cap_strike": 92,
-                        "yes_bid_dollars": "0.6100",
-                        "yes_ask_dollars": "0.6300",
-                    }
-                ],
+                "markets": [],
             }
 
         with mock.patch.object(bot, "kalshi_get", side_effect=fake_kalshi_get):
@@ -352,6 +383,62 @@ class ClobPricingTest(unittest.TestCase):
         self.assertEqual("https://kalshi.com/markets/KXHIGHAUS-26JUL14", market["kalshi_url"])
         self.assertAlmostEqual(91.5, market["midpoint_f"])
         self.assertAlmostEqual(0.62, market["yes_probability"])
+
+    def test_kalshi_top_market_falls_back_when_cached_ref_has_no_markets(self):
+        config = bot.default_config()
+        config["trading"]["model_awc_kalshi_high_guard_cache_seconds"] = 0
+        bot.KALSHI_HIGH_EVENT_CACHE.clear()
+        bot.KALSHI_HIGH_GUARD_CACHE.clear()
+        bot.KALSHI_HIGH_EVENT_CACHE[("Austin", "2026-07-14")] = {
+            "city": "Austin",
+            "event_date": "2026-07-14",
+            "series_ticker": "KXHIGHAUS",
+            "event_ticker": "KXHIGHAUS-26JUL14",
+            "kalshi_url": "https://kalshi.com/markets/KXHIGHAUS-26JUL14",
+            "cached_at": 1.0,
+        }
+        calls = []
+
+        def fake_kalshi_get(config, path, params=None):
+            calls.append((path, dict(params or {})))
+            if path == "/events/KXHIGHAUS-26JUL14":
+                return {
+                    "event": {
+                        "event_ticker": "KXHIGHAUS-26JUL14",
+                        "occurrence_datetime": "2026-07-14T14:00:00Z",
+                    },
+                    "markets": [],
+                }
+            self.assertEqual("/events", path)
+            self.assertEqual("true", params["with_nested_markets"])
+            return {
+                "events": [
+                    {
+                        "event_ticker": "KXHIGHAUS-26JUL14",
+                        "series_ticker": "KXHIGHAUS",
+                        "occurrence_datetime": "2026-07-14T14:00:00Z",
+                        "markets": [
+                            {
+                                "ticker": "KXHIGHAUS-26JUL14-B91.5",
+                                "status": "active",
+                                "strike_type": "between",
+                                "floor_strike": 91,
+                                "cap_strike": 92,
+                                "yes_bid_dollars": "0.6100",
+                                "yes_ask_dollars": "0.6300",
+                            }
+                        ],
+                    }
+                ]
+            }
+
+        with mock.patch.object(bot, "kalshi_get", side_effect=fake_kalshi_get):
+            market = bot.model_awc_fetch_kalshi_top_high_market(
+                config, "Austin", "2026-07-14"
+            )
+
+        self.assertEqual(["/events/KXHIGHAUS-26JUL14", "/events"], [call[0] for call in calls])
+        self.assertEqual("KXHIGHAUS-26JUL14-B91.5", market["ticker"])
 
     def test_source_station_guard_runs_startup_check(self):
         config = bot.default_config()
@@ -615,7 +702,8 @@ class ModelAwcLiveSingleIntervalTest(unittest.TestCase):
             mock.patch.object(bot, "write_csv"), \
             mock.patch.object(bot, "write_performance_reports"), \
             mock.patch.object(bot, "partial_buy_fillable_now", return_value=partial_now), \
-            mock.patch.object(bot, "best_buy_price", return_value=best_price):
+            mock.patch.object(bot, "best_buy_price", return_value=best_price), \
+            mock.patch.object(bot, "model_awc_kalshi_high_guard_allows_trade", return_value=(True, {"enabled": False})):
             trade = bot.process_model_awc_prediction(
                 self.config,
                 self.event,
@@ -689,6 +777,47 @@ class ModelAwcLiveSingleIntervalTest(unittest.TestCase):
         self.assertEqual(("YES",), args[5])
         self.assertEqual("single", args[8])
         self.assertEqual(10.0, kwargs["target_notional_usd"])
+
+    def test_live_single_interval_manager_only_tracks_selected_finite_market(self):
+        boundary = bot.TemperatureMarket(
+            event_id="event-1",
+            market_id="market-77-below",
+            condition_id="condition-boundary",
+            city="Austin",
+            kind="Highest",
+            event_date="2026-06-29",
+            event_title="Highest temperature in Austin on June 29",
+            market_question="Will the highest temperature in Austin be 77F or below on June 29?",
+            polymarket_url="https://polymarket.com/event/austin-high-june-29",
+            yes_price=0.001,
+            rule_min=None,
+            rule_max=77.0,
+            unit="F",
+            raw_market_json='{"outcomes":["Yes","No"],"clobTokenIds":["yes-boundary","no-boundary"]}',
+        )
+        fake_live_trader = SimpleNamespace(submissions=[], batches=[])
+        fake_live_trader.start_model_awc_hourly_batch = lambda *args, **kwargs: fake_live_trader.batches.append((args, kwargs))
+
+        with mock.patch.object(bot, "get_live_trader", return_value=fake_live_trader), \
+            mock.patch.object(bot, "markets_for_event", return_value=[boundary, self.market]), \
+            mock.patch.object(bot, "read_trades", return_value=[]), \
+            mock.patch.object(bot, "best_buy_price", return_value=0.96), \
+            mock.patch.object(bot, "model_awc_kalshi_high_guard_allows_trade", return_value=(True, {"enabled": False})):
+            trade = bot.process_model_awc_prediction(
+                self.config,
+                self.event,
+                "Austin",
+                "KAUS",
+                98.51,
+                self.latest_row,
+                self.latest_local,
+            )
+
+        self.assertIsNone(trade)
+        self.assertEqual(1, len(fake_live_trader.batches))
+        args, _kwargs = fake_live_trader.batches[0]
+        self.assertEqual((self.market,), args[4])
+        self.assertEqual(("YES",), args[5])
 
     def test_live_boundary_snap_price_above_cap_starts_resting_notional_manager(self):
         fake_live_trader, trade = self._run_with_fake_live_trader(97.98, best_price=0.96)

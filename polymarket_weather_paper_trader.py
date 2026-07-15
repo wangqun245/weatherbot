@@ -408,7 +408,7 @@ def default_config() -> dict[str, Any]:
         "model_awc_disagree_takeover_min_gap": 0.30,
         "model_awc_kalshi_high_guard_enabled": True,
         "model_awc_kalshi_high_guard_max_higher_midpoint_f": 2.0,
-        "model_awc_kalshi_high_guard_fail_closed": False,
+        "model_awc_kalshi_high_guard_fail_closed": True,
         "model_awc_kalshi_high_guard_prefetch_enabled": True,
         "model_awc_kalshi_high_guard_cache_seconds": 45,
         "model_awc_kalshi_api_base": "https://api.elections.kalshi.com/trade-api/v2",
@@ -2963,7 +2963,7 @@ def model_awc_kalshi_high_guard_threshold_f(config: dict[str, Any]) -> float:
 
 def model_awc_kalshi_high_guard_fail_closed(config: dict[str, Any]) -> bool:
     return bool(
-        config.get("trading", {}).get("model_awc_kalshi_high_guard_fail_closed", False)
+        config.get("trading", {}).get("model_awc_kalshi_high_guard_fail_closed", True)
     )
 
 
@@ -3183,9 +3183,9 @@ def model_awc_prefetch_kalshi_high_event_refs(
 
 def model_awc_extract_kalshi_event_and_markets(payload: dict[str, Any]) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     event = payload.get("event") if isinstance(payload.get("event"), dict) else payload
-    markets = payload.get("markets") if isinstance(payload.get("markets"), list) else None
-    if markets is None:
-        markets = event.get("markets") if isinstance(event.get("markets"), list) else []
+    event_markets = event.get("markets") if isinstance(event.get("markets"), list) else []
+    top_level_markets = payload.get("markets") if isinstance(payload.get("markets"), list) else []
+    markets = event_markets or top_level_markets
     return event, markets
 
 
@@ -3228,7 +3228,7 @@ def model_awc_fetch_kalshi_top_high_market(
             event, markets = model_awc_fetch_kalshi_event_by_ref(config, ref)
             event = dict(event)
             event["markets"] = markets
-            if kalshi_event_matches_date(event, event_date):
+            if markets and kalshi_event_matches_date(event, event_date):
                 events = [event]
             LOGGER.info(
                 "kalshi high guard using cached event ref city=%s event_date=%s event_ticker=%s url=%s markets=%s",
@@ -3238,6 +3238,13 @@ def model_awc_fetch_kalshi_top_high_market(
                 ref.get("kalshi_url"),
                 len(markets),
             )
+            if not markets:
+                LOGGER.warning(
+                    "kalshi high guard cached event ref returned no markets city=%s event_date=%s event_ticker=%s; falling back to series search",
+                    city,
+                    event_date,
+                    ref.get("event_ticker"),
+                )
         except Exception as exc:
             LOGGER.warning(
                 "kalshi high guard cached event ref failed city=%s event_date=%s event_ticker=%s error=%s; falling back to series search",
@@ -3337,26 +3344,29 @@ def model_awc_kalshi_high_guard_allows_trade(
     try:
         kalshi_market = model_awc_fetch_kalshi_top_high_market(config, city, event_date)
     except Exception as exc:
-        return (not fail_closed), {
+        return False, {
             "enabled": True,
             "available": False,
             "reason": "kalshi_fetch_failed",
             "error": str(exc),
+            "fail_closed": fail_closed,
             "polymarket_midpoint_f": poly_midpoint,
         }
     if not kalshi_market:
-        return (not fail_closed), {
+        return False, {
             "enabled": True,
             "available": False,
             "reason": "kalshi_market_not_found",
+            "fail_closed": fail_closed,
             "polymarket_midpoint_f": poly_midpoint,
         }
     kalshi_midpoint = kalshi_market.get("midpoint_f")
     if kalshi_midpoint is None:
-        return (not fail_closed), {
+        return False, {
             "enabled": True,
             "available": False,
             "reason": "kalshi_interval_midpoint_unavailable",
+            "fail_closed": fail_closed,
             "polymarket_midpoint_f": poly_midpoint,
             "kalshi_market": kalshi_market,
         }
@@ -4219,6 +4229,13 @@ def model_awc_best_non_adjacent_no_candidate(
     adjacent_ids = {market.market_id for market in adjacent_markets}
     candidates: list[dict[str, Any]] = []
     for market in markets:
+        if not finite_temperature_market(market):
+            LOGGER.info(
+                "model awc skip non-adjacent open-ended boundary no candidate market=%s question=%r",
+                market.market_id,
+                market.market_question,
+            )
+            continue
         if market.market_id in adjacent_ids:
             continue
         price = best_buy_price(config, market, "NO")
@@ -4462,10 +4479,17 @@ def process_model_awc_prediction(
             )
             return None
 
-        side_candidates: list[tuple[TemperatureMarket, str]] = [
-            (market, "YES" if market.market_id == predicted_market.market_id else "NO")
-            for market in markets
-        ]
+        if not finite_temperature_market(predicted_market):
+            LOGGER.info(
+                "model awc skip single interval open-ended predicted market city=%s station=%s event_date=%s local_hour=%s market=%s",
+                city,
+                station,
+                event_date,
+                local_hour,
+                predicted_market.market_id,
+            )
+            return None
+        side_candidates: list[tuple[TemperatureMarket, str]] = [(predicted_market, "YES")]
         candidates = []
         for market, _side in side_candidates:
             candidate = model_awc_market_candidate(
@@ -4507,13 +4531,13 @@ def process_model_awc_prediction(
                 "insufficient_current_depth_or_price_above_observation_cap",
                 max_buy_price=observation_max_buy_price,
                 model_details=selected_model_details,
-                managed_markets=tuple(market for market, _side in side_candidates),
-                managed_sides=tuple(side for _market, side in side_candidates),
+                managed_markets=(predicted_market,),
+                managed_sides=("YES",),
             )
             LOGGER.info(
-                "model awc skip no priced single candidates city=%s station=%s "
+                "model awc skip no priced selected single candidate city=%s station=%s "
                 "predicted_high_f=%r market=%s observation_max_buy_price=%.4f "
-                "combined_yes_probability=%s signal_source=%s",
+                "combined_yes_probability=%s signal_source=%s details=%s",
                 city,
                 station,
                 predicted_high_f,
@@ -4521,6 +4545,7 @@ def process_model_awc_prediction(
                 observation_max_buy_price,
                 None if selected_prob is None else round(float(selected_prob), 6),
                 signal_source,
+                selected_model_details,
             )
             return partial_trade
 
@@ -4538,14 +4563,6 @@ def process_model_awc_prediction(
         fair_price = selected.get("fair_price")
         edge = selected.get("edge")
         selected_probability_info = combined_yes_probabilities.get(market.market_id, {})
-        ordered_pairs = [(market, side)] + [
-            (candidate_market, candidate_side)
-            for candidate_market, candidate_side in side_candidates
-            if not (
-                candidate_market.market_id == market.market_id
-                and candidate_side.upper() == side.upper()
-            )
-        ]
         model_details = model_awc_build_trade_model_details(
             predicted_high_f=predicted_high_f,
             rounded_prediction_f=rounded_prediction_f,
@@ -4585,8 +4602,8 @@ def process_model_awc_prediction(
                 "single_interval_managed",
                 max_buy_price=observation_max_buy_price,
                 model_details=model_details,
-                managed_markets=tuple(item[0] for item in ordered_pairs),
-                managed_sides=tuple(item[1] for item in ordered_pairs),
+                managed_markets=(market,),
+                managed_sides=(side,),
             )
         return submit_model_awc_trade(
             market,
